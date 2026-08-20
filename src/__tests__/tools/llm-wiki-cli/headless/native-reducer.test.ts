@@ -30,6 +30,26 @@ const source = (sourceId: string, proposals: NativeSourceScopedIR['proposals'], 
   ...extra,
 });
 
+const mapped = (overrides: Partial<NativeMapIR> = {}): NativeMapIR => ({
+  contractVersion: 'native-map/v1',
+  source: { sourceId: 'mapped-source', sourcePath: 'notes/mapped.md', byteSha256: 'a'.repeat(64), byteCount: 6 },
+  sourceTitle: 'Mapped source',
+  summary: 'A mapped summary',
+  sourceAliases: [],
+  keyPoints: [],
+  entities: [{ name: 'Mapped Entity', type: 'person', aliases: [], summary: 'Entity summary', mentions_in_source: [], mentions_with_provenance: [], related_entities: [], related_concepts: [] }],
+  concepts: [],
+  mentions: [],
+  claims: [],
+  aliases: [],
+  related: [],
+  contradictions: [],
+  artifacts: [],
+  policySha256: 'b'.repeat(64),
+  irSha256: 'c'.repeat(64),
+  ...overrides,
+});
+
 describe('native reducer', () => {
   it('shuffles by typed key and merges shared same-type proposals deterministically', () => {
     const first = source('s-b', [{
@@ -148,6 +168,79 @@ describe('native reducer', () => {
     expect(result.unsupported).toContain('provider-frontmatter:owner_only');
   });
 
+  it('propagates every adapter refusal into the non-applyable plan', () => {
+    const cases: Array<{ label: string; ir: NativeMapIR; reason: string }> = [
+      {
+        label: 'source claim subject',
+        ir: mapped({ claims: [{ claimId: 'source-claim', subject: { pageType: 'source', label: 'Mapped source' }, predicate: 'source-summary', statement: 'Source claim', disposition: 'proposed', evidenceQuotes: [], sourcePath: 'notes/mapped.md' }] }),
+        reason: 'native-map-claim-source-subject:source-claim',
+      },
+      {
+        label: 'claim target missing',
+        ir: mapped({ claims: [{ claimId: 'missing-claim', subject: { pageType: 'entity', label: 'Missing entity' }, predicate: 'item-summary', statement: 'Missing target', disposition: 'proposed', evidenceQuotes: [], sourcePath: 'notes/mapped.md' }] }),
+        reason: 'native-map-claim-target-missing:missing-claim',
+      },
+      {
+        label: 'claim source mismatch',
+        ir: mapped({ claims: [{ claimId: 'mismatched-claim', subject: { pageType: 'entity', label: 'Mapped Entity' }, predicate: 'item-summary', statement: 'Mismatched source', disposition: 'proposed', evidenceQuotes: [], sourcePath: 'notes/other.md' }] }),
+        reason: 'native-map-claim-source-mismatch:mismatched-claim',
+      },
+      {
+        label: 'source alias target',
+        ir: mapped({ aliases: [{ alias: 'Mapped SOP', targetPageType: 'source', targetLabel: 'Mapped source', sourcePath: 'notes/mapped.md' }] }),
+        reason: 'native-map-alias-target:Mapped SOP',
+      },
+      {
+        label: 'alias target missing',
+        ir: mapped({ aliases: [{ alias: 'Ghost', targetPageType: 'entity', targetLabel: 'Missing entity', sourcePath: 'notes/mapped.md' }] }),
+        reason: 'native-map-alias-target-missing:Ghost',
+      },
+      {
+        label: 'alias source mismatch',
+        ir: mapped({ aliases: [{ alias: 'Mapped', targetPageType: 'entity', targetLabel: 'Mapped Entity', sourcePath: 'notes/other.md' }] }),
+        reason: 'native-map-alias-source-mismatch:Mapped',
+      },
+      {
+        label: 'unknown related target',
+        ir: mapped({ related: [{ sourcePath: 'notes/mapped.md', pageType: 'entity', label: 'Missing entity', resolution: 'unresolved-source-proposal' }] }),
+        reason: 'native-map-related-target-missing:Missing entity',
+      },
+      {
+        label: 'unsupported related type',
+        ir: mapped({ related: [{ sourcePath: 'notes/mapped.md', pageType: 'unknown', label: 'Unknown', resolution: 'unresolved-source-proposal' }] }),
+        reason: 'native-map-related-target:Unknown',
+      },
+      {
+        label: 'related source mismatch',
+        ir: mapped({ related: [{ sourcePath: 'notes/other.md', pageType: 'entity', label: 'Mapped Entity', resolution: 'unresolved-source-proposal' }] }),
+        reason: 'native-map-related-source-mismatch:Mapped Entity',
+      },
+      {
+        label: 'contradiction target',
+        ir: mapped({ contradictions: [{ claim: 'Missing page claim', source_page: 'missing.md', contradicted_by: 'Contrary quote', resolution: 'Unresolved' }] }),
+        reason: 'native-map-contradiction-target:missing.md',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const result = reduceNativeMapIR([testCase.ir], options());
+      expect(result.canApply, testCase.label).toBe(false);
+      expect(result.status, testCase.label).toBe('requires-native-comparison');
+      expect(result.reasons, testCase.label).toContain(testCase.reason);
+      expect(result.unsupported, testCase.label).toContain(testCase.reason);
+    }
+  });
+
+  it('propagates source-scoped unsupported reasons verbatim instead of silently applying', () => {
+    const result = reduceNativeSourceIR([source('s-refused', [{
+      proposalId: 'p-refused', sourceId: 's-refused', pageType: 'entity', label: 'Refused',
+    }], { unsupported: ['native-map-custom-refusal:provider-output', 'native-map-another-refusal'] })], options());
+
+    expect(result.canApply).toBe(false);
+    expect(result.reasons).toEqual(expect.arrayContaining(['native-map-custom-refusal:provider-output', 'native-map-another-refusal']));
+    expect(result.unsupported).toEqual(expect.arrayContaining(['native-map-custom-refusal:provider-output', 'native-map-another-refusal']));
+  });
+
   it('consumes native-map/v1 IR while retaining contested claims and provenance', () => {
     const mapped: NativeMapIR = {
       contractVersion: 'native-map/v1',
@@ -178,5 +271,42 @@ describe('native reducer', () => {
   it('rejects source leakage and non-deterministic unsafe labels before producing a plan', () => {
     expect(() => reduceNativeSourceIR([source('s-one', [{ proposalId: 'p', sourceId: 'other-source', pageType: 'entity', label: 'Valid' }])], options())).toThrow(NativeReductionError);
     expect(() => reduceNativeSourceIR([source('s-two', [{ proposalId: 'p', sourceId: 's-two', pageType: 'entity', label: '///' }])], options())).toThrow(NativeReductionError);
+  });
+
+  it('refuses proposal-id, case-insensitive path, and existing-page collisions', () => {
+    expect(() => reduceNativeSourceIR([source('s-duplicate', [
+      { proposalId: 'same', sourceId: 's-duplicate', pageType: 'entity', label: 'First' },
+      { proposalId: 'same', sourceId: 's-duplicate', pageType: 'entity', label: 'Second' },
+    ])], options())).toThrow(/duplicate proposal id/u);
+
+    const slugCollision = reduceNativeSourceIR([
+      source('s-comma', [{ proposalId: 'comma', sourceId: 's-comma', pageType: 'entity', label: 'A,B' }]),
+      source('s-plain', [{ proposalId: 'plain', sourceId: 's-plain', pageType: 'entity', label: 'AB' }]),
+    ], options());
+    expect(slugCollision.canApply).toBe(false);
+    expect(slugCollision.reasons.some(reason => reason.startsWith('path-collision:'))).toBe(true);
+
+    const existingKindCollision = reduceNativeSourceIR([source('s-existing', [{
+      proposalId: 'existing', sourceId: 's-existing', pageType: 'entity', label: 'Existing',
+    }])], options({ existingPages: [{
+      path: 'wiki/entities/existing.md', pageType: 'source', label: 'Existing', content: '---\ntype: source\n---\n\n# Existing source\n',
+    }] }));
+    expect(existingKindCollision.canApply).toBe(false);
+    expect(existingKindCollision.reasons).toContain('existing-page-type-mismatch:wiki/entities/existing.md');
+
+    expect(() => reduceNativeSourceIR([
+      source('s-path-a', [{ proposalId: 'path-a', sourceId: 's-path-a', pageType: 'entity', label: 'Path A' }], { sourcePath: 'notes/shared.md' }),
+      source('s-path-b', [{ proposalId: 'path-b', sourceId: 's-path-b', pageType: 'entity', label: 'Path B' }], { sourcePath: 'notes/SHARED.md' }),
+    ], options())).toThrow(/duplicate source path/u);
+  });
+
+  it('refuses aliases which collide with another page label', () => {
+    const result = reduceNativeSourceIR([
+      source('s-one', [{ proposalId: 'one', sourceId: 's-one', pageType: 'entity', label: 'One', aliases: ['Two'] }]),
+      source('s-two', [{ proposalId: 'two', sourceId: 's-two', pageType: 'entity', label: 'Two' }]),
+    ], options());
+
+    expect(result.canApply).toBe(false);
+    expect(result.reasons.some(reason => reason.startsWith('ambiguous-alias:Two:'))).toBe(true);
   });
 });

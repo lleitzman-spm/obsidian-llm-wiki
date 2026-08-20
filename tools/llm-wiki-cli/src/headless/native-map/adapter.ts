@@ -12,8 +12,12 @@ import { basename, extname } from 'node:path';
 import { PROMPTS } from '../../../../../src/prompts';
 import { calculateBatchLimits, adjustBatchSizeForResponse, getCustomTypeCaps } from '../../../../../src/core/batch-limits';
 import { parseJsonResult } from '../../../../../src/core/json';
+import { coerceToArray } from '../../../../../src/core/arrays';
+import { checkCumulativeLimits, checkEmptyBatch, detectConvergence } from '../../../../../src/core/convergence-detector';
+import { matchExtractedToExisting } from '../../../../../src/core/index-search';
+import { decideSourceLemma } from '../../../../../src/core/source-lemma';
 import { renderTemplate } from '../../../../../src/core/template-renderer';
-import { TOKENS_PER_ITEM_BUDGET, MAX_TOKENS_BATCH, SOURCE_ANALYZER_RETRY_MULTIPLIER } from '../../../../../src/constants';
+import { TOKENS_PER_ITEM_BUDGET, MAX_TOKENS_BATCH, SOURCE_ANALYZER_RETRY_MULTIPLIER, TOKENS_LEMMA_CLASSIFY } from '../../../../../src/constants';
 import { canonicalJson, canonicalJsonSha256, sha256Hex } from '../preflight/hashing';
 import { normalizeLabel, hashDomain } from '../provenance/canonical';
 import type { ProviderCallParams, ProviderTypedResponse } from '../provider';
@@ -31,6 +35,7 @@ import {
   type NativeMapArtifact,
   type NativeMapArtifactKind,
   type NativeMapClient,
+  type NativeMapExistingPage,
   type NativeMapInput,
   type NativeMapIR,
   type NativeMapPolicy,
@@ -100,6 +105,15 @@ const SOURCE_ANALYSIS_JSON_SCHEMA = Object.freeze({
     contradictions: { type: 'array' },
     related_pages: { type: 'array' },
     key_points: { type: 'array' },
+  },
+});
+
+const LEMMA_CLASSIFY_JSON_SCHEMA = Object.freeze({
+  type: 'object',
+  required: ['kind'],
+  additionalProperties: true,
+  properties: {
+    kind: { type: 'string' },
   },
 });
 
@@ -364,6 +378,14 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? uniqueStrings(value.filter((item): item is string => typeof item === 'string')) : [];
 }
 
+function normalizeRelatedPageLabel(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = /^\[\[(?:[^\]|]+\|)?([^\]]+)\]\]$/u.exec(trimmed);
+  return match ? match[1].trim() || null : trimmed;
+}
+
 function assertSource(source: NativeMapSource): { source: NativeMapSource; content: string; byteSha256: string; path: string } {
   if (!source || typeof source !== 'object') throw new NativeMapProtocolError('invalid-source', 'Native source is required');
   const sourceId = nonEmptyString(source.sourceId, 'source.sourceId', 'invalid-source');
@@ -549,15 +571,30 @@ function asProviderParams(
   policy: NativeMapPolicy,
   prompt: string,
   maxTokens: number,
+  task = 'extract',
+  includeThinking = true,
+  maxTokensPerCall = maxTokens * SOURCE_ANALYZER_RETRY_MULTIPLIER,
 ): ProviderCallParams {
   return {
-    task: 'extract',
+    task,
     model: policy.settings.ingestModel?.trim() || policy.settings.model,
     max_tokens: maxTokens,
-    maxTokensPerCall: maxTokens * SOURCE_ANALYZER_RETRY_MULTIPLIER,
+    maxTokensPerCall,
     system: buildSystemPrompt(policy),
     messages: [{ role: 'user', content: prompt }],
     response_format: { type: 'json_object', schema: SOURCE_ANALYSIS_JSON_SCHEMA },
+    ...(includeThinking && policy.settings.disableThinking === true ? { enableThinking: false } : {}),
+  };
+}
+
+function asLemmaParams(policy: NativeMapPolicy, prompt: string): ProviderCallParams {
+  return {
+    task: 'lemma-classify',
+    model: policy.settings.ingestModel?.trim() || policy.settings.model,
+    max_tokens: TOKENS_LEMMA_CLASSIFY,
+    system: buildSystemPrompt(policy),
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object', schema: LEMMA_CLASSIFY_JSON_SCHEMA },
     ...(policy.settings.disableThinking === true ? { enableThinking: false } : {}),
   };
 }
@@ -579,11 +616,59 @@ async function callProvider(
   return { text: await client.createMessage(params) };
 }
 
+function copyExistingPages(value: readonly NativeMapExistingPage[] | undefined): Array<{ title: string; aliases?: string[] }> | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new NativeMapProtocolError('invalid-source', 'existingPages must be an array');
+  }
+  const pages: Array<{ title: string; aliases?: string[] }> = [];
+  for (const page of value) {
+    if (!isRecord(page)) throw new NativeMapProtocolError('invalid-source', 'existingPages entry must be an object');
+    const title = nonEmptyString(page.title, 'existingPages.title', 'invalid-source');
+    const aliases = asStringArray(page.aliases);
+    pages.push(freeze({ title, ...(aliases.length ? { aliases: freeze(aliases) } : {}) }));
+  }
+  return pages;
+}
+
+async function classifySourceLemma(
+  policy: NativeMapPolicy,
+  client: NativeMapClient,
+  name: string,
+  summary: string,
+): Promise<'entity' | 'concept' | null> {
+  const prompt = `A wiki page must be created for "${name}". Decide which kind it is.
+
+entity  — a thing that exists: a substance, gene, protein, organism, product, person, organization, place.
+concept — a thing that is the case: a process, mechanism, method, theory, condition, field of study.
+
+Summary of the source describing it:
+${summary}
+
+Respond with this JSON object and nothing else: {"kind": "entity"} or {"kind": "concept"}`;
+  try {
+    const response = await callProvider(client, asLemmaParams(policy, prompt));
+    const parsed = await parseJsonResult(response.text, undefined, { expectedSchemaFields: ['kind'] });
+    if (!parsed.ok) return null;
+    const kind = typeof parsed.value.kind === 'string' ? parsed.value.kind.trim().toLowerCase() : '';
+    return kind === 'entity' || kind === 'concept' ? kind : null;
+  } catch (error) {
+    console.warn('[Lemma guarantee] type classification call failed:', error);
+    return null;
+  }
+}
+
+function firstActiveTag(policy: NativeMapPolicy, target: 'entity' | 'concept'): string {
+  const tags = target === 'entity' ? policy.entityTags : policy.conceptTags;
+  return tags[0] ?? (target === 'entity' ? 'other' : 'term');
+}
+
 function normalizeBatch(
   value: Record<string, unknown>,
   policy: NativeMapPolicy,
   source: { path: string; content: string; slug: string; extractedAt: string },
 ): {
+  validity: 'valid' | 'empty' | 'unusable';
   entities: NativeEntityProposal[];
   concepts: NativeConceptProposal[];
   sourceTitle: string | null;
@@ -593,14 +678,22 @@ function normalizeBatch(
   keyPoints: string[];
   empty: boolean;
 } {
-  if (!Array.isArray(value.entities) || !Array.isArray(value.concepts)) {
-    throw new NativeMapProtocolError('invalid-response', 'Native extraction response must contain entity and concept arrays');
-  }
-  const entities = value.entities.map(item => normalizeItem(item, 'entity', policy, source) as NativeEntityProposal);
-  const concepts = value.concepts.map(item => normalizeItem(item, 'concept', policy, source) as NativeConceptProposal);
+  // Match SourceAnalyzer.normalizeBatchResponse: non-array values are
+  // coerced to empty arrays, and malformed array members are ignored when
+  // they do not carry a usable name.  This keeps harmless model-shape drift
+  // from aborting an otherwise valid source while preserving strict
+  // provenance checks for members that are actually extracted.
+  const rawEntities = coerceToArray<unknown>(value.entities);
+  const rawConcepts = coerceToArray<unknown>(value.concepts);
+  const entities = rawEntities
+    .filter((item): item is JsonRecord => isRecord(item) && typeof item.name === 'string' && item.name.trim().length > 0)
+    .map(item => normalizeItem(item, 'entity', policy, source) as NativeEntityProposal);
+  const concepts = rawConcepts
+    .filter((item): item is JsonRecord => isRecord(item) && typeof item.name === 'string' && item.name.trim().length > 0)
+    .map(item => normalizeItem(item, 'concept', policy, source) as NativeConceptProposal);
   const contradictions: NativeContradictionProposal[] = [];
   if (Array.isArray(value.contradictions)) {
-    for (const item of value.contradictions) {
+    for (const item of coerceToArray<unknown>(value.contradictions)) {
       if (!isRecord(item)) throw new NativeMapProtocolError('invalid-response', 'Contradiction proposal must be an object');
       contradictions.push(freeze({
         claim: nonEmptyString(item.claim, 'contradiction.claim', 'invalid-response'),
@@ -616,9 +709,17 @@ function normalizeBatch(
     sourceTitle: typeof value.source_title === 'string' && value.source_title.trim() ? value.source_title.trim() : null,
     summary: typeof value.summary === 'string' && value.summary.trim() ? value.summary.trim() : null,
     contradictions,
-    relatedPages: asStringArray(value.related_pages),
-    keyPoints: asStringArray(value.key_points),
+    relatedPages: uniqueStrings(coerceToArray<unknown>(value.related_pages)
+      .map(normalizeRelatedPageLabel)
+      .filter((item): item is string => item !== null)),
+    keyPoints: uniqueStrings(coerceToArray<unknown>(value.key_points)
+      .filter((item): item is string => typeof item === 'string')),
     empty: entities.length === 0 && concepts.length === 0,
+    validity: value.entities === undefined && value.concepts === undefined
+      ? 'unusable'
+      : entities.length === 0 && concepts.length === 0
+        ? 'empty'
+        : 'valid',
   };
 }
 
@@ -769,6 +870,9 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
   const sourceMeta = readFrontmatter(content);
   const sourceLanguage = sourceMeta.language;
   const slug = sourceSlug(checked.path);
+  // Copy the catalog at the boundary.  The worker never retains a host
+  // object or reads a live vault while extracting this source.
+  const existingPages = copyExistingPages(input.existingPages);
   const limits = calculateBatchLimits(content.length, policy.settings.extractionGranularity, {
     entityCap: policy.settings.customEntityLimit,
     conceptCap: policy.settings.customConceptLimit,
@@ -797,6 +901,9 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
   const sourceRef = { path: checked.path, content, slug, extractedAt: source.extractedAt ?? NATIVE_MAP_DEFAULT_EXTRACTED_AT };
   let currentBatchSize = limits.initialBatchSize;
   let retriedAtSize = false;
+  let batchSizeHalved = false;
+  let placeholderRetried = false;
+  let firstBatchAccepted = false;
   let firstTitle: string | null = null;
   let firstSummary: string | null = null;
   let entities: NativeEntityProposal[] = [];
@@ -804,6 +911,8 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
   let contradictions: NativeContradictionProposal[] = [];
   let relatedPages: string[] = [];
   let keyPoints: string[] = [];
+  const baseMaxTokens = Math.max(MAX_TOKENS_BATCH, limits.initialBatchSize * TOKENS_PER_ITEM_BUDGET);
+  const retryCap = baseMaxTokens * SOURCE_ANALYZER_RETRY_MULTIPLIER;
   for (let batch = 0; batch < configuredMaxBatches; batch += 1) {
     const first = batch === 0;
     const prompt = renderTemplate(
@@ -819,18 +928,46 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
     );
     const maxTokens = Math.max(MAX_TOKENS_BATCH, currentBatchSize * TOKENS_PER_ITEM_BUDGET);
     const response = await callProvider(input.client, asProviderParams(policy, prompt, maxTokens));
-    const parsed = await parseJsonResult(response.text, undefined, { expectedSchemaFields: ['entities', 'concepts'] });
+    const canHalve = !retriedAtSize && currentBatchSize > limits.minBatchSize;
+    // Keep parity with SourceAnalyzer: a length-truncated response is first
+    // given a bounded halve-and-retry opportunity. Once that opportunity is
+    // spent (or for a normal malformed response), JSON repair is the final
+    // salvage path and may only rewrite syntax, never source values.
+    const repairFn = response.finishReason === 'length' && canHalve
+      ? undefined
+      : async (malformedJson: string): Promise<string> => {
+        const repairPrompt = `Fix the following malformed JSON. Only fix JSON syntax errors (unescaped quotes, trailing commas, missing brackets). Do NOT change any values or content. Output ONLY the fixed JSON, no other text.\n\n${malformedJson}`;
+        const repaired = await callProvider(
+          input.client,
+          asProviderParams(policy, repairPrompt, retryCap, 'extract-retry', false, retryCap),
+        );
+        return repaired.text;
+      };
+    const parsed = await parseJsonResult(response.text, repairFn, { expectedSchemaFields: ['entities', 'concepts'] });
+    const parseReason = parsed.ok ? undefined : ('reason' in parsed ? parsed.reason : 'unknown');
     if (!parsed.ok) {
-      if (response.finishReason === 'length' && !retriedAtSize && currentBatchSize > limits.minBatchSize) {
+      if (response.finishReason === 'length' && canHalve) {
         currentBatchSize = Math.max(limits.minBatchSize, Math.floor(currentBatchSize * 0.5));
         retriedAtSize = true;
         batch -= 1;
         continue;
       }
-      throw new NativeMapProtocolError('invalid-response', `Native extraction batch ${batch + 1} could not be parsed (${parsed.reason})`);
+      if (first && !placeholderRetried && parseReason === 'thinking-block-only') {
+        placeholderRetried = true;
+        batch -= 1;
+        continue;
+      }
+      if (first) {
+        throw new NativeMapProtocolError('invalid-response', `Native extraction batch ${batch + 1} could not be parsed (${parseReason})`);
+      }
+      break;
     }
     const normalized = normalizeBatch(parsed.value, policy, sourceRef);
     if (first) {
+      if (normalized.validity === 'unusable') {
+        throw new NativeMapProtocolError('invalid-response', 'Native extraction first batch contained neither entities nor concepts');
+      }
+      firstBatchAccepted = true;
       firstTitle = normalized.sourceTitle;
       firstSummary = normalized.summary;
       contradictions = normalized.contradictions;
@@ -843,11 +980,82 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
     retriedAtSize = false;
     if (customCaps.entityCap !== null) entities = entities.slice(0, customCaps.entityCap);
     if (customCaps.conceptCap !== null) concepts = concepts.slice(0, customCaps.conceptCap);
-    if (normalized.empty || entities.length + concepts.length === priorCount) break;
+    const rawTotal = normalized.entities.length + normalized.concepts.length;
+    const newTotal = entities.length + concepts.length - priorCount;
+    if (first) {
+      if (normalized.validity === 'empty') break;
+      continue;
+    }
+
+    const emptyCheck = checkEmptyBatch(rawTotal, newTotal);
+    if (emptyCheck.shouldStop) break;
+
     currentBatchSize = adjustBatchSizeForResponse(currentBatchSize, response.text.length, limits.responseFullnessThreshold);
+    const convergence = detectConvergence(rawTotal, currentBatchSize, batchSizeHalved, limits.minBatchSize);
+    if (convergence.shouldStop) break;
+    if (convergence.newBatchSizeHalved) {
+      batchSizeHalved = true;
+      currentBatchSize = convergence.newBatchSize;
+    }
+    const cumulativeCheck = checkCumulativeLimits(entities.length, concepts.length, {
+      customEntityCap: customCaps.entityCap,
+      customConceptCap: customCaps.conceptCap,
+      maxTotalItems: limits.maxTotalItems,
+    });
+    if (cumulativeCheck.shouldStop) break;
   }
-  if (!firstSummary) throw new NativeMapProtocolError('invalid-response', `Native extraction did not return a source summary for ${checked.path}`);
+  if (!firstBatchAccepted) throw new NativeMapProtocolError('invalid-response', `Native extraction did not produce a first batch for ${checked.path}`);
   const sourceTitle = firstTitle || basenameWithoutExtension(checked.path);
+  const summary = firstSummary ?? '';
+
+  // SourceAnalyzer deliberately performs related-page matching after all
+  // extraction rounds and outside the model prompt.  The optional catalog is
+  // an immutable host projection, so this remains source-isolated while
+  // avoiding fabricated/unresolvable LLM page labels.  Keep the legacy
+  // unresolved proposals only when no catalog was supplied at all.
+  if (existingPages !== undefined) {
+    const allExtractedNames = [
+      ...entities.map(item => item.name),
+      ...concepts.map(item => item.name),
+    ];
+    relatedPages = matchExtractedToExisting(allExtractedNames, existingPages);
+  }
+
+  // Patch 16 parity: extraction asks what a source mentions, not what the
+  // source itself is about.  Decide the missing source lemma deterministically
+  // and spend one bounded classification call only when the summary is usable.
+  // As in SourceAnalyzer, the candidate is named after the filename rather
+  // than trusting a model-supplied source_title, and no mention is invented.
+  const lemmaName = basenameWithoutExtension(checked.path);
+  const lemmaDecision = decideSourceLemma({
+    sourceTitle: lemmaName,
+    sourceAliases: sourceMeta.aliases,
+    entities: entities.map(item => ({ name: item.name, aliases: [...item.aliases] })),
+    concepts: concepts.map(item => ({ name: item.name, aliases: [...item.aliases] })),
+  });
+  if (lemmaDecision.action === 'add' && summary.trim().length > 0) {
+    const target = await classifySourceLemma(policy, input.client, lemmaDecision.name, summary);
+    const capHit = target === 'entity'
+      ? customCaps.entityCap !== null && entities.length >= customCaps.entityCap
+      : target === 'concept'
+        ? customCaps.conceptCap !== null && concepts.length >= customCaps.conceptCap
+        : false;
+    if (target !== null && !capHit) {
+      const candidate = freeze({
+        name: lemmaDecision.name,
+        type: firstActiveTag(policy, target),
+        aliases: freeze([] as string[]),
+        summary,
+        mentions_in_source: freeze([] as string[]),
+        mentions_with_provenance: freeze([] as NativeMention[]),
+        related_entities: freeze([] as string[]),
+        related_concepts: freeze([] as string[]),
+      });
+      if (target === 'entity') entities = [...entities, candidate as NativeEntityProposal];
+      else concepts = [...concepts, candidate as NativeConceptProposal];
+    }
+  }
+
   const allItems = [...entities, ...concepts];
   const mentions = collectMentions(allItems);
   const claims: NativeClaimProposal[] = [claimFor(
@@ -855,7 +1063,7 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
     checked.path,
     { pageType: 'source', label: sourceTitle },
     'source-summary',
-    firstSummary,
+    summary,
     'proposed',
     [],
   )];
@@ -865,13 +1073,13 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
   const aliases = aliasProposals(checked.path, sourceTitle, sourceMeta.aliases, entities, concepts);
   const related = relatedProposals(checked.path, sourceTitle, entities, concepts, relatedPages);
   const artifacts = buildArtifacts(
-    source.sourceId, checked.byteSha256, checked.path, sourceTitle, firstSummary,
+    source.sourceId, checked.byteSha256, checked.path, sourceTitle, summary,
     sourceMeta.aliases, keyPoints, entities, concepts, claims, aliases, related,
   );
   const body = {
     contractVersion: NATIVE_MAP_CONTRACT_VERSION,
     source: { sourceId: source.sourceId, sourcePath: checked.path, byteSha256: checked.byteSha256, byteCount: source.sourceBytes.byteLength },
-    sourceTitle, summary: firstSummary, sourceAliases: sourceMeta.aliases, keyPoints,
+    sourceTitle, summary, sourceAliases: sourceMeta.aliases, keyPoints,
     entities, concepts, mentions, claims, aliases, related, contradictions, artifacts,
     policySha256: policy.policySha256,
   };

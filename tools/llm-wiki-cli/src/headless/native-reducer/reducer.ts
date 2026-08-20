@@ -58,10 +58,12 @@ function sha256(value: string): string {
 }
 
 function uniqueSorted(values: Iterable<string>): string[] {
+  const candidates = [...values]
+    .map(text)
+    .filter(Boolean)
+    .sort((left, right) => normalizeLabel(left).localeCompare(normalizeLabel(right)) || left.localeCompare(right));
   const byKey = new Map<string, string>();
-  for (const raw of values) {
-    const value = text(raw);
-    if (!value) continue;
+  for (const value of candidates) {
     const key = normalizeLabel(value);
     if (!byKey.has(key)) byKey.set(key, value);
   }
@@ -95,19 +97,47 @@ function safeSlug(label: string, preserveCase: boolean): string {
 }
 
 function normalizeFolder(value: string, name: string): string {
-  const folder = text(value).replace(/\\/gu, '/').replace(/^\/+|\/+$/gu, '');
-  if (!folder || folder.split('/').some(part => part === '..' || part === '.')) {
+  const raw = text(value).replace(/\\/gu, '/');
+  const folder = raw.replace(/^\/+|\/+$/gu, '');
+  if (!raw || raw.startsWith('/') || /^[A-Za-z]:\//u.test(raw) || folder.split('/').some(part => !part || part === '..' || part === '.')) {
     throw new NativeReductionError(`${name} must be a relative vault path: ${JSON.stringify(value)}`);
   }
   return folder;
 }
 
 function assertRelativePath(value: string, name: string): string {
-  const path = text(value).replace(/\\/gu, '/').replace(/^\/+|\/+$/gu, '');
-  if (!path || path.split('/').some(part => part === '..' || part === '.')) {
+  const raw = text(value).replace(/\\/gu, '/');
+  const path = raw.replace(/^\/+|\/+$/gu, '');
+  if (!raw || raw.startsWith('/') || /^[A-Za-z]:\//u.test(raw) || path.split('/').some(part => !part || part === '..' || part === '.')) {
     throw new NativeReductionError(`${name} must be a relative vault path: ${JSON.stringify(value)}`);
   }
   return path;
+}
+
+/**
+ * Obsidian's vault is commonly hosted on a case-insensitive filesystem.  A
+ * reducer running outside that filesystem must still refuse two desired
+ * files which differ only by slash spelling or case; otherwise a later
+ * transaction can overwrite one of them nondeterministically.
+ */
+function pathCollisionKey(value: string): string {
+  return value.replace(/\\/gu, '/').normalize('NFKC').toLocaleLowerCase('en-US');
+}
+
+function existingFileContent(existingFiles: ReadonlyMap<string, string> | undefined, path: string): string | undefined {
+  if (!existingFiles) return undefined;
+  const key = pathCollisionKey(path);
+  let match: string | undefined;
+  let matchPath: string | undefined;
+  for (const [candidatePath, content] of existingFiles.entries()) {
+    if (pathCollisionKey(candidatePath) !== key) continue;
+    if (matchPath !== undefined && candidatePath !== matchPath) {
+      throw new NativeReductionError(`existing files contain a case-insensitive path collision: ${path}`);
+    }
+    matchPath = candidatePath;
+    match = content;
+  }
+  return match;
 }
 
 function assertSourceReference(value: string, name: string): string {
@@ -315,7 +345,7 @@ function desiredFile(
   existingFiles?: ReadonlyMap<string, string>,
   canonicalKey?: NativeCanonicalKey,
 ): NativeDesiredFile {
-  const current = existingFiles?.get(path);
+  const current = existingFileContent(existingFiles, path);
   let action: NativeDesiredAction = current === undefined ? 'create' : current === content ? 'unchanged' : 'replace';
   return {
     path,
@@ -337,9 +367,15 @@ function inferExistingPages(options: NativeReducerOptions): NativeExistingPage[]
 
 function normalizeProposal(proposal: NativePageProposal, source: NativeSourceScopedIR): NativePageProposal {
   if (proposal.sourceId !== source.sourceId) throw new NativeReductionError(`proposal ${proposal.proposalId} escaped source ${source.sourceId}`);
-  if (!proposal.proposalId.trim()) throw new NativeReductionError(`source ${source.sourceId} has an empty proposal id`);
+  if (!text(proposal.proposalId)) throw new NativeReductionError(`source ${source.sourceId} has an empty proposal id`);
   if (proposal.pageType !== 'entity' && proposal.pageType !== 'concept') throw new NativeReductionError(`unsupported native page type: ${String(proposal.pageType)}`);
   if (!text(proposal.label)) throw new NativeReductionError(`proposal ${proposal.proposalId} has an empty label`);
+  for (const related of proposal.related ?? []) {
+    if (related.pageType !== 'entity' && related.pageType !== 'concept') {
+      throw new NativeReductionError(`proposal ${proposal.proposalId} has an unsupported related page type`);
+    }
+    if (!text(related.label)) throw new NativeReductionError(`proposal ${proposal.proposalId} has an empty related label`);
+  }
   return proposal;
 }
 
@@ -434,11 +470,15 @@ export function nativeMapIRToSourceScopedIR(source: NativeMapIR): NativeSourceSc
     const key = partitionKeyString(canonicalPartitionKey(claim.subject.pageType, claim.subject.label));
     const extra = getExtras(claim.subject.pageType, claim.subject.label);
     const role = claim.disposition === 'contested' ? 'contests' as const : 'supports' as const;
+    const claimPath = assertSourceReference(claim.sourcePath || sourcePath, `claim ${claim.claimId}.sourcePath`);
+    if (pathCollisionKey(claimPath) !== pathCollisionKey(sourcePath)) {
+      unsupported.push(`native-map-claim-source-mismatch:${claim.claimId}`);
+    }
     const evidence = claim.evidenceQuotes.map((quote, index) => ({
       evidenceId: `claim:${sha256(`${claim.claimId}\u0000${index}\u0000${quote}`)}`,
       role,
       quote: text(quote),
-      sourcePath: assertSourceReference(claim.sourcePath || sourcePath, `claim ${claim.claimId}.sourcePath`),
+      sourcePath: claimPath,
       sourceSlug,
       sourceId,
     })).filter(item => item.quote);
@@ -457,15 +497,36 @@ export function nativeMapIRToSourceScopedIR(source: NativeMapIR): NativeSourceSc
 
   for (const alias of source.aliases) {
     if (alias.targetPageType === 'entity' || alias.targetPageType === 'concept') {
-      getExtras(alias.targetPageType, alias.targetLabel).aliases.push(alias.alias);
-      if (alias.sourcePath !== sourcePath) unsupported.push(`native-map-alias-source-mismatch:${alias.alias}`);
+      const aliasSourcePath = assertSourceReference(alias.sourcePath, `alias ${alias.alias}.sourcePath`);
+      if (pathCollisionKey(aliasSourcePath) !== pathCollisionKey(sourcePath)) {
+        unsupported.push(`native-map-alias-source-mismatch:${alias.alias}`);
+      }
+      const targetLabels = alias.targetPageType === 'entity' ? entityLabels : conceptLabels;
+      const targetLabel = normalizeLabel(alias.targetLabel);
+      if (!targetLabel || !targetLabels.has(targetLabel)) {
+        unsupported.push(`native-map-alias-target-missing:${alias.alias}`);
+      } else if (text(alias.alias)) {
+        getExtras(alias.targetPageType, alias.targetLabel).aliases.push(alias.alias);
+      } else {
+        unsupported.push('native-map-alias-empty');
+      }
     } else {
       unsupported.push(`native-map-alias-target:${alias.alias}`);
     }
   }
   for (const related of source.related) {
-    if (related.pageType !== 'entity' && related.pageType !== 'concept') unsupported.push(`native-map-related-target:${related.label}`);
-    if (related.sourcePath !== sourcePath) unsupported.push(`native-map-related-source-mismatch:${related.label}`);
+    const relatedSourcePath = assertSourceReference(related.sourcePath, `related ${related.label}.sourcePath`);
+    if (pathCollisionKey(relatedSourcePath) !== pathCollisionKey(sourcePath)) {
+      unsupported.push(`native-map-related-source-mismatch:${related.label}`);
+    }
+    if (related.pageType !== 'entity' && related.pageType !== 'concept') {
+      unsupported.push(`native-map-related-target:${related.label}`);
+      continue;
+    }
+    const targetLabels = related.pageType === 'entity' ? entityLabels : conceptLabels;
+    if (!normalizeLabel(related.label) || !targetLabels.has(normalizeLabel(related.label))) {
+      unsupported.push(`native-map-related-target-missing:${related.label}`);
+    }
   }
   for (const contradiction of source.contradictions) {
     const normalized = normalizeLabel(contradiction.source_page.split('/').pop()?.replace(/\.md$/iu, '') ?? contradiction.source_page);
@@ -525,7 +586,16 @@ interface Group {
 
 function dedupeStatements(values: readonly NativeStatement[]): NativeStatement[] {
   const byKey = new Map<string, NativeStatement>();
-  for (const statement of values) {
+  const ordered = [...values].sort((left, right) => {
+    const leftText = text(left.text);
+    const rightText = text(right.text);
+    return statementKey(left).localeCompare(statementKey(right))
+      || ROLE_ORDER[evidenceRole(left)] - ROLE_ORDER[evidenceRole(right)]
+      || normalizeLabel(leftText).localeCompare(normalizeLabel(rightText))
+      || leftText.localeCompare(rightText)
+      || left.statementId.localeCompare(right.statementId);
+  });
+  for (const statement of ordered) {
     const normalized = text(statement.text);
     if (!normalized) continue;
     const next = { ...statement, text: normalized, role: evidenceRole(statement) };
@@ -537,7 +607,17 @@ function dedupeStatements(values: readonly NativeStatement[]): NativeStatement[]
 
 function dedupeEvidence(values: readonly NativeEvidence[]): NativeEvidence[] {
   const byKey = new Map<string, NativeEvidence>();
-  for (const item of values) {
+  const ordered = [...values].sort((left, right) => {
+    const leftRange = left.byteRange ? `${left.byteRange.start}:${left.byteRange.end}` : '';
+    const rightRange = right.byteRange ? `${right.byteRange.start}:${right.byteRange.end}` : '';
+    return evidenceKey(left).localeCompare(evidenceKey(right))
+      || ROLE_ORDER[evidenceRole(left)] - ROLE_ORDER[evidenceRole(right)]
+      || (left.sourceId ?? '').localeCompare(right.sourceId ?? '')
+      || (left.sourcePath ?? '').localeCompare(right.sourcePath ?? '')
+      || text(left.quote).localeCompare(text(right.quote))
+      || leftRange.localeCompare(rightRange);
+  });
+  for (const item of ordered) {
     const id = text(item.evidenceId);
     if (!id) continue;
     const next = { ...item, evidenceId: id, ...(item.role ? { role: item.role } : {}) };
@@ -549,7 +629,8 @@ function dedupeEvidence(values: readonly NativeEvidence[]): NativeEvidence[] {
 
 function dedupeRelated(values: readonly NativeRelatedProposal[]): NativeRelatedProposal[] {
   const byKey = new Map<string, NativeRelatedProposal>();
-  for (const item of values) {
+  const ordered = [...values].sort((left, right) => relatedKey(left).localeCompare(relatedKey(right)) || text(left.label).localeCompare(text(right.label)));
+  for (const item of ordered) {
     if (item.pageType !== 'entity' && item.pageType !== 'concept') continue;
     const label = text(item.label);
     if (!label) continue;
@@ -697,10 +778,21 @@ function renderLog(options: NativeReducerOptions, pages: readonly NativePageCand
 }
 
 function checkAliasCollisions(pages: readonly NativePageCandidate[], reasons: string[]): void {
+  const pageLabels = new Map<string, string>();
+  for (const page of pages) {
+    const key = normalizeLabel(page.label);
+    const prior = pageLabels.get(key);
+    if (prior && prior !== page.key.keyString) reasons.push(`duplicate-page-label:${key}:${prior}:${page.key.keyString}`);
+    else pageLabels.set(key, page.key.keyString);
+  }
   const owners = new Map<string, string>();
   for (const page of pages) {
     for (const alias of page.aliases) {
       const key = normalizeLabel(alias);
+      const pageOwner = pageLabels.get(key);
+      if (pageOwner && pageOwner !== page.key.keyString) {
+        reasons.push(`ambiguous-alias:${alias}:${pageOwner}:${page.key.keyString}`);
+      }
       const prior = owners.get(key);
       if (prior && prior !== page.key.keyString) reasons.push(`ambiguous-alias:${alias}:${prior}:${page.key.keyString}`);
       else owners.set(key, page.key.keyString);
@@ -710,7 +802,7 @@ function checkAliasCollisions(pages: readonly NativePageCandidate[], reasons: st
 
 function compareExistingPath(existing: NativeExistingPage, candidate: NativePageCandidate, reasons: string[]): void {
   const existingMeta = parseFrontmatter(existing.content);
-  if (existing.pageType !== candidate.pageType && existing.pageType !== 'source') reasons.push(`existing-page-type-mismatch:${candidate.path}`);
+  if (existing.pageType !== candidate.pageType) reasons.push(`existing-page-type-mismatch:${candidate.path}`);
   if (existingMeta.type && existingMeta.type !== candidate.pageType) reasons.push(`existing-frontmatter-type-mismatch:${candidate.path}`);
 }
 
@@ -730,18 +822,29 @@ export function reduceNativeSourceIR(
   if (!text(options.global.schemaContent)) throw new NativeReductionError('global schema content is required for a complete desired-state plan');
   const wikiFolder = normalizeFolder(options.wikiFolder, 'wikiFolder');
   const sourceIds = new Set<string>();
+  const sourcePaths = new Map<string, string>();
   const sources = [...input].sort((left, right) => left.sourceId.localeCompare(right.sourceId));
   for (const source of sources) {
     if (!text(source.sourceId) || sourceIds.has(source.sourceId)) throw new NativeReductionError(`duplicate or empty source id: ${source.sourceId}`);
     sourceIds.add(source.sourceId);
     if (!text(source.sourcePath) || !text(source.sourceSlug)) throw new NativeReductionError(`source ${source.sourceId} lacks source path or slug`);
-    assertSourceReference(source.sourcePath, `source ${source.sourceId}.sourcePath`);
+    const normalizedSourcePath = assertSourceReference(source.sourcePath, `source ${source.sourceId}.sourcePath`);
+    const sourcePathKey = pathCollisionKey(normalizedSourcePath);
+    const priorSourceId = sourcePaths.get(sourcePathKey);
+    if (priorSourceId && priorSourceId !== source.sourceId) {
+      throw new NativeReductionError(`duplicate source path across source ids: ${normalizedSourcePath}`);
+    }
+    sourcePaths.set(sourcePathKey, source.sourceId);
     safeSlug(source.sourceSlug, true);
   }
   const groups = new Map<string, Group>();
   for (const source of sources) {
+    const proposalIds = new Set<string>();
     for (const raw of source.proposals) {
       const proposal = normalizeProposal(raw, source);
+      const proposalId = text(proposal.proposalId);
+      if (proposalIds.has(proposalId)) throw new NativeReductionError(`duplicate proposal id in source ${source.sourceId}: ${proposalId}`);
+      proposalIds.add(proposalId);
       const key = canonicalKey(proposal.pageType, proposal.label);
       const existing = groups.get(key.keyString);
       if (existing) {
@@ -754,8 +857,14 @@ export function reduceNativeSourceIR(
   }
   const existingPages = inferExistingPages(options);
   const existingByKey = new Map<string, NativeExistingPage>();
+  const existingByPath = new Map<string, NativeExistingPage>();
   for (const existing of existingPages) {
-    const label = text(existing.label) || existing.path.split('/').pop()?.replace(/\.md$/iu, '') || '';
+    const normalizedPath = assertRelativePath(existing.path, `existing page ${existing.path}`);
+    const pathKey = pathCollisionKey(normalizedPath);
+    const priorPath = existingByPath.get(pathKey);
+    if (priorPath) throw new NativeReductionError(`duplicate existing page path: ${normalizedPath}`);
+    existingByPath.set(pathKey, existing);
+    const label = text(existing.label) || normalizedPath.split('/').pop()?.replace(/\.md$/iu, '') || '';
     if (existing.pageType === 'entity' || existing.pageType === 'concept') {
       const key = canonicalKey(existing.pageType, label);
       if (existingByKey.has(key.keyString)) throw new NativeReductionError(`duplicate existing page key: ${key.keyString}`);
@@ -791,16 +900,25 @@ export function reduceNativeSourceIR(
       for (const group of sameLabel) group.crossTypeAlias = true;
     }
   }
-  const comparisonReasons = [...structuralReasons];
+  // Adapter-level refusals are authoritative.  They must remain in both the
+  // comparison reasons and the explicit unsupported list; dropping one here
+  // would let a partially understood native-map result become applyable.
+  const sourceUnsupported = sources.flatMap(source => source.unsupported ?? []).map(text).filter(Boolean);
+  const comparisonReasons = [...sourceUnsupported, ...structuralReasons];
   const pages = [...groups.values()].sort((left, right) => left.key.keyString.localeCompare(right.key.keyString)).map(group => candidateForGroup(group, options, comparisonReasons));
   checkAliasCollisions(pages, comparisonReasons);
   const pathOwners = new Map<string, string>();
   for (const page of pages) {
-    const prior = pathOwners.get(page.path);
+    const pagePathKey = pathCollisionKey(page.path);
+    const prior = pathOwners.get(pagePathKey);
     if (prior && prior !== page.key.keyString) comparisonReasons.push(`path-collision:${page.path}:${prior}:${page.key.keyString}`);
-    pathOwners.set(page.path, page.key.keyString);
-    const existing = existingPages.find(item => item.path === page.path);
-    if (existing) compareExistingPath(existing, page, comparisonReasons);
+    pathOwners.set(pagePathKey, page.key.keyString);
+    const existing = existingByPath.get(pagePathKey);
+    if (existing) {
+      const existingForKey = existingByKey.get(page.key.keyString);
+      if (existingForKey !== existing) comparisonReasons.push(`existing-path-collision:${page.path}:${existing.path}`);
+      compareExistingPath(existing, page, comparisonReasons);
+    }
   }
   const desiredPages = pages.map(page => desiredFile(page.path, page.pageType, 'partition', page.content, page.sourceIds, options.existingFiles, page.key));
   const sourceFiles = sources.map(source => desiredFile(sourcePath(source, { ...options, wikiFolder }), 'source', 'serialized-global', renderSourcePage(source, options), [source.sourceId], options.existingFiles));
@@ -816,6 +934,12 @@ export function reduceNativeSourceIR(
   // concept frontmatter links point at them.  Keep the phase order explicit:
   // sources first, then the native global trio in index/log/schema order.
   const serializedGlobalFiles = [...sourceFiles.sort((left, right) => left.path.localeCompare(right.path)), ...globalFiles];
+  for (const file of serializedGlobalFiles) {
+    const existing = existingByPath.get(pathCollisionKey(file.path));
+    if (existing && existing.pageType !== file.kind) {
+      comparisonReasons.push(`existing-file-kind-mismatch:${file.path}:${existing.pageType}:${file.kind}`);
+    }
+  }
   const globalPhase: NativeGlobalPhase = Object.freeze({
     serialized: true,
     serializationOrder: Object.freeze(serializedGlobalFiles.map(file => file.path)),
@@ -823,14 +947,23 @@ export function reduceNativeSourceIR(
   });
   const allPathOwners = new Map<string, string>();
   for (const file of [...desiredPages, ...serializedGlobalFiles]) {
-    const owner = allPathOwners.get(file.path);
+    const filePathKey = pathCollisionKey(file.path);
+    const owner = allPathOwners.get(filePathKey);
     const nextOwner = `${file.kind}:${file.sourceIds.join(',')}`;
     if (owner && owner !== nextOwner) comparisonReasons.push(`global-path-collision:${file.path}:${owner}:${nextOwner}`);
-    allPathOwners.set(file.path, nextOwner);
+    allPathOwners.set(filePathKey, nextOwner);
   }
   const desiredState = Object.freeze([...desiredPages, ...serializedGlobalFiles].sort((left, right) => left.path.localeCompare(right.path)));
   const reasons = uniqueSorted(comparisonReasons);
-  const unsupported = reasons.filter(reason => reason.startsWith('unresolved-cross-type-collision:') || reason.startsWith('ambiguous-alias:') || reason.startsWith('path-collision:') || reason.startsWith('provider-frontmatter:'));
+  const unsupported = uniqueSorted([
+    ...sourceUnsupported,
+    ...reasons.filter(reason => reason.startsWith('unresolved-cross-type-collision:')
+      || reason.startsWith('ambiguous-alias:')
+      || reason.startsWith('path-collision:')
+      || reason.startsWith('global-path-collision:')
+      || reason.startsWith('existing-path-collision:')
+      || reason.startsWith('provider-frontmatter:')),
+  ]);
   const status = reasons.length > 0 ? 'requires-native-comparison' as const : 'candidate' as const;
   return Object.freeze({
     version: 'native-reducer/v1' as const,

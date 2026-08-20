@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   createTransactionPlan,
+  hashBytes,
+  MutationBoundaryError,
   NodeTransactionFileSystem,
   ReadbackMismatchError,
   RestoreFailureError,
@@ -408,5 +410,71 @@ describe('transaction WAL writer', () => {
     roots.push(rootAlias);
     const aliased = new NodeTransactionFileSystem(rootAlias);
     await expect(aliased.read('linked/secret.md')).rejects.toThrow(/symlink|junction|reparse/i);
+  });
+
+  it('rechecks the supplied CAS precondition inside write and remove boundaries', async () => {
+    const root = await tempRoot();
+    const target = nodePath.join(root, 'note.md');
+    await writeFile(target, 'before');
+    const fileSystem = new NodeTransactionFileSystem(root);
+
+    await expect(fileSystem.write('note.md', new TextEncoder().encode('new'), hashBytes(new TextEncoder().encode('foreign'))))
+      .rejects.toBeInstanceOf(StalePreconditionError);
+    expect(await bytes(target)).toBe('before');
+
+    await expect(fileSystem.remove('note.md', hashBytes(new TextEncoder().encode('foreign'))))
+      .rejects.toBeInstanceOf(StalePreconditionError);
+    expect(await bytes(target)).toBe('before');
+  });
+
+  it('serializes rooted mutations and rejects a second writer with a stale identity/CAS', async () => {
+    const root = await tempRoot();
+    const target = nodePath.join(root, 'note.md');
+    await writeFile(target, 'before');
+    const firstFileSystem = new NodeTransactionFileSystem(root);
+    const secondFileSystem = new NodeTransactionFileSystem(root);
+    const beforeHash = hashBytes(new TextEncoder().encode('before'));
+    const results = await Promise.allSettled([
+      firstFileSystem.write('note.md', new TextEncoder().encode('first'), beforeHash),
+      secondFileSystem.write('note.md', new TextEncoder().encode('second'), beforeHash),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected').map((result) => result.reason)).toEqual([
+      expect.any(StalePreconditionError),
+    ]);
+    expect(['first', 'second']).toContain(await bytes(target));
+  });
+
+  it('keeps a post-mutation identity failure visible to rollback', async () => {
+    const root = await tempRoot();
+    const target = nodePath.join(root, 'note.md');
+    await writeFile(target, 'before');
+    const plan = createTransactionPlan({
+      fence: 17,
+      transactionId: 'tx-boundary-visible',
+      current: [{ path: 'note.md', bytes: 'before' }],
+      desired: [{ path: 'note.md', bytes: 'after' }],
+    });
+    const store = new Map<string, Uint8Array>([['note.md', new TextEncoder().encode('before')]]);
+    let failAfterMutation = true;
+    const fileSystem = {
+      read: async (path: string) => store.get(path) ?? null,
+      write: async (path: string, value: Uint8Array) => {
+        store.set(path, new Uint8Array(value));
+        if (failAfterMutation) {
+          failAfterMutation = false;
+          throw new MutationBoundaryError(path, 'post-write identity changed', true);
+        }
+      },
+      remove: async (path: string) => { store.delete(path); },
+    };
+    const log = { assert: [] as FenceToken[], starts: [] as FenceToken[], completes: [] as FenceToken[], freezes: [] as FenceToken[] };
+    const engine = new TransactionEngine({ rootDir: root, lease: leaseFor(log), fileSystem });
+
+    await expect(engine.apply(plan)).rejects.toBeInstanceOf(MutationBoundaryError);
+    expect(new TextDecoder().decode(store.get('note.md'))).toBe('before');
+    expect(log.starts).toEqual([17]);
+    expect(log.completes).toEqual([17]);
   });
 });

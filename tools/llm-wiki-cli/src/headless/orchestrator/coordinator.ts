@@ -7,7 +7,6 @@ import {
   createContractSignature,
   createSignedEnvelope,
   createTerminalRoot,
-  independentlyVerifyRun,
   digestHex,
   hashCanonical,
   publicKeyBase64,
@@ -22,6 +21,8 @@ import {
 } from '../preflight/manifest';
 import { assertSafeCopyRoots, pathsOverlap, resolveSafeRoot, type SafeCopyRoots } from '../preflight/roots';
 import { toContractSourceInventory } from '../preflight/source-inventory';
+import { copySnapshot } from '../copy-snapshot';
+import { independentlyVerifyRunArtifacts } from '../verification';
 import {
   canonicalKeyId,
   claimId,
@@ -75,6 +76,7 @@ import type { ContractSemanticProjection as ContractProjection } from '../proven
 import type {
   CanarySourceDescriptor,
   CorrectnessCensus,
+  CopiedVaultSnapshots,
   HeadlessCanaryInput,
   HeadlessCanaryResult,
 } from './types';
@@ -141,6 +143,48 @@ function assertActivationMode(input: HeadlessCanaryInput): void {
     throw new Error('Native-compatible activation is fail-closed until native/candidate snapshot and comparison components are supplied');
   }
   throw new Error('Native-compatible activation is not implemented by the synthetic scaffold coordinator');
+}
+
+/**
+ * Create both isolated vault copies from one stable live-root observation.
+ *
+ * The copy helper captures the source before each copy because it verifies
+ * source drift while writing. We retain both observations and require their
+ * content-addressed trees to agree before any preflight or candidate work is
+ * allowed to proceed. This prevents a coordinator from accidentally using an
+ * inventory hash as a vault snapshot or treating an un-copied empty root as a
+ * valid candidate vault.
+ */
+async function createCopiedVaultSnapshots(
+  input: HeadlessCanaryInput,
+  allRoots: SafeCopyRoots,
+): Promise<CopiedVaultSnapshots> {
+  const exclusions = ['run', 'lease'] as const;
+  const native = await copySnapshot({
+    root: allRoots.liveRoot.resolved,
+    destinationRoot: allRoots.copyRoots[0].resolved,
+    exclusions,
+    syncRoots: input.syncRoots,
+  });
+  const candidate = await copySnapshot({
+    root: allRoots.liveRoot.resolved,
+    destinationRoot: allRoots.copyRoots[1].resolved,
+    exclusions,
+    syncRoots: input.syncRoots,
+  });
+  if (native.source.treeSha256 !== candidate.source.treeSha256
+    || native.source.manifestSha256 !== candidate.source.manifestSha256) {
+    throw new Error('Live vault changed while creating the native and candidate snapshots');
+  }
+  if (native.destination.treeSha256 !== native.source.treeSha256
+    || candidate.destination.treeSha256 !== candidate.source.treeSha256) {
+    throw new Error('Copied vault snapshot does not exactly match the captured live vault');
+  }
+  return {
+    source: native.source,
+    native: native.destination,
+    candidate: candidate.destination,
+  };
 }
 
 function jsonValue(value: unknown): JsonValue {
@@ -660,6 +704,7 @@ export async function runHeadlessCanary(input: HeadlessCanaryInput): Promise<Hea
     copyRoots: [input.nativeRoot, input.candidateRoot, input.artifactRoot],
     syncRoots: input.syncRoots,
   });
+  const copySnapshots = await createCopiedVaultSnapshots(input, allRoots);
 
   const preflight = await capturePreflightManifest({
     authorityTree: input.authority.tree,
@@ -669,6 +714,7 @@ export async function runHeadlessCanary(input: HeadlessCanaryInput): Promise<Hea
     syncRoots: input.syncRoots,
     fullSettingsBytes: input.settings.fullSettingsBytes,
     settings: input.settings.value,
+    snapshotEntries: copySnapshots.source.entries,
     runtimeHashes: {
       engine: input.runtime.engineVersion,
       bundle: input.runtime.bundleSha256,
@@ -890,18 +936,27 @@ export async function runHeadlessCanary(input: HeadlessCanaryInput): Promise<Hea
       ledgerRootHash: ledger.rootHash(),
     });
     await writeJson(join(artifactDirectory, 'terminal-run-root.json'), terminalRoot);
-    const independentVerification = independentlyVerifyRun({
+    const independentVerification = independentlyVerifyRunArtifacts({
       directory: artifactDirectory,
       registry: input.trustedRegistry,
       expectedRunId: input.runId,
-      terminalScope: 'spm-brain-run-terminalize',
-      replayScope: 'spm-brain-replay-append',
+      requiredScopes: {
+        preflight: 'spm-brain-preflight-sign',
+        manifest: 'spm-brain-run-manifest-sign',
+        worker: 'spm-brain-worker-artifact-sign',
+        candidatePlan: 'spm-brain-candidate-plan-sign',
+        candidateReceipt: 'spm-brain-candidate-receipt-sign',
+        replay: 'spm-brain-replay-append',
+        terminal: 'spm-brain-run-terminalize',
+      },
+      verifyTerminalTree: true,
     });
     return {
       activationMode: input.activationMode,
       runId: input.runId,
       preflight,
       preflightCapture: executionPreflightCapture,
+      copySnapshots,
       contractSourceInventory,
       runManifest,
       sources,

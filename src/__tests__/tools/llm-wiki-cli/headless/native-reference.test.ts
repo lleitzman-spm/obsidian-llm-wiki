@@ -150,4 +150,76 @@ describe('native reference projection', () => {
     expect(projection.edges.some(edge => edge.type === 'evidences')).toBe(true);
     expect(JSON.stringify(projection)).not.toContain('must-not-leave-the-settings-hash');
   });
+
+  it('grounds source pages at their generated wiki path and preserves page metadata and links', async () => {
+    const { input, sourceInventory } = await fixture();
+    const sourceSlug = resolveSourceSlug(sourceInventory.sources[0]!.path);
+    const sourcePagePath = `wiki/sources/${sourceSlug}.md`;
+    const files = new Map<string, string>([
+      [sourcePagePath, `---
+type: source
+tags:
+  - procedure
+aliases:
+  - Alpha Source
+---
+# Alpha
+
+Source summary.
+`],
+      ['wiki/entities/Alpha.md', `---
+type: entity
+sources:
+  - "[[sources/${sourceSlug}]]"
+tags:
+  - person
+aliases:
+  - A
+---
+# Alpha
+
+See [[concepts/Governance]] and [[sources/${sourceSlug}]].
+`],
+      ['wiki/concepts/Governance.md', `---
+type: concept
+sources:
+  - "[[sources/${sourceSlug}]]"
+tags:
+  - procedure
+---
+# Governance
+
+See [[entities/Alpha]].
+`],
+      ['wiki/index.md', '# Wiki Index\n\nNavigation only.\n'],
+    ]);
+    const projection = await buildNativeReferenceProjection({
+      runId: input.runId,
+      authorityTree: sourceInventory.authorityTree,
+      wikiFolder: 'wiki',
+      sourceInventory: sourceInventory.sources,
+      vault: {
+        getMarkdownFiles: () => [...files.keys()].map(path => ({ path, name: path.split('/').pop()! })),
+        read: async file => files.get(file.path) ?? '',
+      },
+    });
+
+    const sourceNode = projection.nodes.find(node => node.type === 'source');
+    expect(sourceNode?.data.sourcePagePath).toBe(sourcePagePath);
+    expect(sourceNode?.data.normalizedPath).toBe('docs/alpha.md');
+
+    const entity = projection.nodes.find(node => node.type === 'canonical-key' && node.data.pagePath === 'wiki/entities/Alpha.md');
+    expect(entity?.data.aliases).toEqual(['A']);
+    expect(entity?.data.tags).toEqual(['person']);
+    expect(entity?.data.relatedLinks).toEqual(['wiki/concepts/Governance.md', sourcePagePath]);
+
+    const aliases = projection.nodes.filter(node => node.type === 'alias');
+    expect(aliases.map(node => node.data.normalizedAliasLabel).sort()).toEqual(['a', 'alpha source']);
+    const alias = aliases.find(node => node.data.proposedCanonicalKeyId === entity?.id);
+    expect(alias?.data.normalizedAliasLabel).toBe('a');
+    expect(alias?.data.state).toBe('speculative');
+    expect(projection.edges.some(edge => edge.type === 'nominates')).toBe(false);
+    expect(projection.nodes.filter(node => node.type === 'canonical-key')).toHaveLength(4);
+    expect(projection.nodes.some(node => node.type === 'canonical-key' && node.data.pagePath === 'wiki/index.md')).toBe(true);
+  });
 });

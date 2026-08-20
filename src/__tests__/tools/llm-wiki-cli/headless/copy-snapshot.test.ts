@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -28,6 +28,10 @@ async function fixture(): Promise<{ root: string; live: string; native: string; 
   await writeFile(join(live, 'wiki', 'nested', 'b.md'), 'beta');
   await writeFile(join(live, 'run', 'lease.json'), 'ephemeral');
   return { root, live, native, candidate };
+}
+
+function isSourceFixtureFile(path: string): boolean {
+  return path.replaceAll('\\', '/').endsWith('/wiki/a.md');
 }
 
 describe('copied-vault snapshots', () => {
@@ -90,6 +94,45 @@ describe('copied-vault snapshots', () => {
         return path.endsWith('wiki\\a.md') ? { ...stat, isReparsePoint: true } : stat;
       },
     })).rejects.toThrow(/symlink|reparse/i);
+  });
+
+  it('rejects a Windows junction-like alias even when lstat has no reparse flag', async () => {
+    const { live, root } = await fixture();
+    const nested = join('wiki', 'nested');
+    await expect(captureSnapshot({ root: live, probe: {
+      realpath: async path => path.endsWith(nested) ? join(root, 'outside-target') : realpath(path),
+    } })).rejects.toThrow(/symlink|junction|reparse/i);
+  });
+
+  it('fails closed when a source file identity changes across its byte read', async () => {
+    const { live } = await fixture();
+    let firstFileStatObserved = false;
+    await expect(captureSnapshot({ root: live, probe: {
+      lstat: async path => {
+        const stat = await lstat(path);
+        if (isSourceFixtureFile(path)) {
+          if (firstFileStatObserved) stat.mtimeMs += 1;
+          firstFileStatObserved = true;
+        }
+        return stat;
+      },
+    } })).rejects.toThrow(/changed|stable filesystem identity/i);
+  });
+
+  it('fails closed when a source file is replaced after the initial manifest', async () => {
+    const { live, native } = await fixture();
+    await mkdir(native);
+    let fileStatsObserved = 0;
+    await expect(copySnapshot({ root: live, destinationRoot: native, exclusions: ['run'], probe: {
+      lstat: async path => {
+        const stat = await lstat(path);
+        if (isSourceFixtureFile(path)) {
+          fileStatsObserved += 1;
+          if (fileStatsObserved === 3) stat.mtimeMs += 1;
+        }
+        return stat;
+      },
+    } })).rejects.toThrow(/changed|drift|stable filesystem identity/i);
   });
 
   it('compares manifests by exact paths and bytes, not only tree hash', async () => {

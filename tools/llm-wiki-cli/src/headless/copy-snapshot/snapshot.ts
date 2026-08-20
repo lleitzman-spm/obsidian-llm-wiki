@@ -1,9 +1,9 @@
 import {
   lstat as fsLstat,
   mkdir,
+  open,
   readdir,
   readFile,
-  writeFile,
   realpath as fsRealpath,
 } from 'node:fs/promises';
 import * as nodePath from 'node:path';
@@ -35,8 +35,17 @@ export interface SnapshotProbe {
 
 export interface SnapshotStat {
   isDirectory?: () => boolean;
+  isFile?: () => boolean;
   isSymbolicLink?: () => boolean;
   isReparsePoint?: boolean | (() => boolean);
+  /** Stable identity/metadata fields exposed by Node's fs.Stats. */
+  dev?: number | bigint;
+  ino?: number | bigint;
+  mode?: number | bigint;
+  size?: number | bigint;
+  mtimeMs?: number;
+  ctimeMs?: number;
+  birthtimeMs?: number;
 }
 
 export interface SnapshotDirent {
@@ -109,12 +118,98 @@ function statIsReparse(stat: SnapshotStat): boolean {
   return link || reparse === true;
 }
 
+const STAT_IDENTITY_FIELDS = ['dev', 'ino', 'mode', 'size', 'mtimeMs', 'ctimeMs', 'birthtimeMs'] as const;
+type StatIdentityField = (typeof STAT_IDENTITY_FIELDS)[number];
+const DIRECTORY_IDENTITY_FIELDS = ['dev', 'ino', 'mode', 'birthtimeMs'] as const;
+type DirectoryIdentityField = (typeof DIRECTORY_IDENTITY_FIELDS)[number];
+
+/**
+ * Node does not expose a portable no-follow/openat primitive for all of the
+ * platforms supported by this CLI.  The fields below are the strongest
+ * cross-platform identity we can revalidate around a path-based byte read.
+ * Missing identity is deliberately not treated as stable: a synthetic probe
+ * must opt into the same fail-closed contract as the real fs.Stats object.
+ */
+function statIdentity(stat: SnapshotStat | undefined): string | undefined {
+  if (!stat) return undefined;
+  const values = STAT_IDENTITY_FIELDS.map(field => stat[field as StatIdentityField]);
+  if (values.some(value => value === undefined || (typeof value === 'number' && !Number.isFinite(value)))) return undefined;
+  return values.map(value => `${typeof value}:${String(value)}`).join('|');
+}
+
+/** Directory mtimes legitimately change when a child is created. */
+function directoryIdentity(stat: SnapshotStat | undefined): string | undefined {
+  if (!stat) return undefined;
+  const values = DIRECTORY_IDENTITY_FIELDS.map(field => stat[field as DirectoryIdentityField]);
+  if (values.some(value => value === undefined || (typeof value === 'number' && !Number.isFinite(value)))) return undefined;
+  return values.map(value => `${typeof value}:${String(value)}`).join('|');
+}
+
+function comparisonPath(value: string): string {
+  let normalized = nodePath.normalize(nodePath.resolve(value));
+  if (process.platform === 'win32') {
+    // fs.realpath may use the extended-length spelling while the caller uses
+    // the ordinary spelling.  They are the same path, unlike a junction that
+    // resolves to a different location.
+    normalized = normalized.replace(/^\\\\\?\\/u, '').toLowerCase();
+  }
+  return normalized;
+}
+
+function assertDirectoryStat(path: string, stat: SnapshotStat | undefined, label: string): asserts stat is SnapshotStat {
+  if (!stat || statIsReparse(stat) || stat.isDirectory?.() !== true) {
+    throw new Error(`${label} is not a plain directory: ${path}`);
+  }
+  if (statIdentity(stat) === undefined) {
+    throw new Error(`${label} has no stable filesystem identity: ${path}`);
+  }
+}
+
+function assertFileStat(path: string, stat: SnapshotStat | undefined, label: string): asserts stat is SnapshotStat {
+  if (!stat || statIsReparse(stat) || stat.isDirectory?.() === true || stat.isFile?.() !== true) {
+    throw new Error(`${label} is not a plain file: ${path}`);
+  }
+  if (statIdentity(stat) === undefined) {
+    throw new Error(`${label} has no stable filesystem identity: ${path}`);
+  }
+}
+
+async function assertNoReparseAlias(path: string, probe: SnapshotProbe, label: string): Promise<void> {
+  let resolved: string;
+  try {
+    resolved = nodePath.resolve(probe.realpath ? await probe.realpath(path) : await fsRealpath(path));
+  } catch (error) {
+    throw new Error(`${label} could not be resolved without following a reparse point: ${path} (${String(error)})`);
+  }
+  if (comparisonPath(resolved) !== comparisonPath(path)) {
+    throw new Error(`${label} resolves through a symlink/junction/reparse point: ${path}`);
+  }
+}
+
+function assertStableIdentity(path: string, before: SnapshotStat | undefined, after: SnapshotStat | undefined, label: string): void {
+  const beforeIdentity = statIdentity(before);
+  const afterIdentity = statIdentity(after);
+  if (!beforeIdentity || !afterIdentity) {
+    throw new Error(`${label} has no stable filesystem identity: ${path}`);
+  }
+  if (beforeIdentity !== afterIdentity) {
+    throw new Error(`${label} changed while bytes were being read: ${path}`);
+  }
+}
+
 function missing(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
 async function statPath(path: string, probe: SnapshotProbe): Promise<SnapshotStat | undefined> {
-  if (probe.lstat) return probe.lstat(path);
+  if (probe.lstat) {
+    try {
+      return await probe.lstat(path);
+    } catch (error) {
+      if (missing(error)) return undefined;
+      throw error;
+    }
+  }
   try {
     return await fsLstat(path);
   } catch (error) {
@@ -142,20 +237,23 @@ async function verifyRoot(root: string, probe: SnapshotProbe): Promise<string> {
     throw new Error(`Snapshot root is not an existing directory: ${absolute} (${String(error)})`);
   }
   const stat = await statPath(absolute, probe);
-  if (!stat || statIsReparse(stat) || stat.isDirectory?.() === false) {
-    throw new Error(`Snapshot root must be a non-reparse directory: ${absolute}`);
-  }
-  if (nodePath.normalize(resolved) !== nodePath.normalize(absolute)) {
-    // realpath differing from the requested path is allowed for ordinary
-    // case/volume normalization, but a root symlink must never be followed.
-    if (statIsReparse(stat)) throw new Error(`Snapshot root is a symlink/reparse point: ${absolute}`);
+  assertDirectoryStat(absolute, stat, 'Snapshot root');
+  if (comparisonPath(resolved) !== comparisonPath(absolute)) {
+    throw new Error(`Snapshot root is a symlink/junction/reparse point: ${absolute}`);
   }
   return resolved;
 }
 
 async function walk(root: string, relative: string, exclusions: readonly string[], probe: SnapshotProbe, output: SnapshotEntry[]): Promise<void> {
   const directory = relative ? nodePath.join(root, ...relative.split('/')) : root;
+  const directoryBefore = await statPath(directory, probe);
+  assertDirectoryStat(directory, directoryBefore, 'Snapshot directory');
+  await assertNoReparseAlias(directory, probe, 'Snapshot directory');
   const children = [...await listPath(directory, probe)].sort((a, b) => Buffer.from(a.name).compare(Buffer.from(b.name)));
+  const directoryAfter = await statPath(directory, probe);
+  assertDirectoryStat(directory, directoryAfter, 'Snapshot directory');
+  assertStableIdentity(directory, directoryBefore, directoryAfter, 'Snapshot directory');
+  await assertNoReparseAlias(directory, probe, 'Snapshot directory');
   for (const child of children) {
     const childRelative = normalizeRelative(relative ? `${relative}/${child.name}` : child.name);
     if (excluded(childRelative, exclusions)) continue;
@@ -166,10 +264,12 @@ async function walk(root: string, relative: string, exclusions: readonly string[
       throw new Error(`Snapshot contains a symlink/reparse point: ${childRelative}`);
     }
     if (stat.isDirectory?.() === true || child.isDirectory?.() === true) {
+      assertDirectoryStat(childPath, stat, 'Snapshot entry');
+      await assertNoReparseAlias(childPath, probe, 'Snapshot entry');
       await walk(root, childRelative, exclusions, probe, output);
       continue;
     }
-    const content = await bytesAt(childPath, probe);
+    const content = await readStableBytes(childPath, probe, stat, 'Snapshot entry');
     output.push({ path: childRelative, byteLength: content.byteLength, byteSha256: sha256Hex(content) });
   }
 }
@@ -210,20 +310,110 @@ export async function captureSnapshot(options: CaptureSnapshotOptions): Promise<
 async function assertDestinationEmpty(root: string, probe: SnapshotProbe): Promise<void> {
   const stat = await statPath(root, probe);
   if (!stat) return;
-  if (statIsReparse(stat) || stat.isDirectory?.() === false) throw new Error(`Copy destination is not a plain directory: ${root}`);
+  assertDirectoryStat(root, stat, 'Copy destination');
+  await assertNoReparseAlias(root, probe, 'Copy destination');
   const children = await listPath(root, probe);
   if (children.length !== 0) throw new Error(`Copy destination must be empty: ${root}`);
 }
 
-async function ensureSafeDestinationAncestors(root: string, path: string, probe: SnapshotProbe): Promise<void> {
+interface DestinationAncestorIdentity {
+  path: string;
+  identity: string;
+}
+
+async function ensureSafeDestinationAncestors(root: string, path: string, probe: SnapshotProbe): Promise<readonly DestinationAncestorIdentity[]> {
   const relative = nodePath.relative(root, path);
   if (relative.startsWith('..') || nodePath.isAbsolute(relative)) throw new Error(`Destination path escapes root: ${path}`);
+  const parts = relative.split(nodePath.sep).filter(Boolean);
   let current = root;
-  for (const part of relative.split(nodePath.sep).slice(0, -1)) {
+  const directories = [root, ...parts.slice(0, -1).map(part => {
     current = nodePath.join(current, part);
-    const stat = await statPath(current, probe);
-    if (stat && statIsReparse(stat)) throw new Error(`Destination contains a symlink/reparse point: ${current}`);
+    return current;
+  })];
+  const result: DestinationAncestorIdentity[] = [];
+  for (const directory of directories) {
+    const stat = await statPath(directory, probe);
+    assertDirectoryStat(directory, stat, 'Destination ancestor');
+    await assertNoReparseAlias(directory, probe, 'Destination ancestor');
+    const identity = directoryIdentity(stat);
+    if (!identity) throw new Error(`Destination ancestor has no stable filesystem identity: ${directory}`);
+    result.push({ path: directory, identity });
   }
+  return result;
+}
+
+function assertStableDestinationAncestors(
+  path: string,
+  before: readonly DestinationAncestorIdentity[],
+  after: readonly DestinationAncestorIdentity[],
+): void {
+  if (before.length !== after.length || before.some((entry, index) => {
+    const counterpart = after[index];
+    return !counterpart || comparisonPath(entry.path) !== comparisonPath(counterpart.path) || entry.identity !== counterpart.identity;
+  })) {
+    throw new Error(`Destination ancestor changed while copying: ${path}`);
+  }
+}
+
+async function ensurePlainDirectory(path: string, probe: SnapshotProbe): Promise<void> {
+  const existing = await statPath(path, probe);
+  if (existing) {
+    assertDirectoryStat(path, existing, 'Copy destination');
+    await assertNoReparseAlias(path, probe, 'Copy destination');
+    return;
+  }
+
+  const parent = nodePath.dirname(path);
+  if (parent === path) throw new Error(`Cannot create destination directory: ${path}`);
+  await ensurePlainDirectory(parent, probe);
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if (!error || typeof error !== 'object' || (error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const created = await statPath(path, probe);
+  assertDirectoryStat(path, created, 'Copy destination');
+  await assertNoReparseAlias(path, probe, 'Copy destination');
+}
+
+async function writeStableDestinationFile(
+  path: string,
+  content: Uint8Array,
+  root: string,
+  probe: SnapshotProbe,
+): Promise<void> {
+  const beforeAncestors = await ensureSafeDestinationAncestors(root, path, probe);
+  const handle = await open(path, 'wx');
+  try {
+    await handle.writeFile(content);
+    const handleStat = await handle.stat();
+    assertFileStat(path, handleStat, 'Copied destination file');
+    const afterAncestors = await ensureSafeDestinationAncestors(root, path, probe);
+    assertStableDestinationAncestors(path, beforeAncestors, afterAncestors);
+    const pathStat = await statPath(path, probe);
+    assertFileStat(path, pathStat, 'Copied destination file');
+    assertStableIdentity(path, handleStat, pathStat, 'Copied destination file');
+    await assertNoReparseAlias(path, probe, 'Copied destination file');
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readStableBytes(
+  path: string,
+  probe: SnapshotProbe,
+  initialStat?: SnapshotStat,
+  label = 'Snapshot entry',
+): Promise<Uint8Array> {
+  const before = initialStat ?? await statPath(path, probe);
+  assertFileStat(path, before, label);
+  await assertNoReparseAlias(path, probe, label);
+  const content = await bytesAt(path, probe);
+  const after = await statPath(path, probe);
+  assertFileStat(path, after, label);
+  assertStableIdentity(path, before, after, label);
+  await assertNoReparseAlias(path, probe, label);
+  return content;
 }
 
 /** Capture an immutable source manifest, then copy its bytes to a fresh destination. */
@@ -237,18 +427,29 @@ export async function copySnapshot(options: CopySnapshotOptions): Promise<{ sour
   });
   const source = await captureSnapshot({ ...options, root: roots.liveRoot.resolved, probe });
   const destination = roots.copyRoots[0].resolved;
+  await ensurePlainDirectory(destination, probe);
   await assertDestinationEmpty(destination, probe);
-  await mkdir(destination, { recursive: true });
   for (const entry of source.entries) {
     const destinationPath = nodePath.join(destination, ...entry.path.split('/'));
-    await ensureSafeDestinationAncestors(destination, destinationPath, probe);
-    await mkdir(nodePath.dirname(destinationPath), { recursive: true });
-    const content = await bytesAt(nodePath.join(source.root, ...entry.path.split('/')), probe);
+    await ensurePlainDirectory(nodePath.dirname(destinationPath), probe);
+    const content = await readStableBytes(
+      nodePath.join(source.root, ...entry.path.split('/')),
+      probe,
+      undefined,
+      'Source entry',
+    );
     if (content.byteLength !== entry.byteLength || sha256Hex(content) !== entry.byteSha256) {
       throw new Error(`Source drifted during copy: ${entry.path}`);
     }
-    await writeFile(destinationPath, content, { flag: 'wx' });
+    await writeStableDestinationFile(destinationPath, content, destination, probe);
   }
+  // The per-file identity checks above catch replacement of an existing file;
+  // this second source manifest also catches additions/removals that happened
+  // after the initial directory walk. A path-based copy cannot be made fully
+  // race-free on every Node platform, so any observed drift remains fatal.
+  const sourceAfter = await captureSnapshot({ root: source.root, exclusions: source.exclusions, probe });
+  const sourceDrift = compareSnapshots(source, sourceAfter);
+  if (!sourceDrift.exact) throw new Error(`Source drifted during copy: ${JSON.stringify(sourceDrift)}`);
   const copied = await captureSnapshot({ root: destination, exclusions: source.exclusions, probe });
   const drift = compareSnapshots(source, copied);
   if (!drift.exact) throw new Error(`Copied snapshot mismatch: ${JSON.stringify(drift)}`);

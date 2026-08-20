@@ -66,8 +66,14 @@ export interface TransactionPlan {
 
 export interface TransactionFileSystem {
   read(path: string): Promise<Uint8Array | null>;
-  write(path: string, bytes: Uint8Array): Promise<void>;
-  remove(path: string): Promise<void>;
+  /**
+   * The optional precondition is checked again inside the filesystem mutation
+   * boundary.  The engine already performs a CAS read, but passing the value
+   * through lets a rooted implementation close the read-to-mutate gap as far
+   * as its platform primitives allow.
+   */
+  write(path: string, bytes: Uint8Array, preconditionHash?: string | null): Promise<void>;
+  remove(path: string, preconditionHash?: string | null): Promise<void>;
 }
 
 /**
@@ -225,6 +231,24 @@ export class StalePreconditionError extends TransactionError {
     this.path = path;
     this.expectedHash = expectedHash;
     this.actualHash = actualHash;
+  }
+}
+
+/**
+ * A rooted filesystem discovered that its path identity changed at a mutation
+ * boundary.  `mutationVisible` is deliberately explicit: a post-rename or
+ * post-unlink verification failure must make the engine include that
+ * operation in rollback even though the filesystem method threw.
+ */
+export class MutationBoundaryError extends TransactionError {
+  readonly path: string;
+  readonly mutationVisible: boolean;
+
+  constructor(path: string, message: string, mutationVisible: boolean, transactionId?: string) {
+    super(message, 'MUTATION_BOUNDARY', { transactionId });
+    this.name = 'MutationBoundaryError';
+    this.path = path;
+    this.mutationVisible = mutationVisible;
   }
 }
 

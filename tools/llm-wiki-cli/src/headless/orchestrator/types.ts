@@ -1,6 +1,8 @@
-import type { KeyRegistry, Signer, SignedEnvelope, TerminalRoot, IndependentRunVerificationResult } from '../crypto';
+import type { KeyRegistry, Signer, SignedEnvelope, TerminalRoot } from '../crypto';
 import type { SourceInventory } from '../preflight/source-inventory';
 import type { PreflightManifest } from '../preflight/manifest';
+import type { CopySnapshotManifest } from '../copy-snapshot';
+import type { RunArtifactVerificationResult } from '../verification';
 import type { ContractSemanticProjection } from '../provenance/types';
 import type { ArtifactData, CandidatePlan as EngineCandidatePlan, ProviderPort, SchedulerPort, SourceRecord } from '../engine';
 import type { CandidatePlan, Receipt, RunManifest, SourceInventory as ContractSourceInventory, WorkerArtifact, PreflightCapture } from '../contracts';
@@ -50,6 +52,13 @@ export interface SnapshotPortContext {
 
 export interface SnapshotPort<TSnapshot = unknown> {
   readonly capture: (context: SnapshotPortContext) => Promise<TSnapshot>;
+}
+
+/** Content-addressed live/native/candidate roots captured before execution. */
+export interface CopiedVaultSnapshots {
+  readonly source: CopySnapshotManifest;
+  readonly native: CopySnapshotManifest;
+  readonly candidate: CopySnapshotManifest;
 }
 
 export interface ComparisonPortInput<TNativeSnapshot = unknown, TCandidateSnapshot = unknown> {
@@ -120,6 +129,7 @@ export interface HeadlessCanaryResult {
   readonly runId: string;
   readonly preflight: PreflightManifest;
   readonly preflightCapture: PreflightCapture;
+  readonly copySnapshots: CopiedVaultSnapshots;
   readonly contractSourceInventory: ContractSourceInventory;
   readonly runManifest: RunManifest;
   readonly sources: readonly SourceRecord[];
@@ -134,7 +144,7 @@ export interface HeadlessCanaryResult {
   readonly receipt: Receipt;
   readonly receiptEnvelope: SignedEnvelope;
   readonly terminalRoot: TerminalRoot;
-  readonly independentVerification: IndependentRunVerificationResult;
+  readonly independentVerification: RunArtifactVerificationResult;
   readonly artifactDirectory: string;
 }
 

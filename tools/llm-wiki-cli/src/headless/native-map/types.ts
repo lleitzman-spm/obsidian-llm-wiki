@@ -73,6 +73,19 @@ export interface NativeMapSource {
   readonly extractedAt?: string;
 }
 
+/**
+ * Immutable page-catalog entry supplied by the host after extraction.
+ *
+ * The map worker never receives an App, TFile, vault, or page body.  A host
+ * may pass this small read-only projection when it wants SourceAnalyzer's
+ * deterministic related-page matching; omitting it preserves the unresolved
+ * related-page proposals returned by the model.
+ */
+export interface NativeMapExistingPage {
+  readonly title: string;
+  readonly aliases?: readonly string[];
+}
+
 export interface NativeMention {
   readonly quote: string;
   readonly translation?: string;
@@ -184,6 +197,8 @@ export interface NativeMapInput {
   /** The client is already authorized by the host; this seam never obtains credentials. */
   readonly client: NativeMapClient;
   readonly maxBatches?: number;
+  /** Optional read-only catalog used for programmatic related-page matching. */
+  readonly existingPages?: readonly NativeMapExistingPage[];
 }
 
 /** Provider shape accepted by the map seam; no authorization methods are exposed. */

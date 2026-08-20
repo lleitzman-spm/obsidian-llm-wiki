@@ -19,6 +19,7 @@ import {
   runHeadlessCanary,
   type HeadlessCanaryInput,
 } from '../../../../../tools/llm-wiki-cli/src/headless/orchestrator';
+import { independentlyVerifyRunArtifacts } from '../../../../../tools/llm-wiki-cli/src/headless/verification';
 
 const roots: string[] = [];
 const AUTHORITY_TREE = 'a'.repeat(64);
@@ -46,6 +47,9 @@ async function fixture(): Promise<{
   const candidateRoot = join(base, 'candidate-copy');
   const artifactRoot = join(base, 'headless-artifacts');
   await Promise.all([liveRoot, nativeRoot, candidateRoot, artifactRoot].map(path => mkdir(path, { recursive: true })));
+  // The production snapshot contract rejects an empty tree. Keep the live
+  // fixture deterministic while exercising the real copied-vault path.
+  await writeFile(join(liveRoot, 'vault-seed.md'), '# Test vault seed\n', 'utf8');
   const contents = new Map([
     ['docs/alpha.md', '# Alpha\nAlpha is an entity.\n'],
     ['docs/beta.md', '# Beta\nBeta is a procedure.\n'],
@@ -140,7 +144,10 @@ describe('headless canary orchestrator', () => {
     expect(result.correctness.semanticEquivalent).toBe(true);
     expect(result.correctness.matchedStatementIds.length).toBeGreaterThan(0);
     expect(result.independentVerification.ok).toBe(true);
-    expect(result.independentVerification.rootHash).toBe(result.terminalRoot.rootHash);
+    expect(result.independentVerification.terminalRootCrypto?.rootHash).toBe(result.terminalRoot.rootHash);
+    expect(result.copySnapshots.native.treeSha256).toBe(result.copySnapshots.source.treeSha256);
+    expect(result.copySnapshots.candidate.treeSha256).toBe(result.copySnapshots.source.treeSha256);
+    expect(result.preflight.snapshotTreeHash).toBe(result.copySnapshots.source.treeSha256);
     expect(result.activationMode).toBe('synthetic-scaffold-only');
     expect(result.preflightCapture.capture_type).toBe('live');
     expect(result.runManifest.target_vault.copy_roots.native).toBe(result.preflightCapture.copy_roots.native);
@@ -149,7 +156,7 @@ describe('headless canary orchestrator', () => {
     expect(persistedPreflight).toMatchObject({ capture_type: 'live', run_id: input.runId });
 
     const liveEntries = await readdir(input.liveRoot);
-    expect(liveEntries).toEqual([]);
+    expect(liveEntries).toEqual(['vault-seed.md']);
     const receiptText = await readFile(join(result.artifactDirectory, 'run-manifest.json'), 'utf8');
     expect(receiptText).not.toContain('must-not-appear');
     const generated = await readdir(join(input.candidateRoot, 'headless-generated', 'entity'));
@@ -171,6 +178,22 @@ describe('headless canary orchestrator', () => {
     expect(await readdir(input.artifactRoot)).toEqual([]);
   });
 
+  it('refuses a non-fresh candidate root instead of accepting without a copied-vault snapshot', async () => {
+    const { input } = await fixture();
+    await writeFile(join(input.candidateRoot, 'preexisting.md'), 'must not be overwritten\n', 'utf8');
+    await expect(runHeadlessCanary({ ...input, runId: 'run-non-fresh-copy' })).rejects.toThrow(/destination must be empty/i);
+    expect(await readFile(join(input.candidateRoot, 'preexisting.md'), 'utf8')).toBe('must not be overwritten\n');
+    expect(await readdir(input.artifactRoot)).toEqual([]);
+  });
+
+  it('copies the observed live vault into both isolated roots before candidate work', async () => {
+    const { input } = await fixture();
+    await writeFile(join(input.liveRoot, 'existing-note.md'), '# Existing note\n', 'utf8');
+    await runHeadlessCanary({ ...input, runId: 'run-copied-vault' });
+    expect(await readFile(join(input.nativeRoot, 'existing-note.md'), 'utf8')).toBe('# Existing note\n');
+    expect(await readFile(join(input.candidateRoot, 'existing-note.md'), 'utf8')).toBe('# Existing note\n');
+  });
+
   it('fails closed when native-compatible activation lacks native snapshots and comparison', async () => {
     const { input } = await fixture();
     const nativeMode = { ...input, activationMode: 'native-compatible' as const };
@@ -184,7 +207,7 @@ describe('headless canary orchestrator', () => {
     await expect(runHeadlessCanary(untrusted)).rejects.toThrow(/unknown signing key|trusted registry|pinned/i);
   });
 
-  it('rejects an artifact that escapes its source lane before any candidate write', async () => {
+  it('rejects an artifact that escapes its source lane before any generated candidate write', async () => {
     const { input } = await fixture();
     const wrongSource: HeadlessCanaryInput = {
       ...input,
@@ -200,7 +223,7 @@ describe('headless canary orchestrator', () => {
       },
     };
     await expect(runHeadlessCanary(wrongSource)).rejects.toThrow(/escaped source|inventory-bound/i);
-    expect(await readdir(input.candidateRoot)).toEqual([]);
+    expect(await readdir(input.candidateRoot)).toEqual(['vault-seed.md']);
   });
 
   it('uses the real filesystem lease and restores prior writes on a stale compare-and-swap', async () => {
@@ -244,5 +267,16 @@ describe('headless canary orchestrator', () => {
       registry: createKeyRegistry({ trustedKeys: [input.signer] }),
       expectedRunId: 'run-substitution',
     }))).rejects.toThrow(/root|artifact|hash/i);
+  });
+
+  it('does not accept a durable run when the full artifact set is incomplete', async () => {
+    const { input } = await fixture();
+    const result = await runHeadlessCanary({ ...input, runId: 'run-missing-artifact' });
+    await rm(join(result.artifactDirectory, 'worker-artifacts.json'));
+    await expect(Promise.resolve().then(() => independentlyVerifyRunArtifacts({
+      directory: result.artifactDirectory,
+      registry: input.trustedRegistry,
+      expectedRunId: input.runId,
+    }))).rejects.toThrow(/worker-artifacts|missing|artifact/i);
   });
 });

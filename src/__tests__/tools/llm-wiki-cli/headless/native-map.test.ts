@@ -5,6 +5,7 @@ import {
   mapNativeSource,
   NativeMapProtocolError,
   type NativeMapClient,
+  type NativeMapExistingPage,
   type NativeMapSettings,
 } from '../../../../../tools/llm-wiki-cli/src/headless/native-map';
 
@@ -183,5 +184,123 @@ describe('native source map seam', () => {
       entityTags: ['person'],
       conceptTags: ['procedure', 'control'],
     })).toThrow(NativeMapProtocolError);
+  });
+
+  it('uses the native repair callback and SourceAnalyzer-style batch coercion', async () => {
+    const calls: Array<Parameters<NativeMapClient['createMessage']>[0]> = [];
+    const repaired = JSON.stringify({
+      source_title: 'Lease workflow',
+      summary: 'The source describes a lease workflow.',
+      // The null member is the kind of harmless irregularity that native
+      // normalizeBatchResponse filters before extracting the valid item.
+      entities: [null, {
+        name: 'lease',
+        type: 'owner',
+        summary: 'The owner approves the workflow.',
+        mentions_in_source: ['The owner approves the lease workflow.'],
+      }],
+      // A scalar is coerced to an empty array, matching SourceAnalyzer.
+      concepts: { malformed: true },
+    });
+    const client = clientFor([
+      '{"source_title":"Lease workflow","summary":"bad","entities":[{"name":"owner","summary":NaN}],"concepts":[]}',
+      repaired,
+      '{"entities":[],"concepts":[]}',
+    ], params => calls.push(params));
+
+    const result = await mapNativeSource({
+      source: { sourceId: 'repair-1', sourcePath: 'notes/lease.md', sourceBytes: new TextEncoder().encode(sourceText) },
+      policy: policy(),
+      client,
+      maxBatches: 1,
+    });
+
+    expect(result.entities.map(item => item.name)).toEqual(['lease']);
+    expect(calls.map(call => call.task)).toEqual(['extract', 'extract-retry']);
+    expect(calls[1]?.messages[0]?.content).toContain('Fix the following malformed JSON');
+  });
+
+  it('retries a first-batch placeholder once, then accepts the completed response', async () => {
+    const calls: Array<Parameters<NativeMapClient['createMessage']>[0]> = [];
+    const client = clientFor([
+      '{"": ""}',
+      JSON.stringify({
+        source_title: 'Lease',
+        summary: 'A lease workflow.',
+        entities: [{ name: 'lease', type: 'owner', summary: 'The lease.', mentions_in_source: [] }],
+        concepts: [],
+      }),
+    ], params => calls.push(params));
+    const result = await mapNativeSource({
+      source: { sourceId: 'placeholder-1', sourcePath: 'notes/lease.md', sourceBytes: new TextEncoder().encode(sourceText) },
+      policy: policy(),
+      client,
+      maxBatches: 1,
+    });
+    expect(result.entities.map(item => item.name)).toEqual(['lease']);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('applies native convergence rules instead of exhausting every configured round', async () => {
+    const longSource = `${sourceText}\n${'The owner follows the lease workflow. '.repeat(180)}`;
+    const makeItem = (name: string) => ({ name, type: 'owner', summary: name, mentions_in_source: [] });
+    const calls: Array<Parameters<NativeMapClient['createMessage']>[0]> = [];
+    const client = clientFor([
+      JSON.stringify({ source_title: 'Lease-workflow', summary: 'Summary.', entities: [makeItem('Lease-workflow')], concepts: [] }),
+      JSON.stringify({ entities: [makeItem('Owner')], concepts: [] }),
+      JSON.stringify({ entities: [makeItem('Vendor')], concepts: [] }),
+      JSON.stringify({ entities: [makeItem('System')], concepts: [] }),
+    ], params => calls.push(params));
+
+    const result = await mapNativeSource({
+      source: { sourceId: 'convergence-1', sourcePath: 'notes/Lease-workflow.md', sourceBytes: new TextEncoder().encode(longSource) },
+      policy: policy({ extractionGranularity: 'standard', tagVocabularyMode: 'default' }),
+      client,
+      maxBatches: 4,
+    });
+
+    expect(result.entities.map(item => item.name)).toEqual(['Lease-workflow', 'Owner', 'Vendor']);
+    expect(calls.filter(call => call.task === 'extract')).toHaveLength(3);
+  });
+
+  it('replaces LLM related_pages with deterministic catalog matches when a catalog is supplied', async () => {
+    const existingPages: readonly NativeMapExistingPage[] = [
+      { title: 'Lease Control', aliases: ['control procedure'] },
+      { title: 'Unrelated page' },
+    ];
+    const result = await mapNativeSource({
+      source: { sourceId: 'related-1', sourcePath: 'notes/lease.md', sourceBytes: new TextEncoder().encode(sourceText) },
+      policy: policy(),
+      client: clientFor([firstResponse(), '{"entities":[],"concepts":[]}']),
+      existingPages,
+      maxBatches: 1,
+    });
+    expect(result.related.filter(item => item.pageType === 'unknown').map(item => item.label)).toEqual(['Lease Control']);
+  });
+
+  it('adds the source filename lemma only after deterministic matching and classifies it safely', async () => {
+    const client = clientFor([
+      JSON.stringify({
+        source_title: 'Model supplied title',
+        summary: 'The source summary is used for the missing lemma.',
+        entities: [{ name: 'owner', type: 'owner', summary: 'Owner.', mentions_in_source: [] }],
+        concepts: [],
+        related_pages: ['LLM fabricated page'],
+      }),
+      '{"kind":"concept"}',
+    ]);
+    const result = await mapNativeSource({
+      source: { sourceId: 'lemma-1', sourcePath: 'notes/lease.md', sourceBytes: new TextEncoder().encode(sourceText) },
+      policy: policy(),
+      client,
+      existingPages: [{ title: 'Owner' }],
+      maxBatches: 1,
+    });
+
+    expect(result.entities.map(item => item.name)).toEqual(['owner']);
+    expect(result.concepts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'lease', type: 'procedure', summary: 'The source summary is used for the missing lemma.', mentions_in_source: [], mentions_with_provenance: [] }),
+    ]));
+    expect(result.related.filter(item => item.pageType === 'unknown').map(item => item.label)).toEqual(['Owner']);
   });
 });

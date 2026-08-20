@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, join, parse, relative, resolve, sep } from 'node:path';
 
 import {
   DOMAINS,
@@ -121,6 +121,101 @@ function comparePathBytes(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
 }
 
+type ReparseMetadata = {
+  readonly isReparsePoint?: boolean | (() => boolean);
+  readonly reparsePoint?: boolean;
+};
+
+type LstatResult = NonNullable<ReturnType<typeof lstatSync>>;
+
+/**
+ * Node's Windows Stats type does not expose reparse metadata, even though
+ * newer runtimes may provide it at runtime.  Keep the check structural so a
+ * junction/mount-point marker is honoured when the host exposes one, while
+ * retaining the ordinary symbolic-link check on older Node versions.
+ */
+function statIsReparse(stat: LstatResult): boolean {
+  const candidate = stat as LstatResult & ReparseMetadata;
+  const reparse = typeof candidate.isReparsePoint === 'function'
+    ? candidate.isReparsePoint()
+    : candidate.isReparsePoint;
+  return stat.isSymbolicLink() || reparse === true || candidate.reparsePoint === true;
+}
+
+/** Normalize native/extended Windows paths for a conservative comparison. */
+function comparablePath(value: string): string {
+  let normalized = resolve(value);
+  if (process.platform === 'win32') {
+    const extendedUncPrefix = '\\\\?\\UNC\\';
+    const extendedPrefix = '\\\\?\\';
+    const devicePrefix = '\\\\.\\';
+    if (normalized.startsWith(extendedUncPrefix)) {
+      normalized = `\\\\${normalized.slice(extendedUncPrefix.length)}`;
+    } else if (normalized.startsWith(extendedPrefix)) {
+      normalized = normalized.slice(extendedPrefix.length);
+    } else if (normalized.startsWith(devicePrefix)) {
+      normalized = normalized.slice(devicePrefix.length);
+    }
+    normalized = normalized.replace(/[\\/]+$/, '') || normalized;
+    return normalized.toLowerCase();
+  }
+  return normalized;
+}
+
+function samePath(left: string, right: string): boolean {
+  return comparablePath(left) === comparablePath(right);
+}
+
+function assertNonReparseStat(path: string, label: 'root' | 'ancestor' | 'artifact'):
+  LstatResult {
+  const stat = lstatSync(path);
+  if (stat === undefined) {
+    throw new CryptoVerificationError('missing-path', `Merkle ${label} disappeared during verification: ${path}`);
+  }
+  if (statIsReparse(stat)) {
+    throw new CryptoVerificationError('reparse-path', `Symlink or reparse ${label} is not allowed: ${path}`);
+  }
+  return stat;
+}
+
+/**
+ * Inspect a path without following links, then compare its native canonical
+ * path.  `lstat` catches ordinary links and exposed reparse tags; the
+ * canonical comparison catches Windows junctions/mount points that Node
+ * reports as ordinary directories.  Both checks are intentionally fail-closed.
+ */
+function assertNonReparsePath(path: string, label: 'root' | 'ancestor' | 'artifact'):
+  LstatResult {
+  const stat = assertNonReparseStat(path, label);
+  const canonical = realpathSync.native(path);
+  if (!samePath(path, canonical)) {
+    throw new CryptoVerificationError('reparse-path', `Path resolves through a symlink or reparse ${label}: ${path}`);
+  }
+  return stat;
+}
+
+/** Inspect the requested root and every existing ancestor before traversal. */
+function assertRootPathIsSafe(root: string): LstatResult {
+  if (typeof root !== 'string' || root.length === 0 || root.includes('\0')) {
+    throw new TypeError('Merkle artifact root must be non-empty and NUL-free');
+  }
+  const absolute = resolve(root);
+  const rootStat = assertNonReparsePath(absolute, 'root');
+  const filesystemRoot = resolve(parse(absolute).root);
+  let current = absolute;
+  while (current !== filesystemRoot) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+    // On managed Windows hosts, native realpath can be denied for an
+    // otherwise ordinary user-profile ancestor (for example C:\Users\user).
+    // The requested root's own canonical comparison above still detects a
+    // redirecting junction; ancestors only need the no-follow lstat check.
+    assertNonReparseStat(current, 'ancestor');
+  }
+  return rootStat;
+}
+
 function buildTreeFromLeaves(leaves: readonly MerkleLeaf[]): MerkleTree {
   if (leaves.length === 0) throw new TypeError('An empty Merkle tree is invalid');
   const levels: string[][] = [leaves.map(leaf => leaf.leafHash)];
@@ -166,9 +261,9 @@ function collectDirectoryArtifacts(root: string, current: string, result: Merkle
     // Dirent metadata can be stale (and Windows junctions/reparse points are
     // not consistently reported as symbolic links), so lstat every child
     // before following or reading it.
-    const stat = lstatSync(absolute);
-    if (entry.isSymbolicLink() || stat.isSymbolicLink()) {
-      throw new CryptoVerificationError('symlink-artifact', `Symlink or reparse artifact is not allowed: ${absolute}`);
+    const stat = assertNonReparsePath(absolute, 'artifact');
+    if (entry.isSymbolicLink()) {
+      throw new CryptoVerificationError('reparse-artifact', `Symlink or reparse artifact is not allowed: ${absolute}`);
     }
     if (stat.isDirectory()) {
       collectDirectoryArtifacts(root, absolute, result);
@@ -186,13 +281,12 @@ function collectDirectoryArtifacts(root: string, current: string, result: Merkle
 export function buildMerkleTreeFromDirectory(root: string): MerkleTree {
   const result: MerkleArtifactInput[] = [];
   // lstat is essential here: statSync would follow a symlinked root and make
-  // an out-of-tree directory appear to be the attested artifact root.
-  const stat = lstatSync(root);
-  if (stat.isSymbolicLink()) {
-    throw new CryptoVerificationError('symlink-root', `Symlink or reparse Merkle artifact root is not allowed: ${root}`);
-  }
+  // an out-of-tree directory appear to be the attested artifact root.  The
+  // native canonical-path check additionally catches Windows junctions and
+  // mount-point reparse tags that older Node Stats objects omit.
+  const stat = assertRootPathIsSafe(root);
   if (!stat.isDirectory()) throw new TypeError(`Merkle artifact root is not a directory: ${root}`);
-  collectDirectoryArtifacts(root, root, result);
+  collectDirectoryArtifacts(resolve(root), resolve(root), result);
   return buildMerkleTree(result);
 }
 

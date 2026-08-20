@@ -27,6 +27,7 @@ import type {
 } from './types';
 import {
   ReadbackMismatchError,
+  MutationBoundaryError,
   RestoreFailureError,
   RestoreConflictError,
   StaleFenceError,
@@ -200,12 +201,23 @@ export class TransactionEngine {
       }
       await this.append(plan, 'cas-checked', { operationIndex });
 
-      if (operation.after.exists) {
-        // The planner guarantees that an existing after-state carries bytes.
-        if (operation.after.bytes === null) throw new Error(`Missing staged bytes for ${operation.path}`);
-        await this.fileSystem.write(operation.path, operation.after.bytes);
-      } else {
-        await this.fileSystem.remove(operation.path);
+      try {
+        if (operation.after.exists) {
+          // The planner guarantees that an existing after-state carries bytes.
+          if (operation.after.bytes === null) throw new Error(`Missing staged bytes for ${operation.path}`);
+          // The rooted Node filesystem re-checks this precondition inside its
+          // staging/rename boundary. Custom adapters may ignore the optional
+          // third argument, retaining the original interface behavior.
+          await this.fileSystem.write(operation.path, operation.after.bytes, operation.preconditionHash);
+        } else {
+          await this.fileSystem.remove(operation.path, operation.preconditionHash);
+        }
+      } catch (error) {
+        // A post-rename/unlink identity check can fail after the filesystem
+        // mutation has become visible. Keep that operation rollback-visible;
+        // otherwise the engine would incorrectly restore only earlier files.
+        if (error instanceof MutationBoundaryError && error.mutationVisible) markMutationVisible();
+        throw error;
       }
       // Mark immediately after the filesystem mutation and before the WAL
       // `applied` append. If that append fails, rollback still knows this

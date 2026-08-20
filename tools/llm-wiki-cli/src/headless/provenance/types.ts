@@ -132,6 +132,8 @@ export interface SourceNode {
   authorityTree: string;
   normalizedPath: string;
   byteHash: string;
+  /** Concrete generated page path in the copied wiki, distinct from authority identity. */
+  sourcePagePath?: string;
 }
 
 export interface ClaimNode {
@@ -160,6 +162,19 @@ export interface CanonicalKeyNode {
   pageType: string;
   normalizationVersion: string;
   normalizedLabel: string;
+  /** Concrete copied-vault page path used by the native page census. */
+  pagePath?: string;
+  /** Short compatibility alias for consumers that call the census path `path`. */
+  path?: string;
+  /** Hash of the complete copied-vault page bytes, when available. */
+  pageSha256?: string;
+  /** Native frontmatter identity surface. */
+  aliases?: string[];
+  tags?: string[];
+  /** Outgoing wiki links resolved to concrete copied-vault page paths. */
+  relatedLinks?: string[];
+  /** Canonical-key IDs corresponding to relatedLinks. */
+  relatedPageIds?: string[];
 }
 
 export interface PageStatementNode {

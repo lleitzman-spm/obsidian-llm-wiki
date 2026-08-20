@@ -468,6 +468,7 @@ export async function runNativeReference(input: NativeReferenceInput): Promise<N
     runId: input.runId,
     authorityTree: input.sourceInventory.authorityTree,
     wikiFolder: String(preflight.effectiveSettings.wikiFolder),
+    slugCase: preflight.effectiveSettings.slugCase === 'preserve' ? 'preserve' : 'lower',
     sourceInventory: preflight.selectedSources,
     vault: app.vault,
   });

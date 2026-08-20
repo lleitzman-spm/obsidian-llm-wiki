@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -312,6 +312,29 @@ describe('headless crypto contracts', () => {
         throw error;
       }
       expect(() => buildMerkleTreeFromDirectory(linkPath)).toThrow(/symlink|reparse|root/i);
+    } finally {
+      await rm(linkParent, { recursive: true, force: true });
+      await rm(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a reparse ancestor even when the requested root itself is an ordinary directory', async () => {
+    const targetDir = await mkdtemp(join(tmpdir(), 'spm-crypto-ancestor-target-'));
+    const linkParent = await mkdtemp(join(tmpdir(), 'spm-crypto-ancestor-link-'));
+    const linkPath = join(linkParent, 'vault-junction');
+    const rootPath = join(linkPath, 'nested');
+    try {
+      await mkdir(join(targetDir, 'nested'));
+      await writeFile(join(targetDir, 'nested', 'receipt.json'), '{"ok":true}\n');
+      try {
+        await symlink(targetDir, linkPath, 'junction');
+      } catch (error) {
+        // Windows can disable junction creation in hardened CI.  Do not turn
+        // that host policy into a false crypto failure.
+        if (['EPERM', 'EACCES', 'UNKNOWN'].includes((error as NodeJS.ErrnoException).code ?? '')) return;
+        throw error;
+      }
+      expect(() => buildMerkleTreeFromDirectory(rootPath)).toThrow(/symlink|reparse|root/i);
     } finally {
       await rm(linkParent, { recursive: true, force: true });
       await rm(targetDir, { recursive: true, force: true });
