@@ -6,6 +6,7 @@ import {
   NativeCompatibilityError,
   nativeSourceSlug,
   planNativeGeneratedPage,
+  planNativeMerge,
   planNativeIndex,
   planNativeIngestLog,
   planNativeSourcePage,
@@ -804,24 +805,65 @@ function candidateForGroup(
   if (!sourceForRendering) throw new NativeReductionError(`group has no source: ${group.key.keyString}`);
   let content = '';
   if (existing) {
-    // Existing-page merge and reviewed append semantics are still native LLM
-    // seams. Keep their deterministic comparison renderer unchanged.
-    content = renderPage(
-      pageType,
-      label,
-      options.date,
-      sourceLinks,
-      tags,
-      aliases,
-      reviewed,
-      body,
-      summaries,
-      statements,
-      qualifications,
-      evidence,
-      related,
-      sourceForRendering,
-    );
+    // Only the native frontmatter-only merge is deterministic. Preserve the
+    // existing bytes for every LLM-owned, reviewed, or shared-page case.
+    const existingAliasKeys = new Set((existingMeta?.aliases ?? []).map(normalizeLabel));
+    const existingTagKeys = new Set((existingMeta?.tags ?? []).map(normalizeLabel));
+    const incomingAliases = aliases.filter(alias => !existingAliasKeys.has(normalizeLabel(alias)));
+    const incomingTags = tags.filter(tag => !existingTagKeys.has(normalizeLabel(tag)));
+    const existingFile = existingFileContent(options.existingFiles, path);
+    const mergeEligible = !reviewed
+      && sourceIds.length === 1
+      && bodyParts.length === 0
+      && summaries.length === 0
+      && statements.length === 0
+      && qualifications.length === 0
+      && evidence.length === 0
+      && related.length === 0
+      && path === computedPath
+      && existing.pageType === pageType
+      && existingMeta?.type === pageType
+      && incomingAliases.length === 0
+      && incomingTags.length === 0
+      && (existingFile === undefined || existingFile === existing.content);
+    if (sourceIds.length > 1) localReasons.push(`native-merge:shared-page-sequence-required:${path}`);
+    if (reviewed) localReasons.push(`native-merge:reviewed-page:${path}`);
+    if (bodyParts.length > 0 || summaries.length > 0 || statements.length > 0 || qualifications.length > 0 || evidence.length > 0 || related.length > 0) {
+      localReasons.push(`native-merge:body-comparison-required:${path}`);
+    }
+    if (path !== computedPath) localReasons.push(`native-merge:path-mismatch:expected ${computedPath}, received ${path}`);
+    if (existing.pageType !== pageType) localReasons.push(`native-merge:page-type-mismatch:${path}`);
+    if (existingMeta?.type !== pageType) localReasons.push(`native-merge:frontmatter-type-mismatch:${path}`);
+    if (incomingAliases.length > 0) localReasons.push(`native-merge:aliases-not-proven:${path}`);
+    if (incomingTags.length > 0) localReasons.push(`native-merge:tags-not-proven:${path}`);
+    if (existingFile !== undefined && existingFile !== existing.content) localReasons.push(`native-merge:existing-content-mismatch:${path}`);
+    if (mergeEligible) {
+      try {
+        const plan = planNativeMerge({
+          pagePath: path,
+          sourcePath: sourceForRendering.sourcePath,
+          existingContent: existing.content,
+          wikiFolder: options.wikiFolder,
+          date: options.date,
+          mode: 'frontmatter-only',
+          sourceSlug: sourceForRendering.sourceSlug,
+          slug: { preserveCase: options.slugCase === 'preserve' },
+        });
+        localReasons.push(...plannerReason('native-merge', plan));
+        if (plan.path !== path) localReasons.push(`native-merge:path-mismatch:expected ${path}, received ${plan.path}`);
+        if (plan.currentContent !== existing.content) localReasons.push(`native-merge:existing-content-mismatch:${path}`);
+        if (!plan.canApply || plan.content === undefined || plan.path !== path || (plan.action !== 'replace' && plan.action !== 'unchanged')) {
+          content = existing.content;
+        } else {
+          content = plan.content;
+        }
+      } catch (error) {
+        localReasons.push(plannerException('native-merge', error));
+        content = existing.content;
+      }
+    } else {
+      content = existing.content;
+    }
   } else {
     // New pages are applyable only when both sealed native settings and the
     // provider's generated body are explicitly bound. Never use the generic
@@ -1322,7 +1364,16 @@ export function reduceNativeSourceIR(
       compareExistingPath(existing, page, comparisonReasons);
     }
   }
-  const desiredPages = pages.map(page => desiredFile(page.path, page.pageType, 'partition', page.content, page.sourceIds, options.existingFiles, page.key));
+  // Existing-page projections are sealed bytes too. Bind them into the
+  // desired-file action calculation when no separate file projection was
+  // supplied, so a native merge's replace/unchanged action remains exact.
+  const pageExistingFiles = new Map(options.existingFiles ? [...options.existingFiles.entries()] : []);
+  for (const existing of existingPages) {
+    if (existing.pageType !== 'entity' && existing.pageType !== 'concept') continue;
+    const normalizedPath = assertRelativePath(existing.path, `existing page ${existing.path}`);
+    if (existingFileContent(pageExistingFiles, normalizedPath) === undefined) pageExistingFiles.set(normalizedPath, existing.content);
+  }
+  const desiredPages = pages.map(page => desiredFile(page.path, page.pageType, 'partition', page.content, page.sourceIds, pageExistingFiles, page.key));
   const sourcePlans = new Map<string, ReturnType<typeof sourcePlannerInput>>();
   for (const source of sources) {
     const path = sourcePath(source, { ...options, wikiFolder });
@@ -1391,6 +1442,8 @@ export function reduceNativeSourceIR(
       || reason.startsWith('global-path-collision:')
       || reason.startsWith('existing-path-collision:')
       || reason.startsWith('provider-frontmatter:')
+      || reason.startsWith('native-merge:')
+      || reason.startsWith('native-merge-required:')
       || reason.startsWith('native-generated-page:')
       || reason.startsWith('native-source-page:')
       || reason.startsWith('native-index:')

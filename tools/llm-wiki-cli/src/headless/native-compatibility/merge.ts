@@ -66,6 +66,9 @@ export function planNativeMerge(input: NativeMergeInput): NativeMergePlan {
   const sourcePath = normalizeNativeVaultPath(input.sourcePath, 'sourcePath');
   const wikiFolder = normalizeNativeWikiFolder(input.wikiFolder);
   const reasons: NativeCompatibilityReason[] = [];
+  if (!pagePath.startsWith(`${wikiFolder}/`)) {
+    reasons.push(reason('invalid-path', `Native merge page path ${pagePath} is outside wiki folder ${wikiFolder}`));
+  }
   if (!ISO_DATE.test(input.date)) reasons.push(reason('invalid-date', `Native merge date is invalid: ${input.date}`));
   if (input.existingContent === undefined) reasons.push(reason('missing-page-body', 'Native merge requires the existing page bytes'));
 

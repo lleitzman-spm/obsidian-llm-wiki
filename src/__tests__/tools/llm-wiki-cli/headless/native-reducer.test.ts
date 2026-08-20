@@ -6,6 +6,7 @@ import {
   planNativeGeneratedPage,
   planNativeIndex,
   planNativeIngestLog,
+  planNativeMerge,
   planNativeSourcePage,
 } from '../../../../../tools/llm-wiki-cli/src/headless/native-compatibility';
 import {
@@ -146,7 +147,8 @@ describe('native reducer', () => {
     expect(result.canApply).toBe(false);
     expect(result.reasons).toContain('cross-type-alias:shared name');
     expect(result.pages[0]?.content).toContain('# Curated');
-    expect(result.pages[0]?.content).toContain('new evidence');
+    expect(result.pages[0]?.content).not.toContain('new evidence');
+    expect(result.reasons).toContain('native-merge:reviewed-page:wiki/entities/shared-name.md');
   });
 
   it('preserves reviewed content and makes reviewed append comparison explicit', () => {
@@ -164,10 +166,94 @@ describe('native reducer', () => {
 
     expect(page?.bodyPolicy).toBe('append-reviewed');
     expect(page?.content).toContain('Do not rewrite this paragraph.');
-    expect(page?.content).toContain('Only under condition X.');
+    expect(page?.content).not.toContain('Only under condition X.');
     expect(page?.content).toContain('reviewed: true');
     expect(result.reasons).toContain('reviewed-append-requires-native-comparison:wiki/entities/locked.md');
+    expect(result.reasons).toContain('native-merge:reviewed-page:wiki/entities/locked.md');
     expect(result.canApply).toBe(false);
+  });
+
+  it('uses native frontmatter-only merge bytes for a supported existing page', () => {
+    const sourcePath = 'notes/merge-source.md';
+    const sourceSlug = nativeSourceSlug(sourcePath);
+    const existingContent = `---\ntype: entity\ncreated: 2024-01-01\nupdated: 2026-08-19\nsources:\n  - "[[sources/older-source_abcdef]]"\ntags:\n  - "person"\naliases:\n  - "Existing Alias"\ncustom: preserve-me\n---\n\n# Merge Target\n\nCurated body.\n`;
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/merge-target.md',
+      pageType: 'entity',
+      label: 'Merge Target',
+      content: existingContent,
+    };
+    const reducerOptions = options({
+      existingPages: [existing],
+      existingFiles: new Map([[existing.path, existing.content]]),
+    });
+    const result = reduceNativeSourceIR([source('merge-source', [{
+      proposalId: 'merge-proposal',
+      sourceId: 'merge-source',
+      pageType: 'entity',
+      label: 'Merge Target',
+    }], { sourcePath, sourceSlug })], reducerOptions);
+    const page = result.pages[0];
+    const expected = planNativeMerge({
+      pagePath: existing.path,
+      sourcePath,
+      sourceSlug,
+      existingContent,
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'frontmatter-only',
+      slug: { preserveCase: false },
+    });
+    const desired = result.desiredState.find(file => file.path === existing.path);
+
+    expect(result.canApply).toBe(true);
+    expect(expected.canApply).toBe(true);
+    expect(page?.content).toBe(expected.content);
+    expect(desired?.action).toBe(expected.action);
+    expect(page?.content).toContain('created: 2024-01-01');
+    expect(page?.content).toContain(`sources/${sourceSlug}`);
+    expect(page?.content).toContain('Existing Alias');
+    expect(page?.content).toContain('custom: preserve-me');
+    expect(page?.content).toContain('Curated body.');
+  });
+
+  it('refuses an existing non-reviewed body merge without generic-render fallback', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/body-target.md',
+      pageType: 'entity',
+      label: 'Body Target',
+      content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Curated body.\n',
+    };
+    const result = reduceNativeSourceIR([source('body-source', [{
+      proposalId: 'body-proposal',
+      sourceId: 'body-source',
+      pageType: 'entity',
+      label: 'Body Target',
+      body: '# Provider body\n\nNew content.\n',
+    }])], options({ existingPages: [existing] }));
+
+    expect(result.canApply).toBe(false);
+    expect(result.pages[0]?.content).toBe(existing.content);
+    expect(result.pages[0]?.content).not.toContain('New content.');
+    expect(result.reasons).toContain('native-merge:body-comparison-required:wiki/entities/body-target.md');
+    expect(result.reasons).toContain('native-merge-required:wiki/entities/body-target.md');
+  });
+
+  it('refuses shared existing-page sequencing even when frontmatter is otherwise mergeable', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/shared-existing.md',
+      pageType: 'entity',
+      label: 'Shared Existing',
+      content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Shared Existing\n',
+    };
+    const result = reduceNativeSourceIR([
+      source('shared-a', [{ proposalId: 'shared-a-proposal', sourceId: 'shared-a', pageType: 'entity', label: 'Shared Existing' }]),
+      source('shared-b', [{ proposalId: 'shared-b-proposal', sourceId: 'shared-b', pageType: 'entity', label: 'Shared Existing' }]),
+    ], options({ existingPages: [existing] }));
+
+    expect(result.canApply).toBe(false);
+    expect(result.pages[0]?.content).toBe(existing.content);
+    expect(result.reasons).toContain('native-merge:shared-page-sequence-required:wiki/entities/shared-existing.md');
   });
 
   it('emits a complete serialized global phase without touching the filesystem', () => {
