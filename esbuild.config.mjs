@@ -1,6 +1,10 @@
 import esbuild from "esbuild";
 import process from "process";
 import { builtinModules } from "module";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 
 const banner =
 `/*
@@ -15,10 +19,11 @@ const oneShot = prod || (process.argv[2] === 'dev');
 const prodBanner = prod ? 'console.debug = function() {};\n' : '';
 
 const context = await esbuild.context({
+  absWorkingDir: projectRoot,
   banner: {
     js: banner + prodBanner,
   },
-  entryPoints: ['src/main.ts'],
+  entryPoints: [path.join(projectRoot, 'src/main.ts')],
   bundle: true,
   external: [
     'obsidian',
@@ -41,7 +46,7 @@ const context = await esbuild.context({
   logLevel: "info",
   sourcemap: prod ? false : 'inline',
   treeShaking: true,
-  outfile: 'main.js',
+  outfile: path.join(projectRoot, 'main.js'),
 });
 
 if (oneShot) {

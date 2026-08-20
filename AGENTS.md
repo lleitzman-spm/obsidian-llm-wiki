@@ -30,7 +30,7 @@ Cache-only architecture replaces the previously-planned sidecar (`<vault>/<basen
   - **P1 (settings defaults test)**: new src/__tests__/types/settings.test.ts
   - **P2 (i18n user-perspective rewrite)**: forcePdfSupportDesc + sourceRejectedPdfUnsupported rewritten in 10 locales — drop developer jargon, speak user outcome
 - ⏳ **PR4 (optional, by AkaSakana)** — Kimi Files API provider dispatch + error regex classifiers + transient-retry extension. If AkaSakana ships as follow-up PR after v1.25.0 lands, we merge after review. If schedule slips, we port ourselves (1-day).
-- ⏳ **Final** — `pnpm build:dev` + HARD STOP + user e2e + push decision.
+- ⏳ **Final** — `pnpm build:dev` + agent-run E2E/readback + gated push and PR.
 
 **AkaSakana PR #286 feedback adopted (2026-07-15):**
 - ✅ Cache key includes `converterVersion` so prompt upgrades invalidate stale entries.
@@ -74,11 +74,11 @@ Full composition + execution plan: [ROADMAP.md](./ROADMAP.md)
 
 ## 🛡️ Six-Gate Quality Closure
 
-Every change must pass all six gates before being considered complete. Gates 1-4 are developer-responsible (checked during development and in Step 2 of the release workflow). Gates 5-6 are automated by `pre-release-gate` before user approval.
+Every change must pass all six gates before being considered complete. Gates 1-4 are developer-responsible (checked during development and in Step 2 of the release workflow). Gates 5-6 are automated by `pre-release-gate` before release integration.
 
 | Gate | Constraint | How | Who |
 |------|-----------|-----|-----|
-| **1. Code correct** | `pnpm lint` 0/0 + `npx tsc --noEmit` 0/0 + `pnpm test` all pass + `pnpm build` clean + `pnpm css-lint` 0 | 5-Gate script | Developer |
+| **1. Code correct** | plugin and CLI typechecks + `pnpm lint` 0/0 + `pnpm build` clean + `pnpm test` all pass + `pnpm css-lint` 0 | 5-Gate script | Developer |
 | **2. No side effects** | Call-site audit + data flow trace + state mutation check + error propagation check | Structured review | Developer |
 | **3. No breaking changes** | API/Schema/File format/Default behavior/Command IDs/Obsidian API all backward-compatible | Breaking-change matrix | Developer |
 | **4. No performance regression** | CPU/memory/IO/network/token usage — 5-dim walkthrough, written assessment table | simplify + code-review + Gate 4 table | Developer |
@@ -92,8 +92,9 @@ Must all pass sequentially. If any fails, fix root cause (no `@ts-ignore` or `es
 ```bash
 pnpm lint           # ESLint + Obsidian rules: 0 errors, 0 warnings
 npx tsc --noEmit    # TypeScript: 0 errors (ESLint does NOT check type safety)
-pnpm test           # Vitest: all pass, 0 failures
+pnpm typecheck:tools # Headless CLI TypeScript: 0 errors
 pnpm build          # esbuild: clean exit
+pnpm test           # Vitest: all pass, 0 failures
 pnpm css-lint       # CSS: 0 !important declarations in styles.css
 ```
 
@@ -102,8 +103,9 @@ pnpm css-lint       # CSS: 0 !important declarations in styles.css
 ```bash
 pnpm lint           # Gate 1: ESLint - 0 errors, 0 warnings
 npx tsc --noEmit    # Gate 1: TypeScript - 0 errors, 0 warnings
-pnpm test           # Gate 1: Tests - all pass, 0 failures
+pnpm typecheck:tools # Gate 1: Headless CLI TypeScript - 0 errors
 pnpm build          # Gate 1: Build - clean exit
+pnpm test           # Gate 1: Tests - all pass, 0 failures
 pnpm css-lint       # Gate 1: CSS - 0 !important declarations
 ```
 
@@ -179,7 +181,7 @@ A bare "no regression" without the table is **not acceptable**.
 
 Gate 6 is a **superset of Gates 1-5**: re-verifies everything is still green
 *plus* release-specific hygiene. Automated by the `pre-release-gate`
-skill before user approval (release Step 5c). The skill's REPORT phase
+skill before release integration (release Step 5c). The skill's REPORT phase
 must include:
 
 - All Gate 1 mechanical checks (lint/tsc/test/build) — re-run, do not trust cached
@@ -228,7 +230,13 @@ Every change via `Read` + `Edit` — no sed/awk/python for code or document edit
 
 ## ⚠️ Git Safety Protocol
 
-- **NEVER commit or push without explicit user permission.** Non-negotiable.
+- Routine commits, pushes to this fork, PR creation, review, and forward
+  integration are agent-owned after the required gates pass. Luke is not a
+  routine code-review or merge gate.
+- Ask Luke only for a genuinely constitutive product/business decision or an
+  external effect outside the approved objective. Never push to the upstream
+  maintainer's repository unless the task itself includes an upstream
+  contribution.
 
 ## 🔀 Git Branch Workflow (enforced since v1.20.2)
 
@@ -250,13 +258,13 @@ main (protected) ─────────────────────
 
 1. **Branch from main:** `git checkout -b feat/xxx` or `git checkout -b fix/xxx`
 2. **Develop on the branch** — multiple commits OK, each with meaningful content
-3. **Gate 1 verification:** `pnpm lint && npx tsc --noEmit && pnpm test && pnpm build && pnpm css-lint`
-4. **Only after user confirmation** — push branch, create PR
-5. **After PR merge** — switch back to main, pull, tag (if needed)
+3. **Gate 1 verification:** `pnpm gate:1`
+4. **After independent review** — push branch and create the PR
+5. **After required checks and review pass** — merge, switch back to main, pull, and tag if needed
 
 **Prohibited:**
 - ❌ Committing directly on main (except lockfile-only changes)
-- ❌ Pushing PR without user confirmation
+- ❌ Pushing to the upstream maintainer or an unrelated remote
 - ❌ Mixing unrelated changes in one PR
 - ❌ Fragmented commits (amend the previous commit or squash)
 
@@ -267,7 +275,7 @@ main (protected) ─────────────────────
 
 ## 📦 Development Workflow
 
-1. `pnpm lint && pnpm test && npx tsc --noEmit && pnpm build && pnpm css-lint` — all five must pass (Six-Gate Gate 1)
+1. `pnpm gate:1` — lint, typecheck, build, tests, and CSS lint must all pass in that order (Six-Gate Gate 1)
 
 ### Build modes
 
@@ -425,17 +433,18 @@ Use the `obsidian-plugin-release` skill for the full workflow (Steps 1-8). Gate 
 
 ---
 
-## ⚠️ Development Protocol: Plan First, Then Execute
+## ⚠️ Development Protocol: Plan, Execute, and Report
 
 **Before starting any significant change** (refactoring, new modules, prompt modification, architectural decisions, or anything touching core engine files):
 
-1. **Present your plan** — explain what, why, and how
-2. **Wait for explicit user approval** before writing code or committing
-3. **For multi-phase work**: pause and report after each phase
+1. **State the plan** — explain what, why, and how in the active task
+2. **Execute within the approved objective** without making Luke a routine code
+   or commit gate
+3. **For multi-phase work**: report each phase transition and continue when its
+   objective gates pass; stop only for a real authority boundary or blocker
 
-**Exceptions** (no prior approval needed): trivial one-line fixes, running lint/test/build, reading files, documenting existing code.
-
-**Why**: The user is the domain expert on product vision. The AI has tooling capability but lacks product context. Propose, don't dispose.
+**Why**: Luke owns constitutive product direction. The agent cluster owns code
+review, tests, commits, pushes, and forward integration inside that direction.
 
 ## 🧪 TDD: Write Tests First
 

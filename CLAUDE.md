@@ -10,7 +10,7 @@
 
 | Gate | Constraint | How |
 |------|-----------|-----|
-| **1. Code correct** | `pnpm lint` 0/0 + `npx tsc --noEmit` 0/0 + `pnpm build` clean + `pnpm test` all pass + `pnpm css-lint` 0 | Five-Gate script (build BEFORE test — see §"Gate 1: Five-Gate automated") |
+| **1. Code correct** | plugin and CLI typechecks + `pnpm lint` 0/0 + `pnpm build` clean + `pnpm test` all pass + `pnpm css-lint` 0 | Five-Gate script (build BEFORE test — see §"Gate 1: Five-Gate automated") |
 | **2. No side effects** | Call-site audit + data flow + state mutation + error propagation | Structured review |
 | **3. No breaking changes** | API/Schema/File format/Default behavior/Command IDs/Obsidian API | Breaking-change matrix |
 | **4. No performance regression** | CPU/memory/IO/network/token — 5-dim written assessment | simplify + code-review + Gate 4 table |
@@ -20,7 +20,7 @@
 ### Gate 1: Five-Gate automated
 
 ```bash
-pnpm lint && npx tsc --noEmit && pnpm build && pnpm test && pnpm css-lint
+pnpm lint && pnpm typecheck && pnpm typecheck:tools && pnpm build && pnpm test && pnpm css-lint
 ```
 
 All five must pass. ESLint checks style, TypeScript checks types, css-lint checks Obsidian review compliance — three complementary checks, single tool passing is insufficient. No `@ts-ignore` / `eslint-disable` to silence failures.
@@ -130,26 +130,33 @@ main (protected) ────► tag → release
   └── fix/xxx  ── PR → review → merge
 ```
 
-**Per-fix E2E handoff + explicit push approval (added 2026-08-14, post #456 incident):**
+**Per-fix E2E handoff + agent-owned forward integration:**
 
 1. Branch from main (`git checkout -b feat/xxx` or `fix/xxx`)
 2. RED test → GREEN fix → 4-Gate green (per TDD closure)
-3. **Local commit** (`git commit`, no push yet)
+3. **Local commit**
 4. **`pnpm build:dev`** → verify artifacts (`tail -1 main.js` ends with sourcemap; `console.debug` preserved; 3 output files exist)
-5. **Report to user** — root cause + file:line + diff + test delta + 6-Gate table
-6. **Wait for explicit "可以 push" / "push it" / "ship it"** before `git push` + `gh pr create`
-7. **Wait for explicit "merge it" / "合并"** before `gh pr merge`
+5. **Independent review** — resolve P0/P1 findings and preserve the review evidence
+6. **Report the phase transition** — root cause + file:line + diff + test delta + 6-Gate table
+7. **Forward integrate** — push, create the PR, and merge after required checks and review pass
 
-**Prohibited:** committing directly on main · pushing PR without user confirmation · mixing unrelated changes · fragmented commits (amend instead) · **`git push` + `gh pr create` immediately after Gate 1 passes** (must do E2E handoff + explicit approval first) · **`gh pr merge` after PR created** (must wait for explicit signal).
+**Prohibited:** committing directly on main · pushing to the upstream maintainer or an unrelated remote · mixing unrelated changes · fragmented commits (amend instead) · pushing or merging immediately after Gate 1 without E2E/readback and independent review.
 
 **When to amend vs new commit:** fixing a problem in previous commit → `--amend`; new feature/fix → new commit; pre-release doc updates → can amend into version bump commit.
 
 ### ⚠️ Git Safety Protocol
 
-- **NEVER commit or push without explicit user permission.** Non-negotiable.
-- **NEVER auto-merge PRs.** Not even when Gate 1 passed in CI, or the fix looks "obviously correct", or user said "handle it".
-- **Mandatory pre-merge workflow:** (1) user explicit "merge it" / "合并" required before `gh pr merge` / cherry-pick / PR-creation; (2) `simplify` skill runs on PR diff (4 angles); (3) `code-review` skill runs (8 angles, max effort); (4) report findings as `file:line + concrete issue + suggested fix` — do NOT modify the PR; (5) wait for approval before any destructive action.
-- **Anti-patterns:** "the PR is small, let me cherry-pick to local main first while we discuss" (violates workflow, creates commits ahead of approval); "Gate 1 passes, so I can `git push` + `gh pr create` immediately" (skips E2E handoff — see #456 incident above).
+- Routine commits, pushes to this fork, PR creation, review, and forward
+  integration are agent-owned. Luke does not review code and is not a routine
+  merge gate.
+- Never push to the upstream maintainer or an unrelated remote unless the task
+  itself includes that external contribution.
+- **Mandatory pre-merge workflow:** (1) `simplify` review covers code reuse,
+  quality, efficiency, and scope; (2) `code-review` covers the PR diff at the
+  risk-appropriate effort; (3) P0/P1 findings are fixed and re-reviewed; (4)
+  E2E/readback and required checks pass; (5) merge and preserve exact-SHA proof.
+- **Anti-pattern:** treating Gate 1 alone as sufficient. Mechanical checks do
+  not replace E2E/readback or independent review.
 
 ### Per-PR discipline
 
@@ -159,7 +166,7 @@ For contributor PRs that need rebase after base-branch move: use `gh pr update-b
 
 ```
 gh pr review <N> --body "<file>"   # ← MANDATORY. Formal review event lands on the PR.
-gh pr merge <N> --admin --squash --delete-branch   # ← ONLY after user said "merge it"
+gh pr merge <N> --admin --squash --delete-branch   # ← ONLY after required checks and review pass
 ```
 
 - **`gh pr review --approve` (or `--request-changes`) MUST be posted BEFORE `gh pr merge`.** This lands the formal review verdict on the PR timeline; downstream tooling (release notes, contributor credit, audit trail) reads from that event, not from comments.
@@ -182,7 +189,7 @@ pnpm lint && pnpm test && pnpm typecheck && pnpm build && pnpm css-lint   # WRON
 
 `.github/workflows/pr-ci.yml` runs the full Five-Gate on every PR to `main`. Status check: `Gate 1 / Five-Gate`. Branch protection requires it (`strict: false`, `require_last_push_approval: true`).
 
-CI is a **defense-in-depth** layer on top of the per-fix E2E handoff manual Gate 1 (which is still required before `git push`). CI does NOT enable auto-merge — explicit "merge it" / "合并" still required per §"⚠️ Git Safety Protocol".
+CI is a **defense-in-depth** layer on top of the per-fix E2E handoff manual Gate 1 (which is still required before `git push`). CI does not replace the independent review and native-readback gates in §"⚠️ Git Safety Protocol".
 
 Obsidian Bot review remains a separate pipeline (not a GitHub status check); CI green ≠ Bot-approved. See `feedback_obsidian_bot_double_lint` for the double-lint invariant.
 
@@ -209,15 +216,13 @@ Use `obsidian-plugin-release` skill for the full workflow (Steps 1-8). Gate 1 mu
 
 ---
 
-## ⚠️ Development Protocol: Plan First, Then Execute
+## ⚠️ Development Protocol: Plan, Execute, and Report
 
 **Before any significant change** (refactoring, new modules, prompt modification, architectural decisions, anything touching core engine files):
 
-1. Present your plan — explain what, why, how
-2. Wait for explicit user approval before writing code or committing
-3. For multi-phase work: pause and report after each phase
-
-**Exceptions** (no prior approval needed): trivial one-line fixes, running lint/test/build, reading files, documenting existing code.
+1. State the plan — explain what, why, and how in the active task
+2. Execute within the approved objective without making Luke a routine code or commit gate
+3. For multi-phase work, report each transition and continue when its gates pass; stop only for a real authority boundary or blocker
 
 Full protocol: [[feedback_development_protocol]].
 

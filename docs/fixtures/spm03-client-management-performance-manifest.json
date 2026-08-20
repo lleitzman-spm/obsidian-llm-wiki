@@ -1,0 +1,90 @@
+{
+  "schema": "spm-throughput-source-manifest/v1",
+  "authority_repository": "https://github.com/lleitzman-spm/SPM-Optimization.git",
+  "authority_commit": "37cc4d934482f87342a9dc45e60839f1dfc35a26",
+  "authority_tree": "f0eca985c293f0c813066533ef63bb42e781aac9",
+  "domain": "client-management",
+  "source_count": 16,
+  "sources": [
+    {
+      "path": "wiki/client-management/agents-imported-from-cowork-corpus-projects-flipper.md",
+      "bytes": 2617,
+      "sha256": "2799ef7bf6b515e23fce1e3e3f8f852939a566d17b1b7e4cfd4217add368a165"
+    },
+    {
+      "path": "wiki/client-management/change-of-ownership-of-existing-property.md",
+      "bytes": 2205,
+      "sha256": "80442722d887e31d4011d97f68b2ee6fffaa39ea16556389f48735f945a203cc"
+    },
+    {
+      "path": "wiki/client-management/data-fixes-recon.md",
+      "bytes": 3990,
+      "sha256": "af20ed8bc520d72ea1963c605c6b8319b15a157f0974d77390a2d08714f8ce6d"
+    },
+    {
+      "path": "wiki/client-management/handling-price-adjustments-and-owner-expectations.md",
+      "bytes": 3672,
+      "sha256": "5aab5d603be4c98a6ca61e2c8f3af481130723219bcfccd2970b49b6331de815"
+    },
+    {
+      "path": "wiki/client-management/holiday-gifts-procedure.md",
+      "bytes": 3774,
+      "sha256": "4f13788a9fbaa73953864c23ac9fad4f742e09f81b2f8f9831959b8fc7507877"
+    },
+    {
+      "path": "wiki/client-management/holiday-gifts-tracking-sheet.md",
+      "bytes": 3398,
+      "sha256": "dac151070e0f9d08b05f34179539aaa2b72da71d9af5e58d9f0053363a3becc8"
+    },
+    {
+      "path": "wiki/client-management/informing-owners-of-repairs.md",
+      "bytes": 6470,
+      "sha256": "99b8c8c412cb516dd93d47f07e69b36935202bb0049fa4d39b2becc6fdc59774"
+    },
+    {
+      "path": "wiki/client-management/legacy-corpus-corpus.md",
+      "bytes": 1556,
+      "sha256": "70ac1b5f0d80cc6b3b551efab5c75bdcf4e7df583b69c93356a5e89abbac03f7"
+    },
+    {
+      "path": "wiki/client-management/monthly-owner-communication.md",
+      "bytes": 1740,
+      "sha256": "6dde70ce0fa09140a9b7c064d02968a58f4abfc3fad6c689cb204c8c4da91d2b"
+    },
+    {
+      "path": "wiki/client-management/new-client-acquisition.md",
+      "bytes": 4762,
+      "sha256": "fef601b7b9bd581013ff361cd6ce8e0482025d1fb53bcdf1102caba252845a3e"
+    },
+    {
+      "path": "wiki/client-management/new-property-w-existing-tenants-intake.md",
+      "bytes": 2217,
+      "sha256": "165b654bb17809c8376bfe2e2098fe46f9512731d3a9c6e4735f3614b4e1e9c9"
+    },
+    {
+      "path": "wiki/client-management/owner-onboarding-letter-compliance-a9-owner.md",
+      "bytes": 6898,
+      "sha256": "3644d7b5b4c4cca8a52263a78231baf4e03b0f7f28c06e1c0a4e561a9fe5866e"
+    },
+    {
+      "path": "wiki/client-management/renovation-project-funding-and-communication.md",
+      "bytes": 1282,
+      "sha256": "033e6252440ce521353a21f9ecab9a9272b66f78911c5035bffcd4987d38b7bc"
+    },
+    {
+      "path": "wiki/client-management/seat-seats-bdr.md",
+      "bytes": 5595,
+      "sha256": "f117f3f6693f9a4dfb2978073ce06a2f5b6fc4fae7861ba4e67d38c28cece8e3"
+    },
+    {
+      "path": "wiki/client-management/skill-skills-owner-approval-ov.md",
+      "bytes": 3341,
+      "sha256": "293e86a3147e18d3c6bc98674b3828f79a549b9516a2c764a055c9b4602e8087"
+    },
+    {
+      "path": "wiki/client-management/spm-no-longer-managing-property-instructions.md",
+      "bytes": 1592,
+      "sha256": "2c67626e766ed6b5978708feedf1e3b699eb2136274291555b143130b8dc3841"
+    }
+  ]
+}

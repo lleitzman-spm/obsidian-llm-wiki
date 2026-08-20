@@ -1,0 +1,13 @@
+{
+  "version": "projection-parser/v1",
+  "source": "# Title\n\n## Scope\nA first sentence. A second sentence.\n\n- One item.\n\n| Name | Value |\n| --- | --- |\n| Alpha | 42 |\n",
+  "canonicalStatements": [
+    { "kind": "heading", "text": "Scope" },
+    { "kind": "paragraph", "text": "A first sentence." },
+    { "kind": "paragraph", "text": "A second sentence." },
+    { "kind": "list-item", "text": "One item." },
+    { "kind": "table-cell", "text": "Alpha" },
+    { "kind": "table-cell", "text": "42" }
+  ],
+  "excludedReasons": ["title-heading", "navigation-section", "frontmatter-key:title"]
+}
