@@ -426,6 +426,9 @@ export function nativeMapIRToSourceScopedIR(
   if (!sourceId) throw new NativeReductionError('native-map IR source id is empty');
   const sourcePath = assertSourceReference(source.source.sourcePath, 'native-map source.sourcePath');
   const sourceSlug = nativeMapSourceSlug(sourcePath, slugCase === 'preserve');
+  const sourceTitle = text(source.sourceTitle) || sourceSlug;
+  const sourceSummary = text(source.summary);
+  let sourceAliases = uniqueSorted(source.sourceAliases ?? []);
   const extras = new Map<string, ProposalExtras>();
   const getExtras = (pageType: NativePageType, label: string): ProposalExtras => {
     const key = partitionKeyString(canonicalPartitionKey(pageType, label));
@@ -475,6 +478,36 @@ export function nativeMapIRToSourceScopedIR(
   source.concepts.forEach((item, index) => makeProposal('concept', item, source.entities.length + index));
 
   for (const claim of source.claims) {
+    const claimPath = assertSourceReference(claim.sourcePath, `claim ${claim.claimId}.sourcePath`);
+    const claimSourceMismatch = pathCollisionKey(claimPath) !== pathCollisionKey(sourcePath);
+    if (claim.subject.pageType === 'source') {
+      // Native analyze-source always emits one source-summary claim.  The
+      // summary is already represented by sourceSummary/sourceBody, and
+      // source-level contradiction claims are reduced from `contradictions`
+      // below.  Both are safely reduced only after their source binding,
+      // target title, disposition, and statement agree with native output.
+      if (claimSourceMismatch) unsupported.push(`native-map-claim-source-mismatch:${claim.claimId}`);
+      const targetMatches = normalizeLabel(claim.subject.label) === normalizeLabel(sourceTitle);
+      const sourceContradictionMatches = claim.predicate === 'contradiction'
+        && claim.disposition === 'contested'
+        && claim.evidenceQuotes.length === 0
+        && source.contradictions.some(item => text(item.claim) === text(claim.statement));
+      if (sourceContradictionMatches && targetMatches && !claimSourceMismatch) continue;
+      if (claim.predicate !== 'source-summary' || claim.disposition !== 'proposed' || claim.evidenceQuotes.length > 0) {
+        unsupported.push(`native-map-claim-source-subject:${claim.claimId}`);
+        continue;
+      }
+      if (!targetMatches) {
+        unsupported.push(`native-map-claim-source-subject:${claim.claimId}`);
+        unsupported.push(`native-map-source-summary-target-mismatch:${claim.claimId}`);
+        continue;
+      }
+      if (text(claim.statement) !== sourceSummary) {
+        unsupported.push(`native-map-claim-source-subject:${claim.claimId}`);
+        unsupported.push(`native-map-source-summary-mismatch:${claim.claimId}`);
+      }
+      continue;
+    }
     if (claim.subject.pageType !== 'entity' && claim.subject.pageType !== 'concept') {
       unsupported.push(`native-map-claim-source-subject:${claim.claimId}`);
       continue;
@@ -482,10 +515,7 @@ export function nativeMapIRToSourceScopedIR(
     const key = partitionKeyString(canonicalPartitionKey(claim.subject.pageType, claim.subject.label));
     const extra = getExtras(claim.subject.pageType, claim.subject.label);
     const role = claim.disposition === 'contested' ? 'contests' as const : 'supports' as const;
-    const claimPath = assertSourceReference(claim.sourcePath || sourcePath, `claim ${claim.claimId}.sourcePath`);
-    if (pathCollisionKey(claimPath) !== pathCollisionKey(sourcePath)) {
-      unsupported.push(`native-map-claim-source-mismatch:${claim.claimId}`);
-    }
+    if (claimSourceMismatch) unsupported.push(`native-map-claim-source-mismatch:${claim.claimId}`);
     const evidence = claim.evidenceQuotes.map((quote, index) => ({
       evidenceId: `claim:${sha256(`${claim.claimId}\u0000${index}\u0000${quote}`)}`,
       role,
@@ -508,11 +538,26 @@ export function nativeMapIRToSourceScopedIR(
   }
 
   for (const alias of source.aliases) {
-    if (alias.targetPageType === 'entity' || alias.targetPageType === 'concept') {
-      const aliasSourcePath = assertSourceReference(alias.sourcePath, `alias ${alias.alias}.sourcePath`);
-      if (pathCollisionKey(aliasSourcePath) !== pathCollisionKey(sourcePath)) {
+    const aliasSourcePath = assertSourceReference(alias.sourcePath, `alias ${alias.alias}.sourcePath`);
+    const aliasSourceMismatch = pathCollisionKey(aliasSourcePath) !== pathCollisionKey(sourcePath);
+    if (alias.targetPageType === 'source') {
+      if (aliasSourceMismatch) {
         unsupported.push(`native-map-alias-source-mismatch:${alias.alias}`);
+        unsupported.push(`native-map-alias-target:${alias.alias}`);
       }
+      if (normalizeLabel(alias.targetLabel) !== normalizeLabel(sourceTitle)) {
+        unsupported.push(`native-map-alias-target:${alias.alias}`);
+        unsupported.push(`native-map-alias-source-target-mismatch:${alias.alias}`);
+      } else if (!text(alias.alias)) {
+        unsupported.push(`native-map-alias-target:${alias.alias}`);
+        unsupported.push('native-map-alias-empty');
+      } else if (!aliasSourceMismatch) {
+        sourceAliases = uniqueSorted([...sourceAliases, alias.alias]);
+      }
+      continue;
+    }
+    if (alias.targetPageType === 'entity' || alias.targetPageType === 'concept') {
+      if (aliasSourceMismatch) unsupported.push(`native-map-alias-source-mismatch:${alias.alias}`);
       const targetLabels = alias.targetPageType === 'entity' ? entityLabels : conceptLabels;
       const targetLabel = normalizeLabel(alias.targetLabel);
       if (!targetLabel || !targetLabels.has(targetLabel)) {
@@ -571,18 +616,18 @@ export function nativeMapIRToSourceScopedIR(
       evidence: extra?.evidence ?? proposal.evidence,
     };
   });
-  const sourceBody = text(source.summary)
-    ? `# ${text(source.sourceTitle) || sourceSlug}\n\n${text(source.summary)}\n`
-    : `# ${text(source.sourceTitle) || sourceSlug}\n`;
+  const sourceBody = sourceSummary
+    ? `# ${sourceTitle}\n\n${sourceSummary}\n`
+    : `# ${sourceTitle}\n`;
   return {
     sourceId,
     sourcePath,
     sourceSlug,
-    sourceTitle: text(source.sourceTitle) || sourceSlug,
+    sourceTitle,
     sourceSummary: source.summary,
     sourceBody,
-    sourceAliases: source.sourceAliases,
-    sourcePage: { title: source.sourceTitle, body: sourceBody, aliases: source.sourceAliases },
+    sourceAliases,
+    sourcePage: { title: sourceTitle, body: sourceBody, aliases: sourceAliases },
     proposals: adapted,
     unsupported,
   };
@@ -812,6 +857,44 @@ function checkAliasCollisions(pages: readonly NativePageCandidate[], reasons: st
   }
 }
 
+function checkSourceAliasCollisions(
+  sources: readonly NativeSourceScopedIR[],
+  pages: readonly NativePageCandidate[],
+  reasons: string[],
+): void {
+  const sourceTitleOwners = new Map<string, string>();
+  const pageOwners = new Map<string, string>();
+  for (const source of sources) {
+    const owner = `source:${source.sourceId}`;
+    const titleKey = normalizeLabel(text(source.sourceTitle));
+    if (titleKey && !sourceTitleOwners.has(titleKey)) sourceTitleOwners.set(titleKey, owner);
+  }
+  for (const page of pages) {
+    const owner = `page:${page.key.keyString}`;
+    const labelKey = normalizeLabel(page.label);
+    if (labelKey && !pageOwners.has(labelKey)) pageOwners.set(labelKey, owner);
+    for (const alias of page.aliases) {
+      const key = normalizeLabel(alias);
+      if (key && !pageOwners.has(key)) pageOwners.set(key, owner);
+    }
+  }
+  const sourceAliasOwners = new Map<string, string>();
+  for (const source of sources) {
+    const owner = `source:${source.sourceId}`;
+    for (const alias of source.sourceAliases ?? []) {
+      const key = normalizeLabel(alias);
+      if (!key) continue;
+      const priorAlias = sourceAliasOwners.get(key);
+      if (priorAlias && priorAlias !== owner) reasons.push(`ambiguous-source-alias:${alias}:${priorAlias}:${owner}`);
+      else sourceAliasOwners.set(key, owner);
+      const priorTitle = sourceTitleOwners.get(key);
+      if (priorTitle && priorTitle !== owner) reasons.push(`ambiguous-source-alias:${alias}:${priorTitle}:${owner}`);
+      const pageOwner = pageOwners.get(key);
+      if (pageOwner) reasons.push(`ambiguous-source-alias:${alias}:${owner}:${pageOwner}`);
+    }
+  }
+}
+
 function compareExistingPath(existing: NativeExistingPage, candidate: NativePageCandidate, reasons: string[]): void {
   const existingMeta = parseFrontmatter(existing.content);
   if (existing.pageType !== candidate.pageType) reasons.push(`existing-page-type-mismatch:${candidate.path}`);
@@ -924,6 +1007,7 @@ export function reduceNativeSourceIR(
   const comparisonReasons = [...sourceUnsupported, ...structuralReasons];
   const pages = [...groups.values()].sort((left, right) => left.key.keyString.localeCompare(right.key.keyString)).map(group => candidateForGroup(group, options, comparisonReasons));
   checkAliasCollisions(pages, comparisonReasons);
+  checkSourceAliasCollisions(sources, pages, comparisonReasons);
   const pathOwners = new Map<string, string>();
   for (const page of pages) {
     const pagePathKey = pathCollisionKey(page.path);
@@ -976,6 +1060,7 @@ export function reduceNativeSourceIR(
     ...sourceUnsupported,
     ...reasons.filter(reason => reason.startsWith('unresolved-cross-type-collision:')
       || reason.startsWith('ambiguous-alias:')
+      || reason.startsWith('ambiguous-source-alias:')
       || reason.startsWith('path-collision:')
       || reason.startsWith('global-path-collision:')
       || reason.startsWith('existing-path-collision:')

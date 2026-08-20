@@ -207,11 +207,71 @@ describe('native reducer', () => {
     expect(result.unsupported).toContain('provider-frontmatter:owner_only');
   });
 
+  it('accepts the native source summary, source alias, and deterministically resolved related proposal', () => {
+    const result = reduceNativeMapIR([mapped({
+      claims: [{
+        claimId: 'source-summary',
+        subject: { pageType: 'source', label: 'Mapped source' },
+        predicate: 'source-summary',
+        statement: 'A mapped summary',
+        disposition: 'proposed',
+        evidenceQuotes: [],
+        sourcePath: 'notes/mapped.md',
+      }, {
+        claimId: 'source-contradiction',
+        subject: { pageType: 'source', label: 'Mapped source' },
+        predicate: 'contradiction',
+        statement: 'Mapped Entity fact is disputed',
+        disposition: 'contested',
+        evidenceQuotes: [],
+        sourcePath: 'notes/mapped.md',
+      }],
+      aliases: [{
+        alias: 'Mapped SOP',
+        targetPageType: 'source',
+        targetLabel: 'Mapped source',
+        sourcePath: 'notes/mapped.md',
+      }],
+      related: [{
+        sourcePath: 'notes/mapped.md',
+        pageType: 'entity',
+        label: 'Mapped Entity',
+        resolution: 'unresolved-source-proposal',
+      }],
+      contradictions: [{
+        claim: 'Mapped Entity fact is disputed',
+        source_page: 'Mapped Entity.md',
+        contradicted_by: 'Contrary evidence',
+        resolution: 'Needs review',
+      }],
+    })], options());
+    const sourceFile = result.desiredState.find(file => file.kind === 'source');
+
+    expect(result.canApply).toBe(true);
+    expect(result.unsupported).toEqual([]);
+    expect(sourceFile?.content).toContain('Mapped SOP');
+    expect(result.pages[0]?.statements.some(statement => statement.role === 'contests')).toBe(true);
+  });
+
+  it('fails closed when a source alias collides with a native page label', () => {
+    const result = reduceNativeMapIR([mapped({
+      aliases: [{
+        alias: 'Mapped Entity',
+        targetPageType: 'source',
+        targetLabel: 'Mapped source',
+        sourcePath: 'notes/mapped.md',
+      }],
+    })], options());
+
+    expect(result.canApply).toBe(false);
+    expect(result.unsupported.some(reason => reason.startsWith('ambiguous-source-alias:'))).toBe(true);
+  });
+
   it('propagates every adapter refusal into the non-applyable plan', () => {
     const cases: Array<{ label: string; ir: NativeMapIR; reason: string }> = [
       {
-        label: 'source claim subject',
-        ir: mapped({ claims: [{ claimId: 'source-claim', subject: { pageType: 'source', label: 'Mapped source' }, predicate: 'source-summary', statement: 'Source claim', disposition: 'proposed', evidenceQuotes: [], sourcePath: 'notes/mapped.md' }] }),
+        label: 'source summary mismatch',
+        ir: mapped({ claims: [{ claimId: 'source-claim', subject: { pageType: 'source', label: 'Mapped source' }, predicate: 'source-summary', statement: 'Different summary', disposition: 'proposed', evidenceQuotes: [], sourcePath: 'notes/mapped.md' }] }),
         reason: 'native-map-claim-source-subject:source-claim',
       },
       {
@@ -226,7 +286,7 @@ describe('native reducer', () => {
       },
       {
         label: 'source alias target',
-        ir: mapped({ aliases: [{ alias: 'Mapped SOP', targetPageType: 'source', targetLabel: 'Mapped source', sourcePath: 'notes/mapped.md' }] }),
+        ir: mapped({ aliases: [{ alias: 'Mapped SOP', targetPageType: 'source', targetLabel: 'Other source', sourcePath: 'notes/mapped.md' }] }),
         reason: 'native-map-alias-target:Mapped SOP',
       },
       {
