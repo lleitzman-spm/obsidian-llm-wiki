@@ -953,51 +953,110 @@ function logPlannerInput(
 ): { readonly plan: ReturnType<typeof planNativeIngestLog>; readonly reasons: readonly string[] } {
   const logPath = assertRelativePath(options.global.paths.log, 'global.log');
   const wikiFolder = pathFolder(logPath, 'log');
-  const createdPages = [...desiredPages, ...sourceFiles].filter(file => file.action === 'create').map(file => file.path);
-  const updatedPages = [...desiredPages, ...sourceFiles].filter(file => file.action === 'replace').map(file => file.path);
-  const sourceTitle = sources.map(source => text(source.sourceTitle) || source.sourceSlug).join(', ');
+  const refusalReasons: { readonly code: string; readonly message: string }[] = [];
+  for (const file of desiredPages) {
+    if (file.action === 'unchanged') continue;
+    if (file.sourceIds.length === 0) {
+      refusalReasons.push({
+        code: 'unattributed-canonical-page',
+        message: `Canonical page ${file.path} has no sourceIds for native ingest-log attribution`,
+      });
+    } else if (file.sourceIds.length > 1) {
+      refusalReasons.push({
+        code: 'ambiguous-shared-page-attribution',
+        message: `Canonical page ${file.path} is shared by sourceIds ${file.sourceIds.join(', ')}; native create-vs-update attribution is not proven`,
+      });
+    }
+  }
+  const sourceFileById = new Map<string, NativeDesiredFile>();
+  for (const file of sourceFiles) {
+    if (file.sourceIds.length === 1 && file.sourceIds[0]) sourceFileById.set(file.sourceIds[0], file);
+  }
   const existingContent = options.global.existing?.get(logPath) ?? options.existingFiles?.get(logPath);
   if (options.time === undefined) {
-    return {
-      plan: Object.freeze({
-        status: 'refused',
-        canApply: false,
-        reasons: [{ code: 'missing-time', message: 'No sealed HH:MM run time was bound for the native log planner' }],
-        path: logPath,
-        action: 'replace',
-        entryKind: 'ingest',
-      }),
-      reasons: ['native-log:missing-time:No sealed HH:MM run time was bound for the native log planner'],
-    };
+    refusalReasons.push({ code: 'missing-time', message: 'No sealed HH:MM run time was bound for the native log planner' });
   }
-  try {
-    const plan = planNativeIngestLog({
-      wikiFolder,
-      wikiLanguage: options.wikiLanguage ?? 'en',
-      existingContent,
-      operation: 'ingest',
-      sourceTitle,
-      createdPages,
-      updatedPages,
-      date: options.date,
-      time: options.time,
+  if (refusalReasons.length > 0) {
+    const plan = Object.freeze({
+      status: 'refused' as const,
+      canApply: false as const,
+      reasons: refusalReasons,
+      path: logPath,
+      action: 'replace' as const,
+      entryKind: 'ingest' as const,
     });
-    const reasons = plannerReason('native-log', plan);
-    if (plan.path !== logPath) reasons.push(`native-log:path-mismatch:expected ${logPath}, received ${plan.path}`);
-    return { plan, reasons };
-  } catch (error) {
     return {
-      plan: Object.freeze({
-        status: 'refused',
-        canApply: false,
-        reasons: [{ code: 'native-planner-exception', message: error instanceof Error ? error.message : String(error) }],
-        path: logPath,
-        action: 'replace',
-        entryKind: 'ingest',
-      }),
-      reasons: [plannerException('native-log', error)],
+      plan,
+      reasons: refusalReasons.map(item => `native-log:${item.code}:${item.message}`),
     };
   }
+  let foldedContent = existingContent;
+  let lastPlan: ReturnType<typeof planNativeIngestLog> | undefined;
+  const reasons: string[] = [];
+  for (const source of sources) {
+    const sourceId = source.sourceId;
+    const sourceFile = sourceFileById.get(sourceId);
+    const attributedPages = desiredPages.filter(file => file.sourceIds.length === 1 && file.sourceIds[0] === sourceId);
+    const createdPages = [
+      ...attributedPages.filter(file => file.action === 'create').map(file => file.path),
+      ...(sourceFile?.action === 'create' && sourceFile.path ? [sourceFile.path] : []),
+    ];
+    const updatedPages = [
+      ...attributedPages.filter(file => file.action === 'replace').map(file => file.path),
+      ...(sourceFile?.action === 'replace' && sourceFile.path ? [sourceFile.path] : []),
+    ];
+    try {
+      const plan = planNativeIngestLog({
+        wikiFolder,
+        wikiLanguage: options.wikiLanguage ?? 'en',
+        existingContent: foldedContent,
+        operation: 'ingest',
+        sourceTitle: text(source.sourceTitle) || source.sourceSlug,
+        createdPages,
+        updatedPages,
+        date: options.date,
+        time: options.time as string,
+      });
+      lastPlan = plan;
+      reasons.push(...plannerReason('native-log', plan));
+      if (plan.path !== logPath) reasons.push(`native-log:path-mismatch:expected ${logPath}, received ${plan.path}`);
+      if (!plan.canApply || plan.content === undefined) {
+        return { plan, reasons };
+      }
+      foldedContent = plan.content;
+    } catch (error) {
+      reasons.push(plannerException('native-log', error));
+      break;
+    }
+  }
+  if (lastPlan && reasons.length === 0) return { plan: lastPlan, reasons };
+  if (lastPlan && reasons.length > 0) {
+    return {
+      plan: Object.freeze({
+        ...lastPlan,
+        status: 'refused' as const,
+        canApply: false as const,
+        content: undefined,
+        reasons: Object.freeze([
+          ...lastPlan.reasons,
+          ...reasons.map(message => ({ code: 'native-reducer-log-refusal', message })),
+        ]),
+      }),
+      reasons,
+    };
+  }
+  const message = 'Native ingest-log planner received no sources';
+  return {
+    plan: Object.freeze({
+      status: 'refused',
+      canApply: false,
+      reasons: [{ code: 'missing-source', message }],
+      path: logPath,
+      action: 'replace',
+      entryKind: 'ingest',
+    }),
+    reasons: [`native-log:missing-source:${message}`],
+  };
 }
 
 function checkAliasCollisions(pages: readonly NativePageCandidate[], reasons: string[]): void {

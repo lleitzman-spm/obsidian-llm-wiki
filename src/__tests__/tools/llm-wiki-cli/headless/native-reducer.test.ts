@@ -81,8 +81,11 @@ describe('native reducer', () => {
 
     expect(a).toEqual(b);
     expect(a.complete).toBe(true);
-    expect(a.status).toBe('candidate');
-    expect(a.canApply).toBe(true);
+    expect(a.status).toBe('requires-native-comparison');
+    expect(a.canApply).toBe(false);
+    expect(a.reasons).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-log:ambiguous-shared-page-attribution'),
+    ]));
     expect(a.pages).toHaveLength(1);
     const page = a.pages[0];
     expect(page?.key.keyString).toBe('entity\u001falice example');
@@ -297,6 +300,64 @@ describe('native reducer', () => {
     expect(result.unsupported).toEqual(expect.arrayContaining([
       expect.stringContaining('native-source-page:missing-source-content'),
       expect.stringContaining('native-log:missing-time'),
+    ]));
+  });
+
+  it('folds one native log entry per source while carrying prior log bytes forward', () => {
+    const reducerOptions = options({
+      global: {
+        paths: { index: 'wiki/index.md', log: 'wiki/log.md', schema: 'wiki/schema.md' },
+        runId: 'fold-run',
+        schemaContent: '# Schema\n',
+        existing: new Map([['wiki/log.md', '# Existing log\n']]),
+      },
+      time: '03:05',
+    });
+    const result = reduceNativeSourceIR([
+      source('source-b', [{ proposalId: 'b-page', sourceId: 'source-b', pageType: 'entity', label: 'B Page' }]),
+      source('source-a', [{ proposalId: 'a-page', sourceId: 'source-a', pageType: 'entity', label: 'A Page' }]),
+    ], reducerOptions);
+    const log = result.desiredState.find(file => file.kind === 'log')?.content ?? '';
+    const aPage = result.pages.find(page => page.label === 'A Page')?.path ?? '';
+    const bPage = result.pages.find(page => page.label === 'B Page')?.path ?? '';
+    const aSource = result.desiredState.find(file => file.kind === 'source' && file.sourceIds.includes('source-a'))?.path ?? '';
+    const bSource = result.desiredState.find(file => file.kind === 'source' && file.sourceIds.includes('source-b'))?.path ?? '';
+    const first = planNativeIngestLog({
+      wikiFolder: 'wiki', wikiLanguage: 'en', existingContent: '# Existing log\n', operation: 'ingest', sourceTitle: 'source-a',
+      createdPages: [aPage, aSource], updatedPages: [], date: '2026-08-20', time: '03:05',
+    });
+    const second = planNativeIngestLog({
+      wikiFolder: 'wiki', wikiLanguage: 'en', existingContent: first.content, operation: 'ingest', sourceTitle: 'source-b',
+      createdPages: [bPage, bSource], updatedPages: [], date: '2026-08-20', time: '03:05',
+    });
+
+    expect(result.canApply).toBe(true);
+    expect(log).toBe(second.content);
+    expect(log.indexOf('ingest | source-a')).toBeLessThan(log.indexOf('ingest | source-b'));
+    expect((log.match(/## \[2026-08-20 03:05\] ingest/gu) ?? []).length).toBe(2);
+    expect(log).toContain(`[[${aPage.replace('wiki/', '')}]]`);
+    expect(log).toContain(`[[${bPage.replace('wiki/', '')}]]`);
+  });
+
+  it('refuses native log attribution for a shared canonical page', () => {
+    const result = reduceNativeSourceIR([
+      source('source-a', [{ proposalId: 'a-page', sourceId: 'source-a', pageType: 'entity', label: 'Shared Page' }]),
+      source('source-b', [{ proposalId: 'b-page', sourceId: 'source-b', pageType: 'entity', label: 'Shared Page' }]),
+    ], options({
+      global: {
+        paths: { index: 'wiki/index.md', log: 'wiki/log.md', schema: 'wiki/schema.md' },
+        runId: 'ambiguous-log-run',
+        schemaContent: '# Schema\n',
+      },
+    }));
+
+    expect(result.canApply).toBe(false);
+    expect(result.status).toBe('requires-native-comparison');
+    expect(result.reasons).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-log:ambiguous-shared-page-attribution'),
+    ]));
+    expect(result.unsupported).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-log:ambiguous-shared-page-attribution'),
     ]));
   });
 
