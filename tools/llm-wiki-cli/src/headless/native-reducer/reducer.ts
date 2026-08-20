@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { computeSlug } from '../../../../../src/core/slug';
 import { canonicalPartitionKey, partitionKeyString } from '../engine/partition';
+import { NativeCompatibilityError, nativeSourceSlug } from '../native-compatibility';
 import type { NativeMapIR } from '../native-map/types';
 import type {
   NativeCanonicalKey,
@@ -70,11 +71,15 @@ function uniqueSorted(values: Iterable<string>): string[] {
   return [...byKey.values()].sort((left, right) => normalizeLabel(left).localeCompare(normalizeLabel(right)) || left.localeCompare(right));
 }
 
-function nativeMapSourceSlug(path: string): string {
-  const basename = path.replace(/\\/gu, '/').split('/').pop() ?? path;
-  const extension = basename.toLowerCase().endsWith('.md') ? basename.slice(0, -3) : basename;
-  const slug = extension.replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/gu, '').toLowerCase();
-  return slug || 'source';
+function nativeMapSourceSlug(path: string, preserveCase = false): string {
+  try {
+    return nativeSourceSlug(path, { preserveCase });
+  } catch (error) {
+    const detail = error instanceof NativeCompatibilityError
+      ? error.message
+      : error instanceof Error ? error.message : String(error);
+    throw new NativeReductionError(`native source slug refused for ${JSON.stringify(path)}: ${detail}`);
+  }
 }
 
 function compareIds(left: { readonly sourceId?: string; readonly evidenceId?: string; readonly statementId?: string }, right: typeof left): number {
@@ -390,6 +395,7 @@ function mapMentionEvidence(
   source: NativeMapIR,
   mention: { readonly quote: string; readonly source_path: string; readonly source_slug: string },
   ordinal: number,
+  preserveCase = false,
 ): NativeEvidence {
   const quote = text(mention.quote);
   const sourcePath = assertSourceReference(mention.source_path || source.source.sourcePath, 'native-map mention.source_path');
@@ -398,7 +404,10 @@ function mapMentionEvidence(
     role: 'supports',
     quote,
     sourcePath,
-    sourceSlug: text(mention.source_slug) || nativeMapSourceSlug(source.source.sourcePath),
+    // The provider-supplied slug is not an identity field.  Native derives
+    // this from the normalized source path so duplicate basenames remain
+    // distinct and every source link points at the same page.
+    sourceSlug: nativeMapSourceSlug(sourcePath, preserveCase),
     sourceId: source.source.sourceId,
   };
 }
@@ -408,12 +417,15 @@ function mapMentionEvidence(
  * adapter keeps claims, contested claims, aliases, and related proposals
  * typed; it never collapses them into an untyped string bag.
  */
-export function nativeMapIRToSourceScopedIR(source: NativeMapIR): NativeSourceScopedIR {
+export function nativeMapIRToSourceScopedIR(
+  source: NativeMapIR,
+  slugCase: 'lower' | 'preserve' = 'lower',
+): NativeSourceScopedIR {
   const unsupported: string[] = [];
   const sourceId = text(source.source.sourceId);
   if (!sourceId) throw new NativeReductionError('native-map IR source id is empty');
   const sourcePath = assertSourceReference(source.source.sourcePath, 'native-map source.sourcePath');
-  const sourceSlug = nativeMapSourceSlug(sourcePath);
+  const sourceSlug = nativeMapSourceSlug(sourcePath, slugCase === 'preserve');
   const extras = new Map<string, ProposalExtras>();
   const getExtras = (pageType: NativePageType, label: string): ProposalExtras => {
     const key = partitionKeyString(canonicalPartitionKey(pageType, label));
@@ -433,7 +445,7 @@ export function nativeMapIRToSourceScopedIR(source: NativeMapIR): NativeSourceSc
   ): void => {
     const key = partitionKeyString(canonicalPartitionKey(pageType, item.name));
     const extra = getExtras(pageType, item.name);
-    const evidence = item.mentions_with_provenance.map((mention, index) => mapMentionEvidence(source, mention, ordinal * 1000 + index));
+    const evidence = item.mentions_with_provenance.map((mention, index) => mapMentionEvidence(source, mention, ordinal * 1000 + index, slugCase === 'preserve'));
     extra.evidence.push(...evidence);
     const mentions = evidence.map((itemEvidence, index) => ({
       statementId: `mention-statement:${sha256(`${itemEvidence.evidenceId}\u0000${index}`)}`,
@@ -824,11 +836,16 @@ export function reduceNativeSourceIR(
   const sourceIds = new Set<string>();
   const sourcePaths = new Map<string, string>();
   const sources = [...input].sort((left, right) => left.sourceId.localeCompare(right.sourceId));
+  const preserveSourceCase = options.slugCase === 'preserve';
   for (const source of sources) {
     if (!text(source.sourceId) || sourceIds.has(source.sourceId)) throw new NativeReductionError(`duplicate or empty source id: ${source.sourceId}`);
     sourceIds.add(source.sourceId);
     if (!text(source.sourcePath) || !text(source.sourceSlug)) throw new NativeReductionError(`source ${source.sourceId} lacks source path or slug`);
     const normalizedSourcePath = assertSourceReference(source.sourcePath, `source ${source.sourceId}.sourcePath`);
+    const expectedSourceSlug = nativeMapSourceSlug(normalizedSourcePath, preserveSourceCase);
+    if (text(source.sourceSlug) !== expectedSourceSlug) {
+      throw new NativeReductionError(`source ${source.sourceId} source slug does not match native path fingerprint: expected ${expectedSourceSlug}, received ${JSON.stringify(source.sourceSlug)}`);
+    }
     const sourcePathKey = pathCollisionKey(normalizedSourcePath);
     const priorSourceId = sourcePaths.get(sourcePathKey);
     if (priorSourceId && priorSourceId !== source.sourceId) {
@@ -986,5 +1003,5 @@ export function reduceNativeMapIR(
   options: NativeReducerOptions,
 ): NativeReductionPlan {
   if (!Array.isArray(input) || input.length === 0) throw new NativeReductionError('at least one native-map IR record is required');
-  return reduceNativeSourceIR(input.map(nativeMapIRToSourceScopedIR), options);
+  return reduceNativeSourceIR(input.map(source => nativeMapIRToSourceScopedIR(source, options.slugCase)), options);
 }

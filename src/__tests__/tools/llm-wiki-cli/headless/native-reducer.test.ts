@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { nativeSourceSlug } from '../../../../../tools/llm-wiki-cli/src/headless/native-compatibility';
 import {
   NativeReductionError,
   reduceNativeMapIR,
@@ -24,7 +25,7 @@ const options = (overrides: Partial<NativeReducerOptions> = {}): NativeReducerOp
 const source = (sourceId: string, proposals: NativeSourceScopedIR['proposals'], extra: Partial<NativeSourceScopedIR> = {}): NativeSourceScopedIR => ({
   sourceId,
   sourcePath: `notes/${sourceId}.md`,
-  sourceSlug: `${sourceId}-slug`,
+  sourceSlug: nativeSourceSlug(`notes/${sourceId}.md`),
   sourceTitle: sourceId,
   proposals,
   ...extra,
@@ -79,8 +80,8 @@ describe('native reducer', () => {
     expect(page?.path).toBe('wiki/entities/alice-example.md');
     expect(page?.sourceIds).toEqual(['s-a', 's-b']);
     expect(page?.aliases).toEqual(['A. Example', 'Alice E.']);
-    expect(page?.content).toContain('sources/s-a-slug');
-    expect(page?.content).toContain('sources/s-b-slug');
+    expect(page?.content).toContain(`sources/${nativeSourceSlug('notes/s-a.md')}`);
+    expect(page?.content).toContain(`sources/${nativeSourceSlug('notes/s-b.md')}`);
     expect(page?.content).toContain('## Qualifications');
     expect(page?.content).toContain('## Evidence');
     expect(page?.content).toContain('### Qualifies');
@@ -155,7 +156,45 @@ describe('native reducer', () => {
     expect(result.globalPhase.serializationOrder).toEqual(result.globalPhase.files.map(file => file.path));
     expect(result.desiredState.map(file => file.path)).toContain('20 Brain/schema.md');
     expect(result.desiredState.find(file => file.path === '20 Brain/log.md')?.content).toContain('run-native-test');
-    expect(result.desiredState.find(file => file.path === 'wiki/sources/s-one-slug.md')?.phase).toBe('serialized-global');
+    expect(result.desiredState.find(file => file.path === `wiki/sources/${nativeSourceSlug('notes/s-one.md')}.md`)?.phase).toBe('serialized-global');
+  });
+
+  it('fingerprints duplicate-basename source paths for every source link', () => {
+    const firstPath = 'raw/Course X/About this course.md';
+    const secondPath = 'raw/Course Y/About this course.md';
+    const firstSlug = nativeSourceSlug(firstPath);
+    const secondSlug = nativeSourceSlug(secondPath);
+    const proposal = (sourceId: string) => ({
+      proposalId: `${sourceId}-proposal`, sourceId, pageType: 'entity' as const, label: 'Shared entity',
+    });
+    const result = reduceNativeSourceIR([
+      source('course-x', [proposal('course-x')], { sourcePath: firstPath, sourceSlug: firstSlug }),
+      source('course-y', [proposal('course-y')], { sourcePath: secondPath, sourceSlug: secondSlug }),
+    ], options());
+
+    expect(firstSlug).not.toBe(secondSlug);
+    expect(result.desiredState.map(file => file.path)).toEqual(expect.arrayContaining([
+      `wiki/sources/${firstSlug}.md`,
+      `wiki/sources/${secondSlug}.md`,
+    ]));
+    const page = result.pages[0];
+    expect(page?.sourceLinks).toEqual([
+      `[[sources/${firstSlug}]]`,
+      `[[sources/${secondSlug}]]`,
+    ].sort());
+    expect(page?.content).toContain(`[[sources/${firstSlug}]]`);
+    expect(page?.content).toContain(`[[sources/${secondSlug}]]`);
+    expect(page?.content).not.toContain('[[sources/about-this-course]]');
+  });
+
+  it('refuses a stale basename-only source slug instead of falling back', () => {
+    const sourcePath = 'raw/Course X/About this course.md';
+    expect(() => reduceNativeSourceIR([
+      source('stale', [{ proposalId: 'stale-proposal', sourceId: 'stale', pageType: 'entity', label: 'Stale' }], {
+        sourcePath,
+        sourceSlug: 'about-this-course',
+      }),
+    ], options())).toThrow(/source slug does not match native path fingerprint/u);
   });
 
   it('fails closed for provider-owned unsupported frontmatter instead of applying it', () => {
@@ -295,8 +334,8 @@ describe('native reducer', () => {
     expect(existingKindCollision.reasons).toContain('existing-page-type-mismatch:wiki/entities/existing.md');
 
     expect(() => reduceNativeSourceIR([
-      source('s-path-a', [{ proposalId: 'path-a', sourceId: 's-path-a', pageType: 'entity', label: 'Path A' }], { sourcePath: 'notes/shared.md' }),
-      source('s-path-b', [{ proposalId: 'path-b', sourceId: 's-path-b', pageType: 'entity', label: 'Path B' }], { sourcePath: 'notes/SHARED.md' }),
+      source('s-path-a', [{ proposalId: 'path-a', sourceId: 's-path-a', pageType: 'entity', label: 'Path A' }], { sourcePath: 'notes/shared.md', sourceSlug: nativeSourceSlug('notes/shared.md') }),
+      source('s-path-b', [{ proposalId: 'path-b', sourceId: 's-path-b', pageType: 'entity', label: 'Path B' }], { sourcePath: 'notes/SHARED.md', sourceSlug: nativeSourceSlug('notes/SHARED.md') }),
     ], options())).toThrow(/duplicate source path/u);
   });
 
