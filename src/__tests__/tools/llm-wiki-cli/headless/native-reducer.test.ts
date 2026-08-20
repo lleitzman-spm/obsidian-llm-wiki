@@ -340,6 +340,23 @@ describe('native reducer', () => {
     expect(result.unsupported).toEqual(expect.arrayContaining(['native-map-custom-refusal:provider-output', 'native-map-another-refusal']));
   });
 
+  it('refuses a native-map result degraded by a later provider batch failure', () => {
+    const result = reduceNativeMapIR([mapped({
+      degradations: [{
+        status: 'degraded',
+        code: 'later-batch-provider-failure',
+        failedBatch: 2,
+        preservedBatchCount: 1,
+      }],
+    })], options());
+
+    expect(result.canApply).toBe(false);
+    expect(result.status).toBe('requires-native-comparison');
+    expect(result.reasons).toContain('native-map-degradation:later-batch-provider-failure');
+    expect(result.unsupported).toContain('native-map-degradation:later-batch-provider-failure');
+    expect(result.unsupported.join('\n')).not.toContain('provider unavailable');
+  });
+
   it('consumes native-map/v1 IR while retaining contested claims and provenance', () => {
     const mapped: NativeMapIR = {
       contractVersion: 'native-map/v1',

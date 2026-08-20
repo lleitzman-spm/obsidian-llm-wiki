@@ -428,6 +428,14 @@ export function nativeMapIRToSourceScopedIR(
   const sourceSlug = nativeMapSourceSlug(sourcePath, slugCase === 'preserve');
   const sourceTitle = text(source.sourceTitle) || sourceSlug;
   const sourceSummary = text(source.summary);
+  // A later extraction failure preserves earlier proposals, but it is not a
+  // complete map.  Carry the typed adapter signal into the reducer's existing
+  // refusal surface without copying provider error text or source evidence.
+  for (const degradation of source.degradations ?? []) {
+    unsupported.push(degradation.code === 'later-batch-provider-failure'
+      ? 'native-map-degradation:later-batch-provider-failure'
+      : 'native-map-degradation:unknown');
+  }
   let sourceAliases = uniqueSorted(source.sourceAliases ?? []);
   const extras = new Map<string, ProposalExtras>();
   const getExtras = (pageType: NativePageType, label: string): ProposalExtras => {

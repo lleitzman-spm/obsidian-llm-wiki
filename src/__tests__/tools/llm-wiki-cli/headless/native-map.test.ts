@@ -263,6 +263,54 @@ describe('native source map seam', () => {
     expect(calls.filter(call => call.task === 'extract')).toHaveLength(3);
   });
 
+  it('fails closed when the first extraction batch provider call fails', async () => {
+    const client: NativeMapClient = {
+      createMessage: vi.fn(async () => {
+        throw new Error('provider unavailable');
+      }),
+    };
+
+    await expect(mapNativeSource({
+      source: { sourceId: 'first-batch-failure', sourcePath: 'notes/lease.md', sourceBytes: new TextEncoder().encode(sourceText) },
+      policy: policy({ extractionGranularity: 'standard' }),
+      client,
+      maxBatches: 1,
+    })).rejects.toMatchObject({ name: 'NativeMapProtocolError', code: 'invalid-response' });
+  });
+
+  it('preserves prior extraction and records a typed degradation on a later provider failure', async () => {
+    const firstBatch = JSON.stringify({
+      source_title: 'Lease workflow',
+      summary: 'The source describes a lease workflow.',
+      entities: [{ name: 'lease', type: 'owner', summary: 'The lease workflow.', mentions_in_source: [] }],
+      concepts: [],
+    });
+    let calls = 0;
+    const client: NativeMapClient = {
+      createMessage: vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) return firstBatch;
+        throw new Error('provider unavailable');
+      }),
+    };
+
+    const result = await mapNativeSource({
+      source: { sourceId: 'later-batch-failure', sourcePath: 'notes/lease.md', sourceBytes: new TextEncoder().encode(sourceText) },
+      policy: policy({ extractionGranularity: 'standard' }),
+      client,
+      maxBatches: 2,
+    });
+
+    expect(result.entities.map(item => item.name)).toEqual(['lease']);
+    expect(result.degradations).toEqual([{
+      status: 'degraded',
+      code: 'later-batch-provider-failure',
+      failedBatch: 2,
+      preservedBatchCount: 1,
+    }]);
+    expect(result.degradations?.[0]).not.toHaveProperty('quote');
+  });
+
   it('replaces LLM related_pages with deterministic catalog matches when a catalog is supplied', async () => {
     const existingPages: readonly NativeMapExistingPage[] = [
       { title: 'Lease Control', aliases: ['control procedure'] },

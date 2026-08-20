@@ -13,6 +13,7 @@ export type {
   NativeMapArtifact,
   NativeMapArtifactKind,
   NativeMapClient,
+  NativeMapDegradation,
   NativeMapExistingPage,
   NativeMapInput,
   NativeMapIR,

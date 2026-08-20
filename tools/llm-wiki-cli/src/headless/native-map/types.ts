@@ -167,6 +167,19 @@ export interface NativeMapArtifact {
   readonly data: Readonly<Record<string, unknown>>;
 }
 
+/**
+ * A typed, source-neutral record that extraction stopped after preserving
+ * earlier rounds.  It intentionally carries no provider error text or model
+ * evidence: the map remains source-scoped without implying that later rounds
+ * completed successfully.
+ */
+export interface NativeMapDegradation {
+  readonly status: 'degraded';
+  readonly code: 'later-batch-provider-failure';
+  readonly failedBatch: number;
+  readonly preservedBatchCount: number;
+}
+
 export interface NativeMapIR {
   readonly contractVersion: typeof NATIVE_MAP_CONTRACT_VERSION;
   readonly source: {
@@ -187,6 +200,8 @@ export interface NativeMapIR {
   readonly related: readonly NativeRelatedProposal[];
   readonly contradictions: readonly NativeContradictionProposal[];
   readonly artifacts: readonly NativeMapArtifact[];
+  /** Present only when a later extraction batch stopped after prior success. */
+  readonly degradations?: readonly NativeMapDegradation[];
   readonly policySha256: string;
   readonly irSha256: string;
 }

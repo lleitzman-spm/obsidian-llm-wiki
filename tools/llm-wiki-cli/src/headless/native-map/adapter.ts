@@ -35,6 +35,7 @@ import {
   type NativeMapArtifact,
   type NativeMapArtifactKind,
   type NativeMapClient,
+  type NativeMapDegradation,
   type NativeMapExistingPage,
   type NativeMapInput,
   type NativeMapIR,
@@ -911,6 +912,7 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
   let contradictions: NativeContradictionProposal[] = [];
   let relatedPages: string[] = [];
   let keyPoints: string[] = [];
+  let degradations: NativeMapDegradation[] = [];
   const baseMaxTokens = Math.max(MAX_TOKENS_BATCH, limits.initialBatchSize * TOKENS_PER_ITEM_BUDGET);
   const retryCap = baseMaxTokens * SOURCE_ANALYZER_RETRY_MULTIPLIER;
   for (let batch = 0; batch < configuredMaxBatches; batch += 1) {
@@ -927,21 +929,41 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
       },
     );
     const maxTokens = Math.max(MAX_TOKENS_BATCH, currentBatchSize * TOKENS_PER_ITEM_BUDGET);
-    const response = await callProvider(input.client, asProviderParams(policy, prompt, maxTokens));
+    let response: Awaited<ReturnType<typeof callProvider>>;
+    try {
+      response = await callProvider(input.client, asProviderParams(policy, prompt, maxTokens));
+    } catch {
+      if (first) {
+        throw new NativeMapProtocolError('invalid-response', `Native extraction batch ${batch + 1} provider call failed`);
+      }
+      degradations = [freeze({
+        status: 'degraded' as const,
+        code: 'later-batch-provider-failure' as const,
+        failedBatch: batch + 1,
+        preservedBatchCount: batch,
+      })];
+      break;
+    }
     const canHalve = !retriedAtSize && currentBatchSize > limits.minBatchSize;
     // Keep parity with SourceAnalyzer: a length-truncated response is first
     // given a bounded halve-and-retry opportunity. Once that opportunity is
     // spent (or for a normal malformed response), JSON repair is the final
     // salvage path and may only rewrite syntax, never source values.
+    let repairProviderFailed = false;
     const repairFn = response.finishReason === 'length' && canHalve
       ? undefined
       : async (malformedJson: string): Promise<string> => {
         const repairPrompt = `Fix the following malformed JSON. Only fix JSON syntax errors (unescaped quotes, trailing commas, missing brackets). Do NOT change any values or content. Output ONLY the fixed JSON, no other text.\n\n${malformedJson}`;
-        const repaired = await callProvider(
-          input.client,
-          asProviderParams(policy, repairPrompt, retryCap, 'extract-retry', false, retryCap),
-        );
-        return repaired.text;
+        try {
+          const repaired = await callProvider(
+            input.client,
+            asProviderParams(policy, repairPrompt, retryCap, 'extract-retry', false, retryCap),
+          );
+          return repaired.text;
+        } catch (error) {
+          repairProviderFailed = true;
+          throw error;
+        }
       };
     const parsed = await parseJsonResult(response.text, repairFn, { expectedSchemaFields: ['entities', 'concepts'] });
     const parseReason = parsed.ok ? undefined : ('reason' in parsed ? parsed.reason : 'unknown');
@@ -959,6 +981,14 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
       }
       if (first) {
         throw new NativeMapProtocolError('invalid-response', `Native extraction batch ${batch + 1} could not be parsed (${parseReason})`);
+      }
+      if (repairProviderFailed) {
+        degradations = [freeze({
+          status: 'degraded' as const,
+          code: 'later-batch-provider-failure' as const,
+          failedBatch: batch + 1,
+          preservedBatchCount: batch,
+        })];
       }
       break;
     }
@@ -1081,6 +1111,7 @@ export async function mapNativeSource(input: NativeMapInput): Promise<NativeMapI
     source: { sourceId: source.sourceId, sourcePath: checked.path, byteSha256: checked.byteSha256, byteCount: source.sourceBytes.byteLength },
     sourceTitle, summary, sourceAliases: sourceMeta.aliases, keyPoints,
     entities, concepts, mentions, claims, aliases, related, contradictions, artifacts,
+    ...(degradations.length > 0 ? { degradations } : {}),
     policySha256: policy.policySha256,
   };
   const irSha256 = canonicalJsonSha256(body);
