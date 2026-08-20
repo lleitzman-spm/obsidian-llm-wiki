@@ -60,6 +60,7 @@ jobs:
           set -e
           pnpm lint
           pnpm typecheck
+          pnpm typecheck:tools
           pnpm build
           pnpm test
           pnpm css-lint

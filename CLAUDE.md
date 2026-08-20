@@ -10,7 +10,7 @@
 
 | Gate | Constraint | How |
 |------|-----------|-----|
-| **1. Code correct** | `pnpm lint` 0/0 + `npx tsc --noEmit` 0/0 + `pnpm build` clean + `pnpm test` all pass + `pnpm css-lint` 0 | Five-Gate script (build BEFORE test — see §"Gate 1: Five-Gate automated") |
+| **1. Code correct** | plugin and CLI typechecks + `pnpm lint` 0/0 + `pnpm build` clean + `pnpm test` all pass + `pnpm css-lint` 0 | Five-Gate script (build BEFORE test — see §"Gate 1: Five-Gate automated") |
 | **2. No side effects** | Call-site audit + data flow + state mutation + error propagation | Structured review |
 | **3. No breaking changes** | API/Schema/File format/Default behavior/Command IDs/Obsidian API | Breaking-change matrix |
 | **4. No performance regression** | CPU/memory/IO/network/token — 5-dim written assessment | simplify + code-review + Gate 4 table |
@@ -20,7 +20,7 @@
 ### Gate 1: Five-Gate automated
 
 ```bash
-pnpm lint && npx tsc --noEmit && pnpm build && pnpm test && pnpm css-lint
+pnpm lint && pnpm typecheck && pnpm typecheck:tools && pnpm build && pnpm test && pnpm css-lint
 ```
 
 All five must pass. ESLint checks style, TypeScript checks types, css-lint checks Obsidian review compliance — three complementary checks, single tool passing is insufficient. No `@ts-ignore` / `eslint-disable` to silence failures.

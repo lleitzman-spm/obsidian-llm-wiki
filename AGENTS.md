@@ -78,7 +78,7 @@ Every change must pass all six gates before being considered complete. Gates 1-4
 
 | Gate | Constraint | How | Who |
 |------|-----------|-----|-----|
-| **1. Code correct** | `pnpm lint` 0/0 + `npx tsc --noEmit` 0/0 + `pnpm build` clean + `pnpm test` all pass + `pnpm css-lint` 0 | 5-Gate script | Developer |
+| **1. Code correct** | plugin and CLI typechecks + `pnpm lint` 0/0 + `pnpm build` clean + `pnpm test` all pass + `pnpm css-lint` 0 | 5-Gate script | Developer |
 | **2. No side effects** | Call-site audit + data flow trace + state mutation check + error propagation check | Structured review | Developer |
 | **3. No breaking changes** | API/Schema/File format/Default behavior/Command IDs/Obsidian API all backward-compatible | Breaking-change matrix | Developer |
 | **4. No performance regression** | CPU/memory/IO/network/token usage — 5-dim walkthrough, written assessment table | simplify + code-review + Gate 4 table | Developer |
@@ -92,6 +92,7 @@ Must all pass sequentially. If any fails, fix root cause (no `@ts-ignore` or `es
 ```bash
 pnpm lint           # ESLint + Obsidian rules: 0 errors, 0 warnings
 npx tsc --noEmit    # TypeScript: 0 errors (ESLint does NOT check type safety)
+pnpm typecheck:tools # Headless CLI TypeScript: 0 errors
 pnpm build          # esbuild: clean exit
 pnpm test           # Vitest: all pass, 0 failures
 pnpm css-lint       # CSS: 0 !important declarations in styles.css
@@ -102,6 +103,7 @@ pnpm css-lint       # CSS: 0 !important declarations in styles.css
 ```bash
 pnpm lint           # Gate 1: ESLint - 0 errors, 0 warnings
 npx tsc --noEmit    # Gate 1: TypeScript - 0 errors, 0 warnings
+pnpm typecheck:tools # Gate 1: Headless CLI TypeScript - 0 errors
 pnpm build          # Gate 1: Build - clean exit
 pnpm test           # Gate 1: Tests - all pass, 0 failures
 pnpm css-lint       # Gate 1: CSS - 0 !important declarations
