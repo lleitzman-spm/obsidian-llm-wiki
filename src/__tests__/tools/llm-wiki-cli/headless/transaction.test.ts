@@ -218,6 +218,65 @@ describe('transaction WAL writer', () => {
     expect(log.freezes).toEqual([10]);
   });
 
+  it('freezes instead of overwriting an edit after rollback read but before restore mutation', async () => {
+    const root = await tempRoot();
+    const beforeBytes = new TextEncoder().encode('before');
+    const afterBytes = new TextEncoder().encode('after');
+    const foreignBytes = new TextEncoder().encode('foreign-edit');
+    const store = new Map<string, Uint8Array>([['note.md', new Uint8Array(beforeBytes)]]);
+    const plan = createTransactionPlan({
+      fence: 18,
+      transactionId: 'tx-foreign-after-restore-read',
+      current: [{ path: 'note.md', bytes: beforeBytes }],
+      desired: [{ path: 'note.md', bytes: afterBytes }],
+    });
+    let injectAfterRestoreRead = false;
+    const fileSystem = {
+      read: async (path: string) => {
+        const current = store.get(path) ?? null;
+        if (injectAfterRestoreRead) {
+          injectAfterRestoreRead = false;
+          if (current === null) throw new Error(`Missing test state for ${path}`);
+          store.set(path, new Uint8Array(foreignBytes));
+        }
+        return current === null ? null : new Uint8Array(current);
+      },
+      write: async (path: string, value: Uint8Array, expectedHash?: string | null) => {
+        const current = store.get(path) ?? null;
+        const actualHash = current === null ? null : hashBytes(current);
+        if (expectedHash !== undefined && actualHash !== expectedHash) {
+          throw new StalePreconditionError(path, expectedHash, actualHash);
+        }
+        store.set(path, new Uint8Array(value));
+      },
+      remove: async (path: string, expectedHash?: string | null) => {
+        const current = store.get(path) ?? null;
+        const actualHash = current === null ? null : hashBytes(current);
+        if (expectedHash !== undefined && actualHash !== expectedHash) {
+          throw new StalePreconditionError(path, expectedHash, actualHash);
+        }
+        store.delete(path);
+      },
+    };
+    const log = { assert: [] as FenceToken[], starts: [] as FenceToken[], completes: [] as FenceToken[], freezes: [] as FenceToken[] };
+    const engine = new TransactionEngine({
+      rootDir: root,
+      lease: leaseFor(log),
+      fileSystem,
+      readback: () => {
+        // The next read is restoreOperation's CAS read. Mutate only after
+        // that read has captured the post-apply bytes.
+        injectAfterRestoreRead = true;
+        return false;
+      },
+    });
+
+    await expect(engine.apply(plan)).rejects.toBeInstanceOf(RestoreFailureError);
+    expect(new TextDecoder().decode(store.get('note.md'))).toBe('foreign-edit');
+    expect(log.freezes).toEqual([18]);
+    expect((await engine.journal.read()).map((event) => event.kind)).toContain('frozen');
+  });
+
   it('leaves an interrupted transaction pending and restores it from the WAL', async () => {
     const root = await tempRoot();
     await writeFile(nodePath.join(root, 'a.md'), 'a-old');

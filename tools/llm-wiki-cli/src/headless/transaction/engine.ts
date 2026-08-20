@@ -246,9 +246,13 @@ export class TransactionEngine {
       }
       if (operation.before.exists) {
         if (operation.before.bytes === null) throw new Error(`Missing restoration bytes for ${operation.path}`);
-        await this.fileSystem.write(operation.path, operation.before.bytes);
+        // Retain the post-apply state as an inner rollback CAS. The read above
+        // proves that we are still looking at our own post-state, but a
+        // foreign writer can edit the path before this mutation call starts.
+        // The rooted filesystem must reject that edit rather than overwrite it.
+        await this.fileSystem.write(operation.path, operation.before.bytes, operation.after.hash);
       } else {
-        await this.fileSystem.remove(operation.path);
+        await this.fileSystem.remove(operation.path, operation.after.hash);
       }
       await this.options.faults?.afterRestore?.(this.context(plan, operation, operationIndex));
       return 'restored';
