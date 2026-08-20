@@ -12,6 +12,8 @@ export type NativeEvidenceRole = 'supports' | 'qualifies' | 'contests';
 export type NativeReductionStatus = 'candidate' | 'requires-native-comparison';
 export type NativePageKind = NativePageType | 'source' | 'index' | 'log' | 'schema';
 export type NativeDesiredAction = 'create' | 'replace' | 'unchanged';
+export type NativeMergePlannerAction = 'replace' | 'unchanged';
+export type NativeMergeLogAction = 'created' | 'updated';
 
 export interface NativeByteRange {
   readonly start: number;
@@ -162,7 +164,32 @@ export interface NativePageCandidate {
   readonly reviewed: boolean;
   readonly bodyPolicy: 'generated' | 'preserve-reviewed' | 'append-reviewed' | 'preserve-existing';
   readonly content: string;
+  /**
+   * Sealed native frontmatter-only merge trace.  It is present only when the
+   * reducer proved every existing-page step and can therefore attribute the
+   * page to individual native ingest-log entries.
+   */
+  readonly nativeMergeTrace?: NativeMergeSequenceTrace;
   readonly comparisonReasons: readonly string[];
+}
+
+export interface NativeMergeStepTrace {
+  readonly sourceId: string;
+  readonly sourcePath: string;
+  readonly sourceSlug: string;
+  readonly path: string;
+  /** Exact deterministic planner action for this step. */
+  readonly plannerAction: NativeMergePlannerAction;
+  /** Exact native PageCreationResult classification for this existing page. */
+  readonly logAction: NativeMergeLogAction;
+  readonly currentContent: string;
+  readonly content: string;
+}
+
+export interface NativeMergeSequenceTrace {
+  readonly originalContent: string;
+  readonly finalContent: string;
+  readonly steps: readonly NativeMergeStepTrace[];
 }
 
 export interface NativeDesiredFile {

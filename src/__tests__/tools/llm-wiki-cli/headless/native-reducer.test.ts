@@ -249,7 +249,16 @@ describe('native reducer', () => {
     };
     const sourceA = source('shared-a', [{ proposalId: 'shared-a-proposal', sourceId: 'shared-a', pageType: 'entity', label: 'Shared Existing' }]);
     const sourceB = source('shared-b', [{ proposalId: 'shared-b-proposal', sourceId: 'shared-b', pageType: 'entity', label: 'Shared Existing' }]);
-    const reducerOptions = options({ existingPages: [existing] });
+    const reducerOptions = options({
+      existingPages: [existing],
+      global: {
+        paths: { index: 'wiki/index.md', log: 'wiki/log.md', schema: 'wiki/schema.md' },
+        runId: 'shared-merge-log-run',
+        schemaContent: '# Schema\n',
+        existing: new Map([['wiki/log.md', '# Existing log\n']]),
+      },
+      time: '03:06',
+    });
     const result = reduceNativeSourceIR([sourceB, sourceA], reducerOptions);
     const reversed = reduceNativeSourceIR([sourceA, sourceB], reducerOptions);
     const first = planNativeMerge({
@@ -272,15 +281,62 @@ describe('native reducer', () => {
       date: '2026-08-20',
       mode: 'frontmatter-only',
     });
+    const aSourcePath = result.desiredState.find(file => file.kind === 'source' && file.sourceIds.includes('shared-a'))?.path;
+    const bSourcePath = result.desiredState.find(file => file.kind === 'source' && file.sourceIds.includes('shared-b'))?.path;
+    const firstLog = planNativeIngestLog({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      existingContent: '# Existing log\n',
+      operation: 'ingest',
+      sourceTitle: 'shared-a',
+      createdPages: aSourcePath ? [aSourcePath] : [],
+      updatedPages: [existing.path],
+      date: '2026-08-20',
+      time: '03:06',
+    });
+    const secondLog = planNativeIngestLog({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      existingContent: firstLog.content,
+      operation: 'ingest',
+      sourceTitle: 'shared-b',
+      createdPages: bSourcePath ? [bSourcePath] : [],
+      updatedPages: [existing.path],
+      date: '2026-08-20',
+      time: '03:06',
+    });
 
     expect(first.canApply).toBe(true);
     expect(second.canApply).toBe(true);
     expect(result.pages[0]?.content).toBe(second.content);
     expect(result.pages[0]?.comparisonReasons).toEqual([]);
+    expect(result.pages[0]?.nativeMergeTrace?.steps.map(step => step.sourceId)).toEqual(['shared-a', 'shared-b']);
+    expect(result.pages[0]?.nativeMergeTrace?.steps.map(step => step.logAction)).toEqual(['updated', 'updated']);
+    expect(result.pages[0]?.nativeMergeTrace?.steps.map(step => step.plannerAction)).toEqual(['replace', 'replace']);
+    expect(result.desiredState.find(file => file.kind === 'log')?.content).toBe(secondLog.content);
+    expect(result.reasons).toEqual([]);
+    expect(result.canApply).toBe(true);
+    expect(result.desiredState.find(file => file.kind === 'log')?.content?.indexOf('ingest | shared-a')).toBeLessThan(
+      result.desiredState.find(file => file.kind === 'log')?.content?.indexOf('ingest | shared-b') ?? -1,
+    );
     expect(reversed).toEqual(result);
-    // The serialized log still refuses unattributed shared-page effects; the
-    // page merge sequence itself is fully proven and has no partial output.
+  });
+
+  it('refuses a new shared generated page without an existing-page merge trace', () => {
+    const result = reduceNativeSourceIR([
+      source('new-shared-a', [{ proposalId: 'new-shared-a-proposal', sourceId: 'new-shared-a', pageType: 'entity', label: 'New Shared' }]),
+      source('new-shared-b', [{ proposalId: 'new-shared-b-proposal', sourceId: 'new-shared-b', pageType: 'entity', label: 'New Shared' }]),
+    ], options({
+      global: {
+        paths: { index: 'wiki/index.md', log: 'wiki/log.md', schema: 'wiki/schema.md' },
+        runId: 'new-shared-run',
+        schemaContent: '# Schema\n',
+      },
+      generatedPageContents: new Map([['entity\u001fnew shared', '# New Shared\n']]),
+    }));
+
     expect(result.canApply).toBe(false);
+    expect(result.pages[0]?.nativeMergeTrace).toBeUndefined();
     expect(result.reasons).toEqual(expect.arrayContaining([
       expect.stringContaining('native-log:ambiguous-shared-page-attribution'),
     ]));
@@ -319,6 +375,45 @@ describe('native reducer', () => {
     expect(calls).toBe(2);
     expect(result.pages[0]?.content).toBe(existing.content);
     expect(result.reasons).toContain('native-merge:sequence-refused:rollback-b:native-llm-seam-required:test refusal');
+    expect(result.canApply).toBe(false);
+  });
+
+  it('does not accept a forged current-content binding as a log trace', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/forged-target.md',
+      pageType: 'entity',
+      label: 'Forged Target',
+      content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Forged Target\n',
+    };
+    const sourceA = source('forged-a', [{ proposalId: 'forged-a-proposal', sourceId: 'forged-a', pageType: 'entity', label: 'Forged Target' }]);
+    const sourceB = source('forged-b', [{ proposalId: 'forged-b-proposal', sourceId: 'forged-b', pageType: 'entity', label: 'Forged Target' }]);
+    const realPlan = nativeCompatibility.planNativeMerge;
+    let calls = 0;
+    const spy = vi.spyOn(nativeCompatibility, 'planNativeMerge').mockImplementation(input => {
+      calls += 1;
+      const plan = realPlan(input);
+      if (calls !== 2) return plan;
+      return Object.freeze({
+        ...plan,
+        status: 'ready' as const,
+        canApply: true as const,
+        currentContent: 'forged prior bytes',
+      });
+    });
+    let result: ReturnType<typeof reduceNativeSourceIR>;
+    try {
+      result = reduceNativeSourceIR([sourceB, sourceA], options({ existingPages: [existing] }));
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(calls).toBe(2);
+    expect(result.pages[0]?.content).toBe(existing.content);
+    expect(result.pages[0]?.nativeMergeTrace).toBeUndefined();
+    expect(result.reasons).toContain('native-merge:sequence-current-content-mismatch:forged-b');
+    expect(result.reasons).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-log:ambiguous-shared-page-attribution'),
+    ]));
     expect(result.canApply).toBe(false);
   });
 

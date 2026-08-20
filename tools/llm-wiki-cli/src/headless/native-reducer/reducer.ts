@@ -24,6 +24,9 @@ import type {
   NativeEvidence,
   NativeExistingPage,
   NativeGlobalPhase,
+  NativeMergePlannerAction,
+  NativeMergeSequenceTrace,
+  NativeMergeStepTrace,
   NativePageCandidate,
   NativePageKind,
   NativePageProposal,
@@ -796,6 +799,7 @@ function candidateForGroup(
       ? [existingMeta?.body ?? '', ...bodyParts].filter(Boolean).join('\n\n')
       : bodyParts.join('\n\n');
   const localReasons: string[] = [];
+  let nativeMergeTrace: NativeMergeSequenceTrace | undefined;
   const providerUnsupported = proposals.flatMap(item => stripProviderFrontmatter(item.body ?? '').unsupported);
   localReasons.push(...providerUnsupported);
   if (group.crossTypeAlias) localReasons.push(`cross-type-alias:${group.key.normalizedLabel}`);
@@ -845,6 +849,7 @@ function candidateForGroup(
       });
       const sequence = planNativeMergeSequence(path, existing.content, mergeSources, options);
       localReasons.push(...sequence.reasons);
+      if (mergeSources.length > 1) nativeMergeTrace = sequence.trace;
       content = sequence.reasons.length === 0 ? sequence.content : existing.content;
     } else {
       content = existing.content;
@@ -908,6 +913,7 @@ function candidateForGroup(
     reviewed,
     bodyPolicy,
     content,
+    ...(nativeMergeTrace ? { nativeMergeTrace } : {}),
     comparisonReasons: Object.freeze(uniqueReasons),
   });
 }
@@ -929,6 +935,7 @@ function plannerException(prefix: string, error: unknown): string {
 interface NativeMergeSequenceResult {
   readonly content: string;
   readonly reasons: readonly string[];
+  readonly trace?: NativeMergeSequenceTrace;
 }
 
 /**
@@ -944,6 +951,7 @@ function planNativeMergeSequence(
 ): NativeMergeSequenceResult {
   if (sources.length === 0) return { content: originalContent, reasons: [`native-merge:sequence-empty:${path}`] };
   let priorContent = originalContent;
+  const steps: NativeMergeStepTrace[] = [];
   for (const source of sources) {
     const stepReasons: string[] = [];
     let plan: ReturnType<typeof planNativeMerge>;
@@ -976,9 +984,31 @@ function planNativeMergeSequence(
       stepReasons.push(`native-merge:sequence-action-content-mismatch:${source.sourceId}:${plan.action}`);
     }
     if (stepReasons.length > 0) return { content: originalContent, reasons: stepReasons };
-    priorContent = plan.content as string;
+    const nextContent = plan.content;
+    if (nextContent === undefined) return { content: originalContent, reasons: [`native-merge:sequence-content-missing:${source.sourceId}`] };
+    steps.push(Object.freeze({
+      sourceId: source.sourceId,
+      sourcePath: source.sourcePath,
+      sourceSlug: source.sourceSlug,
+      path: plan.path,
+      plannerAction: plan.action as NativeMergePlannerAction,
+      // The native PageFactory reports every existing-page route as an
+      // update; plannerAction separately records whether bytes changed.
+      logAction: 'updated' as const,
+      currentContent: plan.currentContent ?? priorContent,
+      content: nextContent,
+    }));
+    priorContent = nextContent;
   }
-  return { content: priorContent, reasons: [] };
+  return {
+    content: priorContent,
+    reasons: [],
+    trace: Object.freeze({
+      originalContent,
+      finalContent: priorContent,
+      steps: Object.freeze(steps),
+    }),
+  };
 }
 
 function pathFolder(path: string, name: string): string {
@@ -1103,26 +1133,208 @@ function indexPlannerInput(
   }
 }
 
+function validateSharedPageTrace(
+  options: NativeReducerOptions,
+  file: NativeDesiredFile,
+  page: NativePageCandidate | undefined,
+  sources: readonly NativeSourceScopedIR[],
+): { readonly trace?: NativeMergeSequenceTrace; readonly reasons: readonly { readonly code: string; readonly message: string }[] } {
+  const refuse = (code: string, message: string) => ({ code, message });
+  const trace = page?.nativeMergeTrace;
+  if (!trace) {
+    return {
+      reasons: [{
+        code: 'ambiguous-shared-page-attribution',
+        message: `Canonical page ${file.path} is shared by sourceIds ${file.sourceIds.join(', ')}; no proved native merge sequence is bound`,
+      }],
+    };
+  }
+  if (!page || page.bodyPolicy !== 'preserve-existing' || page.reviewed) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-eligibility-mismatch',
+        `Canonical page ${file.path} has a merge trace outside the unreviewed existing frontmatter-only path`,
+      )],
+    };
+  }
+  const existing = options.existingPages?.find(item => pathCollisionKey(item.path) === pathCollisionKey(file.path));
+  if (!existing) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-missing-existing-page',
+        `Canonical page ${file.path} has a merge trace but no sealed existing page binding`,
+      )],
+    };
+  }
+  const existingFile = existingFileContent(options.existingFiles, file.path);
+  if (existingFile !== undefined && existingFile !== existing.content) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-existing-content-mismatch',
+        `Canonical page ${file.path} merge trace does not bind the exact existing-file bytes`,
+      )],
+    };
+  }
+  if (trace.originalContent !== existing.content) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-original-content-mismatch',
+        `Canonical page ${file.path} merge trace original bytes differ from the sealed existing page`,
+      )],
+    };
+  }
+  if (trace.finalContent !== page.content || trace.finalContent !== file.content) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-final-content-mismatch',
+        `Canonical page ${file.path} merge trace final bytes do not match the candidate and desired file`,
+      )],
+    };
+  }
+  const expectedAction: NativeDesiredAction = existing.content === file.content ? 'unchanged' : 'replace';
+  if (file.action !== expectedAction) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-file-action-mismatch',
+        `Canonical page ${file.path} expected desired action ${expectedAction}, received ${file.action}`,
+      )],
+    };
+  }
+  const expectedSourceIds = [...file.sourceIds].sort((left, right) => normalizeLabel(left).localeCompare(normalizeLabel(right)) || left.localeCompare(right));
+  if (trace.steps.length !== expectedSourceIds.length) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-step-count-mismatch',
+        `Canonical page ${file.path} expected ${expectedSourceIds.length} merge steps, received ${trace.steps.length}`,
+      )],
+    };
+  }
+  const sourceById = new Map(sources.map(source => [source.sourceId, source] as const));
+  let priorContent = trace.originalContent;
+  const seen = new Set<string>();
+  for (let index = 0; index < trace.steps.length; index++) {
+    const step = trace.steps[index];
+    const expectedSourceId = expectedSourceIds[index];
+    if (!step || !expectedSourceId) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-step-missing',
+          `Canonical page ${file.path} has an incomplete merge trace at step ${index}`,
+        )],
+      };
+    }
+    const source = sourceById.get(expectedSourceId);
+    if (!source) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-source-missing',
+          `Canonical page ${file.path} merge trace references unknown sourceId ${expectedSourceId}`,
+        )],
+      };
+    }
+    if (seen.has(step.sourceId) || step.sourceId !== expectedSourceId) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-source-order-mismatch',
+          `Canonical page ${file.path} merge trace source order diverges at step ${index}`,
+        )],
+      };
+    }
+    seen.add(step.sourceId);
+    if (step.path !== file.path) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-path-mismatch',
+          `Canonical page ${file.path} merge trace step ${step.sourceId} points to ${step.path}`,
+        )],
+      };
+    }
+    if (step.sourcePath !== source.sourcePath) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-source-path-mismatch',
+          `Canonical page ${file.path} merge trace source ${step.sourceId} path does not match the sealed source`,
+        )],
+      };
+    }
+    if (step.sourceSlug !== source.sourceSlug) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-source-slug-mismatch',
+          `Canonical page ${file.path} merge trace source ${step.sourceId} slug does not match the sealed source`,
+        )],
+      };
+    }
+    if (step.logAction !== 'updated') {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-log-action-mismatch',
+          `Canonical page ${file.path} merge trace source ${step.sourceId} is not classified as a native update`,
+        )],
+      };
+    }
+    if (step.plannerAction !== 'replace' && step.plannerAction !== 'unchanged') {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-planner-action-mismatch',
+          `Canonical page ${file.path} merge trace source ${step.sourceId} has an unsupported planner action`,
+        )],
+      };
+    }
+    if (step.currentContent !== priorContent) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-current-content-mismatch',
+          `Canonical page ${file.path} merge trace source ${step.sourceId} does not carry the prior step bytes`,
+        )],
+      };
+    }
+    if ((step.plannerAction === 'unchanged' && step.content !== step.currentContent)
+      || (step.plannerAction === 'replace' && step.content === step.currentContent)) {
+      return {
+        reasons: [refuse(
+          'shared-page-trace-action-content-mismatch',
+          `Canonical page ${file.path} merge trace source ${step.sourceId} action does not match its byte transition`,
+        )],
+      };
+    }
+    priorContent = step.content;
+  }
+  if (priorContent !== trace.finalContent || seen.size !== expectedSourceIds.length) {
+    return {
+      reasons: [refuse(
+        'shared-page-trace-final-step-mismatch',
+        `Canonical page ${file.path} merge trace does not terminate at the sealed final bytes`,
+      )],
+    };
+  }
+  return { trace, reasons: [] };
+}
+
 function logPlannerInput(
   options: NativeReducerOptions,
   sources: readonly NativeSourceScopedIR[],
+  pages: readonly NativePageCandidate[],
   desiredPages: readonly NativeDesiredFile[],
   sourceFiles: readonly NativeDesiredFile[],
 ): { readonly plan: ReturnType<typeof planNativeIngestLog>; readonly reasons: readonly string[] } {
   const logPath = assertRelativePath(options.global.paths.log, 'global.log');
   const wikiFolder = pathFolder(logPath, 'log');
   const refusalReasons: { readonly code: string; readonly message: string }[] = [];
+  const pageByPath = new Map(pages.map(page => [pathCollisionKey(page.path), page] as const));
+  const sharedTraceByPath = new Map<string, NativeMergeSequenceTrace>();
   for (const file of desiredPages) {
+    if (file.sourceIds.length > 1) {
+      const validation = validateSharedPageTrace(options, file, pageByPath.get(pathCollisionKey(file.path)), sources);
+      refusalReasons.push(...validation.reasons);
+      if (validation.trace) sharedTraceByPath.set(pathCollisionKey(file.path), validation.trace);
+      continue;
+    }
     if (file.action === 'unchanged') continue;
     if (file.sourceIds.length === 0) {
       refusalReasons.push({
         code: 'unattributed-canonical-page',
         message: `Canonical page ${file.path} has no sourceIds for native ingest-log attribution`,
-      });
-    } else if (file.sourceIds.length > 1) {
-      refusalReasons.push({
-        code: 'ambiguous-shared-page-attribution',
-        message: `Canonical page ${file.path} is shared by sourceIds ${file.sourceIds.join(', ')}; native create-vs-update attribution is not proven`,
       });
     }
   }
@@ -1155,12 +1367,16 @@ function logPlannerInput(
     const sourceId = source.sourceId;
     const sourceFile = sourceFileById.get(sourceId);
     const attributedPages = desiredPages.filter(file => file.sourceIds.length === 1 && file.sourceIds[0] === sourceId);
+    const sharedUpdatedPages = [...sharedTraceByPath.entries()]
+      .map(([pagePath, trace]) => trace.steps.find(step => step.sourceId === sourceId)?.logAction === 'updated' ? pagePath : undefined)
+      .filter((pagePath): pagePath is string => pagePath !== undefined);
     const createdPages = [
       ...attributedPages.filter(file => file.action === 'create').map(file => file.path),
       ...(sourceFile?.action === 'create' && sourceFile.path ? [sourceFile.path] : []),
     ];
     const updatedPages = [
       ...attributedPages.filter(file => file.action === 'replace').map(file => file.path),
+      ...sharedUpdatedPages,
       ...(sourceFile?.action === 'replace' && sourceFile.path ? [sourceFile.path] : []),
     ];
     try {
@@ -1441,7 +1657,7 @@ export function reduceNativeSourceIR(
     sources,
     new Map([...sourcePlans.entries()].map(([sourceId, planned]) => [sourceId, planned.plan])),
   );
-  const logPlannerResult = logPlannerInput({ ...options, wikiFolder }, sources, desiredPages, sourceFiles);
+  const logPlannerResult = logPlannerInput({ ...options, wikiFolder }, sources, pages, desiredPages, sourceFiles);
   comparisonReasons.push(...sourcePlannerReasons, ...indexPlannerResult.reasons, ...logPlannerResult.reasons);
   const globalFiles = [
     desiredFile(indexPath, 'index', 'serialized-global', indexPlannerResult.plan.content ?? '', sources.map(source => source.sourceId), options.existingFiles),
