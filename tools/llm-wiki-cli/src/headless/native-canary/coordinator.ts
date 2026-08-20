@@ -336,6 +336,40 @@ async function assertLiveUnchanged(input: NativeCanaryInput, live: CopySnapshotM
   }
 }
 
+/**
+ * Obtain a fresh signed live observation after the candidate-side work and
+ * bind it to the sealed initial status and bytes.  This is deliberately a
+ * separate gate from the pre-transaction observation: a successful candidate
+ * transaction or terminal artifact can never stand in for proof that the
+ * live Obsidian surface stayed unchanged.
+ */
+export async function validateTerminalLiveObservation(
+  input: NativeCanaryInput,
+  roots: SafeCopyRoots,
+  copies: NativeCanaryCopies,
+  initial: LiveIdleObservation,
+): Promise<LiveIdleObservation> {
+  let terminal: LiveIdleObservation;
+  try {
+    terminal = validateObservation(input, await input.observeLive(), roots.liveRoot.resolved);
+  } catch (error) {
+    wrap('live-observation-invalid', 'Terminal live idle observation failed closed', error);
+  }
+  try {
+    await assertLiveUnchanged(input, copies.live);
+  } catch (error) {
+    if (error instanceof NativeCanaryRefusal) throw error;
+    wrap('live-drift', 'Unable to prove the live vault remained unchanged at terminal observation', error);
+  }
+  if (terminal.statusDigest !== initial.statusDigest) {
+    fail('live-drift', 'Terminal live observation status differs from the signed initial observation', [
+      `initial=${initial.statusDigest}`,
+      `terminal=${terminal.statusDigest}`,
+    ]);
+  }
+  return terminal;
+}
+
 async function readSnapshotFiles(root: string, manifest: CopySnapshotManifest): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   try {
@@ -618,6 +652,7 @@ async function finalizeAndVerify(
   candidateProjection: ContractSemanticProjection,
   candidateSnapshot: CopySnapshotManifest,
   observation: LiveIdleObservation,
+  terminalObservation: LiveIdleObservation,
 ): Promise<{ readonly finalization: FinalizationResult; readonly independentVerification: IndependentRunVerificationResult; readonly artifactDirectory: string }> {
   const artifactBase = nodePath.join(roots.copyRoots[2].resolved, 'canary-runs');
   const artifactDirectory = nodePath.join(artifactBase, input.runId);
@@ -627,6 +662,7 @@ async function finalizeAndVerify(
   try { journalBytes = new Uint8Array(await readFile(journalPath)); } catch (error) { wrap('finalization-refused', 'Candidate transaction journal is not readable for finalization', error); }
   const files = [
     { path: 'live-idle-observation.json', bytes: jsonText(observation) },
+    { path: 'live-terminal-observation.json', bytes: jsonText(terminalObservation) },
     { path: 'copy-manifests.json', bytes: jsonText(copies) },
     { path: 'native-receipt.json', bytes: jsonText(native.receipt) },
     { path: 'native-binding.json', bytes: jsonText(native.binding) },
@@ -805,6 +841,13 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
     fail('candidate-reduction-refused', 'Candidate reduction requires native comparison or contains unsupported structure', [...reduction.reasons, ...reduction.unsupported]);
   }
   const transactionResult = await performCandidateTransaction(input, roots, copies, reduction, initialObservation);
+  let preFinalizationTerminalObservation: LiveIdleObservation;
+  try {
+    preFinalizationTerminalObservation = await validateTerminalLiveObservation(input, roots, copies, initialObservation);
+  } catch (error) {
+    await transactionResult.lease.release().catch(() => undefined);
+    throw error;
+  }
   let candidateProjection: ContractSemanticProjection;
   try {
     candidateProjection = await buildCandidateProjection(input, roots.copyRoots[1].resolved, transactionResult.candidate);
@@ -829,7 +872,14 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
   }
   let finalized: Awaited<ReturnType<typeof finalizeAndVerify>>;
   try {
-    finalized = await finalizeAndVerify(input, roots, native, copies, mapPolicy, mapIR, reduction, transactionResult.plan, transactionResult.receipt, comparison, candidateProjection, transactionResult.candidate, transactionResult.observation);
+    finalized = await finalizeAndVerify(input, roots, native, copies, mapPolicy, mapIR, reduction, transactionResult.plan, transactionResult.receipt, comparison, candidateProjection, transactionResult.candidate, transactionResult.observation, preFinalizationTerminalObservation);
+  } catch (error) {
+    await transactionResult.lease.release().catch(() => undefined);
+    throw error;
+  }
+  let terminalObservation: LiveIdleObservation;
+  try {
+    terminalObservation = await validateTerminalLiveObservation(input, roots, copies, initialObservation);
   } catch (error) {
     await transactionResult.lease.release().catch(() => undefined);
     throw error;
@@ -839,6 +889,7 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
     version: NATIVE_CANARY_VERSION,
     runId: input.runId,
     observation: initialObservation,
+    terminalObservation,
     copies,
     native,
     nativeMapPolicy: mapPolicy,

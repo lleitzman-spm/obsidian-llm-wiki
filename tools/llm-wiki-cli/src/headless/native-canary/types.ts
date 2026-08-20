@@ -138,6 +138,8 @@ export interface NativeCanaryResult {
   readonly version: typeof NATIVE_CANARY_VERSION;
   readonly runId: string;
   readonly observation: LiveIdleObservation;
+  /** Fresh signed proof that the live vault remained idle and unchanged after verification. */
+  readonly terminalObservation: LiveIdleObservation;
   readonly copies: NativeCanaryCopies;
   readonly native: NativeReferenceResult;
   readonly nativeMapPolicy: NativeMapPolicy;
