@@ -256,6 +256,37 @@ describe('scanDeadLinks', () => {
     expect(result).toHaveLength(1);
     expect(result[0].target).toBe('entities/Truly Unknown Page');
   });
+
+  it('resolves a uniquely owned alias for a typed link target', () => {
+    const pm = new Map<string, ScannerPage>([
+      makePageMap('wiki/entities/strategic-property-management.md',
+        '---\ntype: entity\naliases: [SPM]\n---\n\nStrategic Property Management'),
+      makePageMap('wiki/sources/article.md', '[[entities/spm]]'),
+    ].flatMap(m => [...m]));
+    const { known, knownLower } = buildKnownTargets([
+      { basename: 'strategic-property-management.md', path: 'wiki/entities/strategic-property-management.md' },
+      { basename: 'article.md', path: 'wiki/sources/article.md' },
+    ]);
+
+    expect(scanDeadLinks(pm, known, knownLower, 'wiki')).toEqual([]);
+  });
+
+  it('leaves an alias link dead when ownership is ambiguous', () => {
+    const pm = new Map<string, ScannerPage>([
+      makePageMap('wiki/entities/first.md', '---\ntype: entity\naliases: [Shared]\n---\n\nFirst'),
+      makePageMap('wiki/entities/second.md', '---\ntype: entity\naliases: [Shared]\n---\n\nSecond'),
+      makePageMap('wiki/sources/article.md', '[[Shared]]'),
+    ].flatMap(m => [...m]));
+    const { known, knownLower } = buildKnownTargets([
+      { basename: 'first.md', path: 'wiki/entities/first.md' },
+      { basename: 'second.md', path: 'wiki/entities/second.md' },
+      { basename: 'article.md', path: 'wiki/sources/article.md' },
+    ]);
+
+    const result = scanDeadLinks(pm, known, knownLower, 'wiki');
+    expect(result).toHaveLength(1);
+    expect(result[0].target).toBe('Shared');
+  });
 });
 
 // ── scanOrphans ────────────────────────────────────────────────

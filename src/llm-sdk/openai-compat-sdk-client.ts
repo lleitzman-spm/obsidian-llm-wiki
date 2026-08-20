@@ -46,6 +46,11 @@ import { JSON_ENFORCEMENT_SYSTEM_PREFIX } from './json-prompt-prefix';
 import { prependReasoningForParse, wrapReasoningContent } from '../core/markdown';
 import { isPlaceholderJsonText } from '../core/json';
 
+/** Abort and timeout errors must never be converted into provider retries. */
+function isAbortLike(error: unknown): error is Error {
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+}
+
 export interface OpenAICompatSdkClientOptions {
   apiKey: string;
   baseURL: string;
@@ -292,7 +297,7 @@ export class OpenAICompatSdkClient implements LLMClient {
   }
 
   async createMessage(params: LLMClient['createMessage'] extends (p: infer P) => unknown ? P : never): Promise<string> {
-    const { model, max_tokens, messages, temperature, top_p, repetition_penalty, seed, enableThinking, reasoningEffort, response_format, outputModeOverride, onFinish } = params;
+    const { model, max_tokens, messages, temperature, top_p, repetition_penalty, seed, enableThinking, reasoningEffort, response_format, outputModeOverride, abortSignal, onFinish } = params;
     // Issue #481: a pinned mode skips the prober for this call. `text_prompt`
     // puts no `response_format` on the wire, so the JSON shape has to come from
     // the prompt — the same prefix the 400-driven demotion adds at retry time,
@@ -351,6 +356,7 @@ export class OpenAICompatSdkClient implements LLMClient {
 
       const result = await generateText({
         model: languageModel,
+        abortSignal,
         ...(system ? { system } : {}),
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         maxOutputTokens: max_tokens,
@@ -386,7 +392,8 @@ export class OpenAICompatSdkClient implements LLMClient {
             ? [{ text: reasoningRaw }]
             : [];
         reasoningContent = reasoningArr.map((r) => r.text ?? '').join('');
-      } catch {
+      } catch (reasoningErr) {
+        if (isAbortLike(reasoningErr)) throw reasoningErr;
         /* No reasoning field on this provider. */
       }
       const finalText = reasoningContent
@@ -516,6 +523,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const { generateText } = await import('ai');
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -600,6 +608,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         // rejected.
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -734,6 +743,7 @@ export class OpenAICompatSdkClient implements LLMClient {
               : system;
           const result = await generateText({
             model: retryLanguageModel,
+            abortSignal,
             ...(retrySystem ? { system: retrySystem } : {}),
             messages: messages.map((m) => ({ role: m.role, content: m.content })),
             maxOutputTokens: max_tokens,
@@ -749,6 +759,7 @@ export class OpenAICompatSdkClient implements LLMClient {
           reportFinish(onFinish, result.finishReason, result.usage);
           return result.text;
         } catch (retryErr) {
+          if (isAbortLike(retryErr)) throw retryErr;
           // Retry at the demoted tier also failed. Update lastErrBody
           // for the next iteration's classifier check (the loop will
           // decide whether to demote one more tier or break).
@@ -796,6 +807,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const { generateText } = await import('ai');
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -860,6 +872,7 @@ export class OpenAICompatSdkClient implements LLMClient {
     top_p?: number;
     seed?: number;
     repetition_penalty?: number;
+    abortSignal?: AbortSignal;
     onFinish?: (meta: LLMFinishMeta) => void;
   }): Promise<{
     text: string;
@@ -868,7 +881,7 @@ export class OpenAICompatSdkClient implements LLMClient {
     finishReason: LLMFinishReason;
     usage?: LLMUsage;
   }> {
-    const { model, max_tokens, messages, response_format, outputModeOverride, enableThinking, reasoningEffort, repetition_penalty, temperature, top_p, seed, onFinish } = params;
+    const { model, max_tokens, messages, response_format, outputModeOverride, enableThinking, reasoningEffort, repetition_penalty, temperature, top_p, seed, abortSignal, onFinish } = params;
     // See createMessage — a pinned `text_prompt` needs the prompt-side
     // enforcement up front, because no demotion retry will add it.
     const system = forcedTextPromptSystem(params.system, response_format, outputModeOverride);
@@ -892,6 +905,7 @@ export class OpenAICompatSdkClient implements LLMClient {
       const { generateText } = await import('ai');
       const result = await generateText({
         model: languageModel,
+        abortSignal,
         ...(system ? { system } : {}),
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         maxOutputTokens: max_tokens,
@@ -923,7 +937,8 @@ export class OpenAICompatSdkClient implements LLMClient {
             ? [{ text: reasoningRaw }]
             : [];
         reasoningContent = reasoningArr.map((r) => r.text ?? '').join('');
-      } catch {
+      } catch (reasoningErr) {
+        if (isAbortLike(reasoningErr)) throw reasoningErr;
         /* No reasoning field on this provider. */
       }
       const text = reasoningContent
@@ -1009,6 +1024,7 @@ export class OpenAICompatSdkClient implements LLMClient {
                 : JSON_ENFORCEMENT_SYSTEM_PREFIX;
               const retryResult = await generateText({
                 model: retryLanguageModel,
+                abortSignal,
                 ...(retrySystem ? { system: retrySystem } : {}),
                 messages: messages.map((m) => ({ role: m.role, content: m.content })),
                 maxOutputTokens: max_tokens,
@@ -1035,7 +1051,8 @@ export class OpenAICompatSdkClient implements LLMClient {
                 finishReason: retryResult.finishReason,
                 usage: retryResult.usage,
               };
-            } catch {
+            } catch (retryErr) {
+              if (isAbortLike(retryErr)) throw retryErr;
               console.debug(
                 `[OUTPUT-MODE-PLACEHOLDER-DEMOTE] baseURL=${this.baseURL} model=${model} retry failed. Returning raw placeholder text.`,
               );
@@ -1086,6 +1103,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const { generateText } = await import('ai');
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -1146,6 +1164,7 @@ export class OpenAICompatSdkClient implements LLMClient {
                 : system;
             const result = await generateText({
               model: retryLanguageModel,
+              abortSignal,
               ...(retrySystem ? { system: retrySystem } : {}),
               messages: messages.map((m) => ({ role: m.role, content: m.content })),
               maxOutputTokens: max_tokens,
@@ -1166,6 +1185,7 @@ export class OpenAICompatSdkClient implements LLMClient {
               usage: result.usage,
             };
           } catch (retryErr) {
+            if (isAbortLike(retryErr)) throw retryErr;
             if (APICallError.isInstance(retryErr)) {
               lastErrBody = retryErr.responseBody ?? retryErr.message ?? '';
             }
@@ -1185,6 +1205,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const { generateText } = await import('ai');
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -1375,9 +1396,10 @@ export class OpenAICompatSdkClient implements LLMClient {
     top_p?: number;
     repetition_penalty?: number;
     seed?: number;
+    abortSignal?: AbortSignal;
     onFinish?: (meta: { finishReason: LLMFinishReason }) => void;
   }): Promise<string> {
-    const { model, max_tokens, system, messages, onChunk, temperature, top_p, repetition_penalty, seed, enableThinking, onFinish } = params;
+    const { model, max_tokens, system, messages, onChunk, temperature, top_p, repetition_penalty, seed, enableThinking, abortSignal, onFinish } = params;
 
     // v1.23.0 P1-7 follow-up: stream path uses streamWithFallback
     // (real streaming via window.fetch with CORS fallback to
@@ -1403,6 +1425,7 @@ export class OpenAICompatSdkClient implements LLMClient {
       // this is the AI-SDK v6 recommended pattern.
       const result = streamText({
         model: languageModel,
+        abortSignal,
         ...(system ? { system } : {}),
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         maxOutputTokens: max_tokens,
@@ -1480,6 +1503,7 @@ export class OpenAICompatSdkClient implements LLMClient {
 
         const result = streamText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -1498,7 +1522,10 @@ export class OpenAICompatSdkClient implements LLMClient {
         let reasoningContent = '';
         try {
           reasoningContent = extractReasoningText(await result.reasoning);
-        } catch { /* no reasoning */ }
+        } catch (reasoningErr) {
+          if (isAbortLike(reasoningErr)) throw reasoningErr;
+          /* no reasoning */
+        }
         if (reasoningContent) {
           fullText = wrapReasoningContent(reasoningContent, fullText);
         }
@@ -1531,6 +1558,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const { streamText } = await import('ai');
         const result = streamText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -1548,7 +1576,10 @@ export class OpenAICompatSdkClient implements LLMClient {
         let reasoningContent = '';
         try {
           reasoningContent = extractReasoningText(await result.reasoning);
-        } catch { /* no reasoning */ }
+        } catch (reasoningErr) {
+          if (isAbortLike(reasoningErr)) throw reasoningErr;
+          /* no reasoning */
+        }
         // Bug-3: markStrip AFTER the retry succeeds. If the stream
         // throws (network blip, transient 5xx), the cache is not
         // poisoned; the outer catch propagates the error and the
@@ -1569,6 +1600,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const { streamText } = await import('ai');
         const result = streamText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -1586,7 +1618,10 @@ export class OpenAICompatSdkClient implements LLMClient {
         let reasoningContent = '';
         try {
           reasoningContent = extractReasoningText(await result.reasoning);
-        } catch { /* no reasoning */ }
+        } catch (reasoningErr) {
+          if (isAbortLike(reasoningErr)) throw reasoningErr;
+          /* no reasoning */
+        }
         if (reasoningContent) {
           fullText = wrapReasoningContent(reasoningContent, fullText);
         }

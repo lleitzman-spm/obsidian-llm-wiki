@@ -64,6 +64,41 @@ function headersToObject(headers: HeadersInit | undefined): Record<string, strin
   return obj;
 }
 
+function abortReason(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error) return reason;
+  if (reason === undefined) return new DOMException('The operation was aborted.', 'AbortError');
+  if (typeof reason === 'string' || typeof reason === 'number' || typeof reason === 'boolean') {
+    return new Error(String(reason));
+  }
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+/** Race requestUrl, which has no AbortSignal parameter, against cancellation. */
+function awaitWithAbort<T>(promise: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return Promise.resolve(promise);
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortReason(signal));
+    };
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
 // v1.23.0 P1-7: debug logging for fetch adapter path selection.
 // Matched with "STREAM-FETCH" prefix so it's greppable in DevTools.
 const STREAM_FETCH_LOG = 'STREAM-FETCH';
@@ -93,7 +128,7 @@ export async function obsidianFetchBridge(
   // AbortSignal short-circuit: AI-SDK respects AbortSignal but requestUrl
   // doesn't accept one. We honor cancellation here.
   if (init?.signal?.aborted) {
-    throw new DOMException('The operation was aborted.', 'AbortError');
+    throw abortReason(init.signal);
   }
 
   // Build the request. Obsidian's requestUrl requires `body` as string
@@ -124,11 +159,17 @@ export async function obsidianFetchBridge(
 
   let response;
   try {
-    response = await requestUrl(params);
+    response = await awaitWithAbort(requestUrl(params), init?.signal);
   } catch (err) {
     // requestUrl threw — usually network error, CORS, or invalid URL.
     // Re-throw as a fetch-like TypeError so AI-SDK treats it as a
     // network failure (vs. an API error with a body).
+    if (init?.signal?.aborted) {
+      throw abortReason(init.signal);
+    }
+    if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
+      throw err;
+    }
     if (err instanceof Error) {
       throw new TypeError(`obsidianFetchBridge network error: ${err.message}`);
     }
@@ -138,7 +179,7 @@ export async function obsidianFetchBridge(
   // Check abort AFTER requestUrl resolved — race condition: caller
   // aborted while request was in flight.
   if (init?.signal?.aborted) {
-    throw new DOMException('The operation was aborted.', 'AbortError');
+    throw abortReason(init.signal);
   }
 
   // Build a Fetch-API-compatible Response from requestUrl's result.

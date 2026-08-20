@@ -50,6 +50,7 @@ import { isConversationSource, contextualizeError } from './contextualize';
 export interface CreatePageContext extends PathResolutionContext {
   settings: LLMWikiSettings;
   getClient(): LLMClient | null;
+  abortSignal?: AbortSignal;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge' | 'entity' | 'concept' | 'index'): Promise<string>;
   createOrUpdateFile(path: string, content: string): Promise<void>;
   tryReadFile(path: string): Promise<string | null>;
@@ -235,6 +236,7 @@ export async function createNewPage(
       max_tokens: TOKENS_PAGE_GENERATION,
       system: await ctx.buildSystemPrompt(pageType),
       messages: [{ role: 'user', content: finalPrompt }],
+      abortSignal: ctx.abortSignal,
       ...(ctx.settings.disableThinking ? { enableThinking: false } : {}),
     });
 

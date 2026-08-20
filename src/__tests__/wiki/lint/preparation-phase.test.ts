@@ -126,4 +126,17 @@ describe('runPreparationPhase', () => {
     expect(result.sourcesNormalizedFiles).toBe(1);
     expect(result.sourcesNormalizedEntries).toBeGreaterThan(0);
   });
+
+  it('loads a raw source note cited by a wiki Mentions link', async () => {
+    const rawPath = '10 Sources/ingest-queue/source-note.md';
+    const files = {
+      'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "verbatim source quote" - [[${rawPath}|source-note]]`,
+      [rawPath]: '# Source\n\nverbatim source quote',
+    };
+    const ctx = makeContext(files);
+    const result = await runPreparationPhase(ctx);
+
+    expect(result.pageMap.has(rawPath)).toBe(false);
+    expect(result.sourceMap.get(rawPath)?.content).toContain('verbatim source quote');
+  });
 });

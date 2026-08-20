@@ -23,7 +23,7 @@ import { TEXTS } from '../texts';
 import { renderTemplate } from '../core/template-renderer';
 import { slugify } from '../core/slug';
 import { resolveSourceSlug } from '../core/source-slug';
-import { parseFrontmatter, upsertFrontmatterField, mergeFrontmatterArrayField, extractBody } from '../core/frontmatter';
+import { parseFrontmatter, upsertFrontmatterField, mergeFrontmatterArrayField, replaceOrInsertYamlListField, extractBody } from '../core/frontmatter';
 import { setGenerationComplete } from '../core/incomplete-page-cleaner';
 import { convertPdfToMarkdown, UnsupportedProviderError, EncryptedPdfError } from '../core/pdf-converter';
 import { hashBody, checkContentRequirements } from '../core/source-requirements';
@@ -145,6 +145,8 @@ export class WikiEngine {
   private pageFactory: PageFactory;
   private conversationIngestor: ConversationIngestor;
   private abortController: AbortController | null = null;
+  /** Token proving that a nested PDF re-entry belongs to this operation. */
+  private activeIngestToken: symbol | null = null;
   private lintAbortController: AbortController | null = null;
   wasCancelled = false;
   private onIngestionStart: ((filename?: string) => void) | null = null;
@@ -378,6 +380,22 @@ export class WikiEngine {
     this.onLintEnd?.();
   }
 
+  /**
+   * End the active ingest operation and release its UI/controller state.
+   *
+   * Most ingest work reaches the `finally` block in `ingestSource`, but
+   * preflight skips and PDF rejection paths return before that block. Keep
+   * this idempotent so those paths and the normal `finally` can share the
+   * same cleanup without double-firing the end callback.
+   */
+  private endIngestionOperation(): void {
+    if (this.abortController === null) return;
+    this.abortController = null;
+    this.activeIngestToken = null;
+    this.ctx.abortSignal = undefined;
+    this.onIngestionEnd?.();
+  }
+
   private checkCancelled(): void {
     if (this.abortController?.signal.aborted) {
       throw new DOMException('Ingestion cancelled by user', 'AbortError');
@@ -556,22 +574,29 @@ export class WikiEngine {
         NOTICE_NORMAL
       );
     }
-    this.onDone?.({
-      sourceFile: file.path,
-      createdPages: [],
-      updatedPages: [],
-      entitiesCreated: 0,
-      conceptsCreated: 0,
-      failedItems: [],
-      collisions: [],
-      contradictionsFound: 0,
-      success: true,
-      skipped: true,
-      rejectedFiles: [{ path: file.path, reason: rejection.reason, detail: rejection.detail }],
-      elapsedSeconds: 0,
-      // v1.22.6 #204: Propagate trigger so completion can route UI.
-      trigger: opts?.trigger,
-    });
+    try {
+      this.onDone?.({
+        sourceFile: file.path,
+        createdPages: [],
+        updatedPages: [],
+        entitiesCreated: 0,
+        conceptsCreated: 0,
+        failedItems: [],
+        collisions: [],
+        contradictionsFound: 0,
+        success: true,
+        skipped: true,
+        rejectedFiles: [{ path: file.path, reason: rejection.reason, detail: rejection.detail }],
+        elapsedSeconds: 0,
+        // v1.22.6 #204: Propagate trigger so completion can route UI.
+        trigger: opts?.trigger,
+      });
+    } finally {
+      // Preflight/PDF rejection returns before the main ingest try/finally.
+      // Release the controller and hide the status bar even if the completion
+      // callback itself fails.
+      this.endIngestionOperation();
+    }
   }
 
   /**
@@ -817,10 +842,28 @@ export class WikiEngine {
     // `onIngestionStart` is idempotent at the main.ts callback level (it
     // simply sets status bar text), so we still re-emit it for visual
     // refresh — that doesn't grow any state.
+    const ownsActiveOperation = opts?.operationToken !== undefined
+      && opts.operationToken === this.activeIngestToken;
+    if (this.abortController !== null && !ownsActiveOperation) {
+      throw new Error('Ingestion already in progress');
+    }
     if (this.abortController === null) {
       this.wasCancelled = false;
       this.abortController = new AbortController();
-      this.onIngestionStart?.(file.basename);
+      this.activeIngestToken = Symbol('ingest');
+      this.ctx.abortSignal = this.abortController.signal;
+      try {
+        this.onIngestionStart?.(file.basename);
+      } catch (error) {
+        // A status-bar/UI hook is outside the ingest pipeline. Do not let a
+        // throwing hook strand the controller or block a later ingest.
+        try {
+          this.endIngestionOperation();
+        } catch {
+          // Preserve the original startup-hook error.
+        }
+        throw error;
+      }
     }
 
     // v1.25.0 PR2 redo: PDF ingest path converts the PDF binary to markdown
@@ -832,23 +875,68 @@ export class WikiEngine {
     // Guard: only dispatch to the PDF branch when the caller has NOT
     // already provided a converted body — otherwise this would recurse
     // (ingestPdfSource re-enters ingestSource with contentOverride set).
-    if (file.extension.toLowerCase() === 'pdf' && !opts?.contentOverride) {
-      return this.ingestPdfSource(file, opts);
+    if (file.extension.toLowerCase() === 'pdf' && opts?.contentOverride === undefined) {
+      try {
+        return await this.ingestPdfSource(file, {
+          ...opts,
+          operationToken: this.activeIngestToken ?? undefined,
+        });
+      } catch (error) {
+        // The PDF branch runs before the main ingest try/finally. Ensure an
+        // unexpected converter/vault error cannot leave the status bar latched.
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          this.wasCancelled = true;
+          console.debug('=== PDF ingestion cancelled by user ===');
+          try {
+            new Notice(getText(this.settings.language, 'ingestionCancelled'), NOTICE_NORMAL);
+            this.onDone?.({
+              sourceFile: file.path,
+              createdPages: [],
+              updatedPages: [],
+              entitiesCreated: 0,
+              conceptsCreated: 0,
+              failedItems: [],
+              collisions: [],
+              contradictionsFound: 0,
+              success: false,
+              cancelled: true,
+              errorMessage: 'Cancelled by user',
+              elapsedSeconds: 0,
+              trigger: opts?.trigger,
+            });
+          } finally {
+            this.endIngestionOperation();
+          }
+          return;
+        }
+        this.endIngestionOperation();
+        throw error;
+      }
     }
 
-    // #164 pre-ingest requirements gate — runs BEFORE any cancellation/UI setup so
-    // a rejected file returns cleanly with nothing to tear down. Empty/type are
-    // hard skips; a duplicate auto-skips, except interactive ingest prompts first.
-    const fileContent = opts?.contentOverride ?? await this.app.vault.read(file);
-    const rejection = opts?.forceReingest ? null : await this.checkRequirements(file, fileContent, opts?.batchCtx);
-    if (rejection) {
-      const confirmed = rejection.reason === 'duplicate' && opts?.interactive && this.onConfirmReingest
-        ? await this.onConfirmReingest(file, rejection)
-        : false;
-      if (!confirmed) {
-        this.reportSkip(file, rejection, opts);
-        return;
+    // #164 pre-ingest requirements gate. The cancellation/controller setup
+    // above is required for the PDF branch, so reportSkip() owns cleanup when
+    // a text source is rejected here. Empty/type are hard skips; a duplicate
+    // auto-skips, except interactive ingest prompts first.
+    let fileContent: string;
+    try {
+      fileContent = opts?.contentOverride ?? await this.app.vault.read(file);
+      const rejection = opts?.forceReingest ? null : await this.checkRequirements(file, fileContent, opts?.batchCtx);
+      if (rejection) {
+        const confirmed = rejection.reason === 'duplicate' && opts?.interactive && this.onConfirmReingest
+          ? await this.onConfirmReingest(file, rejection)
+          : false;
+        if (!confirmed) {
+          this.reportSkip(file, rejection, opts);
+          return;
+        }
       }
+    } catch (error) {
+      // Vault reads, requirement checks, and interactive confirmation all run
+      // before the main try/finally below. Release UI/controller state when
+      // any of those preflight operations rejects.
+      this.endIngestionOperation();
+      throw error;
     }
 
     const totalStartTime = Date.now();
@@ -893,6 +981,7 @@ export class WikiEngine {
       const analysisStart = Date.now();
       analysis = await this.sourceAnalyzer.analyzeSource(file, {
         ...(opts?.contentOverride !== undefined ? { contentOverride: opts.contentOverride } : {}),
+        abortSignal: this.abortController?.signal,
       });
       if (!analysis) {
         // When the user opted into a custom repetitionPenalty, append the
@@ -1260,8 +1349,7 @@ export class WikiEngine {
       });
       throw error;
     } finally {
-      this.abortController = null;
-      this.onIngestionEnd?.();
+      this.endIngestionOperation();
     }
   }
 
@@ -1302,9 +1390,9 @@ export class WikiEngine {
     // Priority: existing source-page tags > source-note tags > LLM concept names.
     const existingSource = await this.tryReadFile(path);
     const existingFm = existingSource ? parseFrontmatter(existingSource) : null;
-    const existingTags = Array.isArray(existingFm?.tags) && existingFm.tags.length > 0
-      ? existingFm.tags
-      : null;
+    const existingTags = Array.isArray(existingFm?.tags)
+      ? existingFm.tags.filter(t => (VALID_SOURCE_TAGS as readonly string[]).includes(String(t)))
+      : [];
 
     // Issue #90: inherit tags from source note frontmatter when available,
     // so the generated summary page doesn't pollute the tag vocabulary with
@@ -1314,11 +1402,20 @@ export class WikiEngine {
     const sourceTags = extractSourceTags(content).filter(t =>
       (VALID_SOURCE_TAGS as readonly string[]).includes(t)
     );
-    const tagsValue = existingTags
-      ? existingTags.join(', ')
-      : sourceTags.length > 0
-        ? sourceTags.join(', ')
-        : DEFAULT_SOURCE_TAG;
+    // Governed operating articles are repository-controlled articles, not
+    // entity documents. Their queue-note `origin_type` is the deterministic
+    // source identity; use it before inherited/model-derived tags so a custom
+    // entity tag such as `document` cannot cross the source-page boundary.
+    const originType = parseFrontmatter(content)?.origin_type;
+    const governedOperatingArticle = originType === 'spm-repository-governed-operating-article';
+    const sourcePageTags = existingTags.length > 0
+      ? existingTags
+      : governedOperatingArticle
+        ? ['article']
+        : sourceTags.length > 0
+          ? sourceTags
+          : [DEFAULT_SOURCE_TAG];
+    const tagsValue = sourcePageTags.join(', ');
 
     const createdPagesList = plannedPaths.length > 0
       ? plannedPaths.map(p => {
@@ -1349,6 +1446,7 @@ export class WikiEngine {
       max_tokens: TOKENS_PAGE_GENERATION,
       system: await this.buildSystemPrompt('summary'),
       messages: [{ role: 'user', content: finalPrompt }],
+      abortSignal: this.abortController?.signal,
       ...(this.settings.disableThinking ? { enableThinking: false } : {}),
     });
 
@@ -1356,6 +1454,11 @@ export class WikiEngine {
     // #164: stamp a content fingerprint so future ingests can detect duplicates.
     // Injected programmatically — the LLM can't be trusted to emit it.
     let finalContent = upsertFrontmatterField(cleanedContent, 'contentHash', hashBody(extractBody(content)));
+    // The model is instructed to emit the supplied tag but remains untrusted:
+    // stamp the closed source-page taxonomy after generation. This also makes
+    // the governed-article mapping above effective on disk, not just in the
+    // prompt, and removes any entity/concept tag the model may have copied.
+    finalContent = replaceOrInsertYamlListField(finalContent, 'tags', sourcePageTags);
 
     // Issue #185: append the source note's curated frontmatter `aliases:`
     // to the generated `sources/<slug>` page. Merged inline (BEFORE the

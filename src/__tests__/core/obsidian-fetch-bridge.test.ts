@@ -210,6 +210,28 @@ describe('obsidianFetchBridge', () => {
       await expect(promise).rejects.toThrow(DOMException);
     });
 
+    it('settles a pending requestUrl with the signal reason without wrapping timeout', async () => {
+      const deferred: { resolve?: (value: unknown) => void } = {};
+      mockRequestUrl.mockImplementation(
+        () => new Promise((resolve) => { deferred.resolve = resolve; }) as unknown as ReturnType<typeof requestUrl>
+      );
+
+      const controller = new AbortController();
+      const timeoutError = new DOMException('timed out', 'TimeoutError');
+      const promise = obsidianFetchBridge('https://api.example.com/v1/chat', {
+        method: 'POST',
+        body: '{}',
+        signal: controller.signal,
+      });
+
+      controller.abort(timeoutError);
+      await expect(promise).rejects.toBe(timeoutError);
+
+      // requestUrl itself cannot be cancelled by Obsidian; settle the mock so
+      // the test leaves no pending promise after the bridge has rejected.
+      deferred.resolve!(makeRequestUrlResult({ status: 200, text: 'late' }));
+    });
+
     it('does NOT throw when no signal is provided', async () => {
       mockRequestUrl.mockResolvedValue(makeRequestUrlResult({ status: 200, text: '' }));
 

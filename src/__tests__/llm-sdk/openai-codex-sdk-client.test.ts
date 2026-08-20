@@ -18,6 +18,15 @@ describe('OpenAICodexSdkClient', () => {
     if (typeof init?.body !== 'string') throw new Error('Expected a string body');
     expect(JSON.parse(init.body) as unknown).toMatchObject({ stream: true, store: false });
   });
+  it('forwards the caller abort signal to Codex streamText', async () => {
+    const auth = fakeAuthManager();
+    const controller = new AbortController();
+    const fetchFn = vi.fn(async (_url: string, _init?: RequestInit) => streamingResponse(['ok']));
+    const client = new OpenAICodexSdkClient({ auth, fetch: fetchFn, streamFetch: fetchFn, sessionId: () => 'session-abort-signal', version: '1.25.0' });
+
+    await expect(client.createMessage({ ...messageParams(), abortSignal: controller.signal })).resolves.toBe('ok');
+    expect(fetchFn.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+  });
   it('uses one reliable Obsidian transport without attempting a second Codex POST', async () => {
     const auth = fakeAuthManager();
     const networkFetch = vi.spyOn(window, 'fetch').mockRejectedValue(new TypeError('connection lost'));
@@ -68,6 +77,15 @@ describe('OpenAICodexSdkClient', () => {
     await expect(client.createMessageStream({ ...messageParams(), max_tokens: 100, onChunk })).resolves.toBe('hello');
     expect(onChunk.mock.calls).toEqual([['hel'], ['lo']]);
     expect(fetchFn).toHaveBeenCalledOnce();
+  });
+  it('forwards the caller abort signal on the stream method', async () => {
+    const auth = fakeAuthManager();
+    const controller = new AbortController();
+    const fetchFn = vi.fn(async (_url: string, _init?: RequestInit) => streamingResponse(['ok']));
+    const client = new OpenAICodexSdkClient({ auth, fetch: vi.fn(), streamFetch: fetchFn, sessionId: () => 'session-stream-abort', version: '1.24.1' });
+
+    await expect(client.createMessageStream({ ...messageParams(), abortSignal: controller.signal, onChunk: vi.fn() })).resolves.toBe('ok');
+    expect(fetchFn.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
   });
   it('refreshes once after a 401 and replays the request with new access', async () => {
     const auth = fakeAuthManager();

@@ -61,6 +61,7 @@ export interface MergeContext {
   app: unknown;
   settings: LLMWikiSettings;
   getClient(): LLMClient | null;
+  abortSignal?: AbortSignal;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge'): Promise<string>;
   createOrUpdateFile(path: string, content: string): Promise<void>;
   tryReadFile(path: string): Promise<string | null>;
@@ -168,6 +169,9 @@ export async function mergePage(
       }
       // strategy === 'merge' | 'contradictory': fall through to body rewrite.
     } catch (triageError) {
+      if (ctx.abortSignal?.aborted || (triageError instanceof Error && (triageError.name === 'AbortError' || triageError.name === 'TimeoutError'))) {
+        throw triageError;
+      }
       console.warn(
         `[mergePage] triage failed (${triageError instanceof Error ? triageError.message : String(triageError)}) — falling back to merge path`,
       );
@@ -204,6 +208,7 @@ export async function mergePage(
       max_tokens: TOKENS_PAGE_GENERATION,
       system: await ctx.buildSystemPrompt('merge'),
       messages: [{ role: 'user', content: finalPrompt }],
+      abortSignal: ctx.abortSignal,
       ...(ctx.settings.disableThinking ? { enableThinking: false } : {}),
     });
 
@@ -263,6 +268,9 @@ export async function mergePage(
     );
     return path;
   } catch (error) {
+    if (ctx.abortSignal?.aborted || (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError'))) {
+      throw error;
+    }
     throw mergeError(error, info.name, pageType);
   }
 }
@@ -309,6 +317,7 @@ export async function appendToReviewedPage(
       max_tokens: TOKENS_APPEND_REVIEWED,
       system: await ctx.buildSystemPrompt('merge'),
       messages: [{ role: 'user', content: finalPrompt }],
+      abortSignal: ctx.abortSignal,
       ...(ctx.settings.disableThinking ? { enableThinking: false } : {}),
     });
 

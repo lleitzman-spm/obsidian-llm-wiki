@@ -49,6 +49,7 @@ export interface SectionAnchor {
 export interface ComplementaryContext {
   settings: LLMWikiSettings;
   getClient(): LLMClient | null;
+  abortSignal?: AbortSignal;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge'): Promise<string>;
 }
 
@@ -241,6 +242,7 @@ export async function callPerSectionAppend(
       max_tokens: TOKENS_COMPLEMENTARY_APPEND,
       system: await ctx.buildSystemPrompt('merge'),
       messages: [{ role: 'user', content: appendPrompt }],
+      abortSignal: ctx.abortSignal,
       ...(ctx.settings.disableThinking ? { enableThinking: false } : {}),
     });
     const cleaned = response?.trim() ?? '';
@@ -252,8 +254,11 @@ export async function callPerSectionAppend(
     // Verbatim: the splice site picks the section-break separator (single \n
     // for lists, blank line for paragraphs).
     return cleaned;
-  } catch {
-    console.warn('[mergePage] per-section append failed — falling back to New Information section');
+  } catch (error) {
+    if (ctx.abortSignal?.aborted || (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError'))) {
+      throw error;
+    }
+    console.warn('[mergePage] per-section append failed - falling back to New Information section');
     return 'NO_NEW_CONTENT';
   }
 }

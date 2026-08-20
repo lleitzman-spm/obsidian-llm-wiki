@@ -146,6 +146,7 @@ export async function runBatchedWithRetry<T>(
     // Single retry for failures.
     if (retryQueue.length > 0) {
       await opts.apiDelay(apiDelayMs);
+      opts.checkCancelled();
       const retryAttempt = await runBatch(
         retryQueue.map(r => r.task),
         opts,
@@ -163,6 +164,7 @@ export async function runBatchedWithRetry<T>(
     // Delay between batches (skip on last)
     if (i + opts.concurrency < opts.tasks.length && opts.batchDelayMs > 0) {
       await opts.apiDelay(opts.batchDelayMs);
+      opts.checkCancelled();
     }
   }
 
@@ -206,7 +208,7 @@ async function runBatch<T>(
   collisions: Collision[];
   retryQueue: Array<{ task: BatchTask<T>; reason: string }>;
 }> {
-  const settled = await Promise.allSettled(
+    const settled = await Promise.allSettled(
     tasks.map(async (task) => {
       opts.onProgress?.(task.id);
       try {
@@ -217,10 +219,14 @@ async function runBatch<T>(
           failureReason: error instanceof Error ? error.message : String(error),
         };
       }
-    }),
-  );
+      }),
+    );
+    // An in-flight provider call may reject after the task wrapper has caught
+    // it as a normal task failure. Re-check before retrying so cancellation
+    // never turns into a delayed second provider call or a later writer.
+    opts.checkCancelled();
 
-  const succeeded: string[] = [];
+    const succeeded: string[] = [];
   const collisions: Collision[] = [];
   const retryQueue: Array<{ task: BatchTask<T>; reason: string }> = [];
 

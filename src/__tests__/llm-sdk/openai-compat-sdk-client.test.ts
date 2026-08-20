@@ -112,6 +112,93 @@ describe('OpenAICompatSdkClient', () => {
     mockCreateOpenAICompatible.mockClear();
   });
 
+  it('forwards abort signals to plain and typed generateText calls', async () => {
+    const controller = new AbortController();
+    const client = new OpenAICompatSdkClient({
+      apiKey: 'sk-test',
+      baseURL: 'http://localhost:1234/v1',
+      provider: 'lmstudio',
+    });
+
+    await client.createMessage({
+      model: 'qwen',
+      max_tokens: 20,
+      messages: [{ role: 'user', content: 'hi' }],
+      abortSignal: controller.signal,
+    });
+    expect((mockGenerateText.mock.calls[0][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+
+    mockGenerateText.mockReset();
+    mockGenerateText.mockResolvedValue(makeResultWithOutput('{"ok":true}', { ok: true }));
+    await client.createMessageWithOutput({
+      model: 'qwen',
+      max_tokens: 20,
+      messages: [{ role: 'user', content: 'hi' }],
+      response_format: { type: 'json_object', schema: { type: 'object' } },
+      abortSignal: controller.signal,
+    });
+    expect((mockGenerateText.mock.calls[0][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+  });
+
+  it('forwards the same abort signal to a plain-call demotion retry', async () => {
+    const controller = new AbortController();
+    mockGenerateText.mockReset();
+    mockGenerateText
+      .mockRejectedValueOnce(new APICallError({
+        message: 'Provider returned error',
+        statusCode: 400,
+        responseHeaders: {},
+        url: 'https://custom.example.com/v1',
+        requestBodyValues: {},
+        responseBody: '{"error":{"message":"Unsupported value: response_format.json_schema"}}',
+      }))
+      .mockResolvedValueOnce(makeResult('ok'));
+
+    const client = new OpenAICompatSdkClient({
+      apiKey: 'sk-test',
+      baseURL: 'https://custom.example.com/v1',
+      provider: 'custom',
+    });
+    await client.createMessage({
+      model: 'any-model',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      response_format: { type: 'json_object', schema: { type: 'object' } },
+      abortSignal: controller.signal,
+    });
+
+    expect(mockGenerateText.mock.calls).toHaveLength(2);
+    expect((mockGenerateText.mock.calls[0][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+    expect((mockGenerateText.mock.calls[1][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+  });
+
+  it('does not swallow an abort raised by a demotion retry', async () => {
+    const abortError = new DOMException('timed out', 'TimeoutError');
+    mockGenerateText.mockReset();
+    mockGenerateText
+      .mockRejectedValueOnce(new APICallError({
+        message: 'Provider returned error',
+        statusCode: 400,
+        responseHeaders: {},
+        url: 'https://custom.example.com/v1',
+        requestBodyValues: {},
+        responseBody: '{"error":{"message":"Unsupported value: response_format.json_schema"}}',
+      }))
+      .mockRejectedValueOnce(abortError);
+
+    const client = new OpenAICompatSdkClient({
+      apiKey: 'sk-test',
+      baseURL: 'https://custom.example.com/v1',
+      provider: 'custom',
+    });
+    await expect(client.createMessage({
+      model: 'any-model',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+      response_format: { type: 'json_object', schema: { type: 'object' } },
+    })).rejects.toBe(abortError);
+  });
+
   describe.each(PRESETS)('for provider "$id" ($baseURL)', (preset) => {
     it('forwards baseURL + name to createOpenAICompatible', async () => {
       const client = new OpenAICompatSdkClient({

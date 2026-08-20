@@ -10,6 +10,12 @@ import { isInFolderScope } from '../../../core/folder-scope';
 export interface PreparationResult {
   wikiFiles: Array<{ path: string; basename: string }>;
   pageMap: Map<string, ScannerPage>;
+  /**
+   * Wiki source pages plus raw vault notes explicitly cited by a Mentions
+   * link. The quote scanner needs these files even though raw notes are
+   * intentionally outside the wiki pageMap.
+   */
+  sourceMap: Map<string, ScannerPage>;
   knownTargets: Set<string>;
   knownTargetsLower: Set<string>;
   doubleNestFixes: number;
@@ -154,15 +160,84 @@ export async function runPreparationPhase(
     `${filteredWikiFiles.length} linted`
   );
 
+  const sourceMap = await readLinkedSourcePages(ctx, pageMap, allVaultFiles);
+
   return {
     wikiFiles: filteredWikiFiles,
     pageMap,
+    sourceMap,
     knownTargets,
     knownTargetsLower,
     doubleNestFixes,
     sourcesNormalizedFiles,
     sourcesNormalizedEntries,
   };
+}
+
+/**
+ * Read only source pages that the already-loaded wiki pages cite. A raw source
+ * note (for example `10 Sources/ingest-queue/foo.md`) is not part of the wiki
+ * pageMap, but it is the authoritative body for its generated Mentions quote.
+ *
+ * Candidate paths are resolved against the vault's own markdown-file index,
+ * case-insensitively, and only a unique file is read. Ambiguous path casing
+ * stays unresolved so quote lint remains conservative.
+ */
+async function readLinkedSourcePages(
+  ctx: LintPhaseContext,
+  pageMap: Map<string, ScannerPage>,
+  allVaultFiles: Array<{ path: string; basename: string }>,
+): Promise<Map<string, ScannerPage>> {
+  const sourceMap = new Map<string, ScannerPage>();
+  for (const [path, page] of pageMap) {
+    if (path.includes('/sources/')) sourceMap.set(path, page);
+  }
+
+  const filesByLowerPath = new Map<string, Array<{ path: string; basename: string }>>();
+  for (const file of allVaultFiles) {
+    const key = file.path.toLowerCase();
+    const matches = filesByLowerPath.get(key) ?? [];
+    matches.push(file);
+    filesByLowerPath.set(key, matches);
+  }
+
+  const candidates = new Map<string, { path: string; basename: string }>();
+  const linkRegex = /\[\[([^\]|#]+)(?:\|[^\]]+)?\]\]/g;
+  for (const page of pageMap.values()) {
+    let match: RegExpExecArray | null;
+    while ((match = linkRegex.exec(page.content)) !== null) {
+      const target = match[1].trim();
+      if (!target || target.startsWith(ctx.settings.wikiFolder + '/')) continue;
+      if (target.startsWith('entities/') || target.startsWith('concepts/') ||
+          target.startsWith('sources/') || target.startsWith('schema/')) continue;
+
+      const base = target.replace(/\.md$/i, '');
+      const possiblePaths = target.toLowerCase().endsWith('.md')
+        ? [target]
+        : [target, `${base}.md`];
+      const matches = possiblePaths.flatMap(path => filesByLowerPath.get(path.toLowerCase()) ?? []);
+      const unique = new Map(matches.map(file => [file.path, file]));
+      if (unique.size !== 1) continue;
+      const file = [...unique.values()][0];
+      if (file.path.startsWith(ctx.settings.wikiFolder + '/')) continue;
+      candidates.set(file.path, file);
+    }
+    linkRegex.lastIndex = 0;
+  }
+
+  const candidateFiles = [...candidates.values()];
+  for (let i = 0; i < candidateFiles.length; i += LINT_PREP_BATCH_READ) {
+    ctx.checkCancelled();
+    const batch = candidateFiles.slice(i, i + LINT_PREP_BATCH_READ);
+    const batchResults = await Promise.all(batch.map(async file => ({
+      path: file.path,
+      content: await ctx.app.vault.read(file),
+      basename: file.basename,
+    })));
+    for (const result of batchResults) sourceMap.set(result.path, result);
+  }
+
+  return sourceMap;
 }
 
 function buildKnownTargets(

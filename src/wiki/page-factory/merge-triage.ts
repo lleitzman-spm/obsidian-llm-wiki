@@ -62,6 +62,7 @@ export interface MergeTriageResult {
 export interface MergeTriageContext {
   settings: LLMWikiSettings;
   getClient(): LLMClient | null;
+  abortSignal?: AbortSignal;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge'): Promise<string>;
 }
 
@@ -121,6 +122,7 @@ export async function classifyMergeNeed(
       system: systemPrompt,
       messages: [{ role: 'user', content: finalPrompt }],
       response_format: { type: 'json_object', schema: MergeTriageSchema },
+      abortSignal: ctx.abortSignal,
       ...(disableThinking ? { enableThinking: false } : {}),
     });
     parsed = result.output && typeof result.output === 'object'
@@ -134,6 +136,7 @@ export async function classifyMergeNeed(
       system: systemPrompt,
       messages: [{ role: 'user', content: finalPrompt }],
       response_format: { type: 'json_object' },
+      abortSignal: ctx.abortSignal,
       ...(disableThinking ? { enableThinking: false } : {}),
     });
     parsed = await parseJsonResponse(response) as MergeTriage | null;

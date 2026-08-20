@@ -84,6 +84,18 @@ describe('scanQuoteGrounding', () => {
     expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
   });
 
+  it('does not use a raw linked note for legacy bare-quote fallback', () => {
+    const pages = makePageMap({
+      'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "raw-only quote"`,
+    });
+    const sources = makeSourceMap({
+      '10 Sources/ingest-queue/article.md': '# Article\n\nraw-only quote',
+    });
+    const result = scanQuoteGrounding(pages, sources, 'wiki');
+    expect(result).toHaveLength(1);
+    expect(result[0].hasSourceLink).toBe(false);
+  });
+
   it('flags a historical bare quote when it exists in no source', () => {
     const pages = makePageMap({
       'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "this sentence is fabricated"`,

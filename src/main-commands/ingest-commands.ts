@@ -261,6 +261,10 @@ export const ingestCommands = {
         const errMsg = error instanceof Error ? error.message : String(error);
         new Notice(texts.errorIngestFailed + file.basename + ': ' + errMsg, NOTICE_ERROR);
         if (jobId) this.ingestQueue.complete(jobId, false, errMsg);
+        // A PDF conversion can reject with AbortError before the standard
+        // ingest try/catch is entered. Preserve cancellation as a batch-level
+        // stop even when the cancellation report callback itself throws.
+        if (this.wikiEngine.wasCancelled) break;
       }
     }
 

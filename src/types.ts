@@ -620,6 +620,8 @@ export interface IngestOptions {
    * (slug, frontmatter inheritance) still use `file`.
    */
   contentOverride?: string;
+  /** Internal: keeps PDF re-entry attached to its owning ingest operation. */
+  operationToken?: symbol;
 }
 
 // LLM Client interface
@@ -808,6 +810,8 @@ export interface LLMClient {
     top_p?: number;
     seed?: number;
     repetition_penalty?: number;
+    /** Cancellation/timeout signal forwarded to the AI SDK. */
+    abortSignal?: AbortSignal;
     onFinish?: (meta: LLMFinishMeta) => void;
   }): Promise<{
     text: string;
@@ -828,7 +832,9 @@ export interface LLMClient {
     top_p?: number;
     seed?: number;
     repetition_penalty?: number;
-    /** Issue: streamed answers were truncated silently — surface finish_reason. */
+    /** Cancellation/timeout signal forwarded to the AI SDK. */
+    abortSignal?: AbortSignal;
+    /** Issue: streamed answers were truncated silently - surface finish_reason. */
     onFinish?: (meta: LLMFinishMeta) => void;
   }): Promise<string>;
 
@@ -901,6 +907,8 @@ export interface EngineContext {
    * Undefined only in tests that don't stub SubtleCrypto.
    */
   subtle?: SubtleCrypto;
+  /** Signal owned by the active ingest operation, when one is running. */
+  abortSignal?: AbortSignal;
   onFileWrite?: (path: string) => void;
   onProgress?: (message: string) => void;
   onDone?: (report: IngestReport) => void;

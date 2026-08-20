@@ -20,6 +20,11 @@ import { PageFactory } from './page-factory';
 import { SourceAnalysisLLMSchema, ConversationDedupStatusLLMSchema } from '../llm-sdk/output-schemas';
 import { callLlm } from '../core/llm-dispatch';
 
+function isAbortLike(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true
+    || (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError'));
+}
+
 export interface ConversationOrchestration {
   ensureWikiStructure: () => Promise<void>;
   apiDelay: (ms?: number) => Promise<void>;
@@ -101,6 +106,7 @@ export class ConversationIngestor {
           };
         }
       } catch (error) {
+        if (isAbortLike(error, this.ctx.abortSignal)) throw error;
         console.debug('Dedup check failed, proceeding with save:', error);
       }
     }
@@ -168,6 +174,7 @@ CRITICAL RULES:
         content: analysisPrompt
       }],
       response_format: { type: 'json_object' as const, schema: SourceAnalysisLLMSchema },
+      abortSignal: this.ctx.abortSignal,
       ...(this.ctx.settings.disableThinking ? { enableThinking: false } : {}),
     };
     // v1.26.3 PATCH Issue #443 expanded scope: typed-output path. Same
@@ -183,6 +190,7 @@ CRITICAL RULES:
         system: await this.ctx.buildSystemPrompt('conversation'),
         messages: [{ role: 'user' as const, content: repairPrompt }],
         response_format: { type: 'json_object' as const, schema: SourceAnalysisLLMSchema },
+        abortSignal: this.ctx.abortSignal,
         ...(this.ctx.settings.disableThinking ? { enableThinking: false } : {}),
       };
       return callLlm(client, repairArgs);
@@ -249,6 +257,7 @@ CRITICAL RULES:
       max_tokens: TOKENS_CONVERSATION_PAGE,
       system: await this.ctx.buildSystemPrompt('summary'),
       messages: [{ role: 'user', content: finalSummaryPrompt }],
+      abortSignal: this.ctx.abortSignal,
       ...(this.ctx.settings.disableThinking ? { enableThinking: false } : {}),
     });
 
@@ -274,6 +283,7 @@ CRITICAL RULES:
           collisions.push(entityResult.collision);
         }
       } catch (error) {
+        if (isAbortLike(error, this.ctx.abortSignal)) throw error;
         const reason = error instanceof Error ? error.message : String(error);
         console.error(`Conversation entity "${entity.name}" failed:`, error);
         failedItems.push({ type: 'entity', name: entity.name, reason });
@@ -295,6 +305,7 @@ CRITICAL RULES:
           collisions.push(conceptResult.collision);
         }
       } catch (error) {
+        if (isAbortLike(error, this.ctx.abortSignal)) throw error;
         const reason = error instanceof Error ? error.message : String(error);
         console.error(`Conversation concept "${concept.name}" failed:`, error);
         failedItems.push({ type: 'concept', name: concept.name, reason });
@@ -351,6 +362,7 @@ CRITICAL RULES:
       // English welcome. Caller falls back to parseJsonResponse on legacy
       // clients without createMessageWithOutput.
       response_format: { type: 'json_object' as const, schema: ConversationDedupStatusLLMSchema },
+      abortSignal: this.ctx.abortSignal,
       ...(this.ctx.settings.disableThinking ? { enableThinking: false } : {}),
     };
     const dedupText = await callLlm(client, dedupArgs);

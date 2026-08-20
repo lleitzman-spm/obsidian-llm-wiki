@@ -110,6 +110,8 @@ describe('WikiEngine.ingestSource — PDF cache-only branch (#PR2 redo)', () => 
     expect(last?.rejectedFiles?.[0]?.reason).toBe('unsupported-pdf');
     // No LLM calls downstream (provider gate rejected before LLM)
     expect(h.stats.llmCalls).toBe(0);
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
   });
 
   it('skips with reason=unsupported-pdf when converter throws EncryptedPdfError', async () => {
@@ -122,6 +124,24 @@ describe('WikiEngine.ingestSource — PDF cache-only branch (#PR2 redo)', () => 
     expect(wikiPagesWritten(h.writtenPaths)).toEqual([]);
     expect(h.reports.at(-1)?.skipped).toBe(true);
     expect(h.reports.at(-1)?.rejectedFiles?.[0]?.reason).toBe('unsupported-pdf');
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
+  });
+
+  it('skips cleanly when PDF conversion returns an empty body', async () => {
+    mockedConvert.mockResolvedValueOnce({
+      markdown: '',
+      metadata: { convertedAt: '2026-07-15T00:00:00Z', converter: 'anthropic/claude-opus-4-8' },
+    });
+
+    const h = createWikiEngineHarness();
+    await h.engine.ingestSource(pdfFile('sources/empty.pdf'));
+
+    expect(h.reports.at(-1)?.skipped).toBe(true);
+    expect(h.reports.at(-1)?.rejectedFiles?.[0]?.reason).toBe('empty');
+    expect(h.stats.llmCalls).toBe(0);
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
   });
 
   it('propagates LLM errors verbatim (preserves retry/log semantics)', async () => {
@@ -132,6 +152,8 @@ describe('WikiEngine.ingestSource — PDF cache-only branch (#PR2 redo)', () => 
     await expect(h.engine.ingestSource(pdfFile('sources/paper.pdf'))).rejects.toThrow(/LLM API timeout/);
     // No skip report — error was thrown, not reported
     expect(h.reports.at(-1)?.skipped).toBeFalsy();
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
   });
 
   it('does NOT write a sidecar file by default (cache-only architecture)', async () => {
@@ -479,6 +501,8 @@ describe('WikiEngine.ingestSource — PDF cache-only branch (#PR2 redo)', () => 
       await ingestPromise.catch(() => undefined);
       // After completion, isIngesting() flips back to false.
       expect(h.engine.isIngesting()).toBe(false);
+      expect(h.engine.wasCancelled).toBe(true);
+      expect(h.reports.at(-1)?.cancelled).toBe(true);
     });
   });
 

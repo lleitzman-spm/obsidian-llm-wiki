@@ -205,6 +205,7 @@ ${contradiction.source_page}
         'full'
       ),
       messages: [{ role: 'user', content: finalPrompt }],
+      abortSignal: this.ctx.abortSignal,
       ...(this.ctx.settings.disableThinking ? { enableThinking: false } : {}),
     });
 

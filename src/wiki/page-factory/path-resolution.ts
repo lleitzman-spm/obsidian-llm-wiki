@@ -108,6 +108,12 @@ export interface PathResolutionContext extends AliasesContext {
     createMessageWithOutput?: (...args: unknown[]) => Promise<{ text: string }>;
   } | null;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge' | 'index'): Promise<string>;
+  abortSignal?: AbortSignal;
+}
+
+function isAbortLike(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true
+    || (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError'));
 }
 
 /**
@@ -265,6 +271,7 @@ export async function resolvePagePath(
       // wire as Tier 0 json_schema — LMStudio accepts, no parse-error fallback
       // to slugPath.
       response_format: { type: 'json_object' as const, schema: PathResolutionLLMSchema },
+      abortSignal: ctx.abortSignal,
       ...(ctx.settings.disableThinking ? { enableThinking: false } : {}),
     };
     const response = await callLlm(client, resolveArgs);
@@ -304,6 +311,7 @@ export async function resolvePagePath(
       return { path: normalizedPath };
     }
   } catch (error) {
+    if (isAbortLike(error, ctx.abortSignal)) throw error;
     console.debug(`Entity resolution for "${name}" failed, using ${fallbackPath}:`, error);
   }
 

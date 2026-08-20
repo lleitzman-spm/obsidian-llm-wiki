@@ -31,6 +31,7 @@ export interface WikiEngineHarness {
   stats: { llmCalls: number; vaultMarkdownScans: number };
   /** Filenames delivered to `onIngestionStart` (status-bar text hooks). */
   startedFilenames: string[];
+  ingestionEnds: { count: number };
   /** Progress messages delivered to `onProgress` (PDF "Reading PDF: …"). */
   progressMessages: string[];
 }
@@ -39,6 +40,10 @@ export interface HarnessOptions {
   files?: Record<string, string>;
   llmResponses?: string[];
   settings?: Partial<LLMWikiSettings>;
+  readError?: Error;
+  onDoneError?: Error;
+  llmDelayMs?: number;
+  llmAbortAware?: boolean;
   /** Paths where getAbstractFileByPath returns null despite the file existing.
    *  Simulates macOS NFC/NFD normalization mismatch (Issue #173 Symptom A). */
   nfcNfdPaths?: string[];
@@ -65,7 +70,10 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
 
   const app = {
     vault: {
-      read: async (f: { path: string }) => files.get(f.path) ?? '',
+      read: async (f: { path: string }) => {
+        if (opts.readError) throw opts.readError;
+        return files.get(f.path) ?? '';
+      },
       create: async (p: string, c: string) => { files.set(p, c); },
       process: async (f: { path: string }, fn: (d: string) => string) => {
         files.set(f.path, fn(files.get(f.path) ?? ''));
@@ -108,6 +116,23 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
     createMessage: async params => {
       stats.llmCalls++;
       llmRequests.push(params);
+      if (opts.llmAbortAware && params.abortSignal) {
+        await new Promise<void>((resolve, reject) => {
+          const signal = params.abortSignal!;
+          const timer = setTimeout(resolve, opts.llmDelayMs ?? 5000);
+          const abort = () => {
+            clearTimeout(timer);
+            reject(new DOMException('Aborted', 'AbortError'));
+          };
+          if (signal.aborted) {
+            abort();
+            return;
+          }
+          signal.addEventListener('abort', abort, { once: true });
+        });
+      } else if (opts.llmDelayMs) {
+        await new Promise(resolve => setTimeout(resolve, opts.llmDelayMs));
+      }
       return opts.llmResponses?.[llmIdx++] ?? '{"entities":[],"concepts":[]}';
     },
   };
@@ -118,6 +143,7 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
   } as unknown as SchemaManager;
 
   const startedFilenames: string[] = [];
+  const ingestionEnds = { count: 0 };
   const progressMessages: string[] = [];
   const engine = new WikiEngine(
     app,
@@ -130,16 +156,19 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
     // conversion (pre-fix the status bar stayed frozen on the initial
     // placeholder).
     (msg: string) => { progressMessages.push(msg); },
-    (report: IngestReport) => { reports.push(report); }, // onDone
+    (report: IngestReport) => {
+      reports.push(report);
+      if (opts.onDoneError) throw opts.onDoneError;
+    }, // onDone
   );
   // Wire ingestion callbacks (onIngestionStart / onIngestionEnd). Tests
   // can read `startedFilenames` to assert the status bar text was set.
   engine.setIngestionCallbacks(
     (filename?: string) => { if (filename) startedFilenames.push(filename); },
-    () => { /* onEnd: nothing to capture */ },
+    () => { ingestionEnds.count++; },
   );
 
-  return { engine, llmRequests, writtenPaths, reports, files, stats, startedFilenames, progressMessages };
+  return { engine, llmRequests, writtenPaths, reports, files, stats, startedFilenames, ingestionEnds, progressMessages };
 }
 
 /** True if any written path is a wiki entity/concept/source page (the #164 symptom). */

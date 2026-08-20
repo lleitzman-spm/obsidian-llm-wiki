@@ -119,6 +119,7 @@ export async function runLintWiki(
     const findings: ProgrammaticFindings = runProgrammaticPhase(phaseCtx, {
       wikiFiles: prep.wikiFiles,
       pageMap: prep.pageMap,
+      sourceMap: prep.sourceMap,
       knownTargets: prep.knownTargets,
       knownTargetsLower: prep.knownTargetsLower,
       graph,

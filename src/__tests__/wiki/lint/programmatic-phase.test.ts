@@ -104,6 +104,25 @@ describe('runProgrammaticPhase', () => {
     expect(result.ungroundedQuotes).toHaveLength(1);
   });
 
+  it('grounds a quote against an explicitly resolved raw source note', async () => {
+    const ctx = makeContext();
+    const pageMap = makePageMap({
+      'wiki/entities/Foo.md': '## Mentions in Source\n- "verbatim source quote" - [[10 Sources/ingest-queue/source-note|source-note]]',
+    });
+    const sourceMap = makePageMap({
+      '10 Sources/ingest-queue/source-note.md': '# Source\n\nverbatim source quote',
+    });
+    const result = runProgrammaticPhase(ctx, {
+      wikiFiles: makeWikiFiles(['wiki/entities/Foo.md']),
+      pageMap,
+      sourceMap,
+      knownTargets: new Set(),
+      knownTargetsLower: new Set(),
+      graph: emptyGraph(),
+    });
+    expect(result.ungroundedQuotes).toEqual([]);
+  });
+
   it('initializes emptyPages as empty (populated later by LLM phase)', async () => {
     const ctx = makeContext();
     const pageMap = makePageMap({});

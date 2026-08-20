@@ -42,6 +42,10 @@ import { reportFinish } from './finish-reason';
 import { buildSamplingArgs } from './sampling-args';
 import { ReasoningStripProber } from './reasoning-strip-probe';
 
+function isAbortLike(error: unknown): error is Error {
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+}
+
 export interface OpenAISdkClientOptions {
   apiKey: string;
   baseURL?: string;
@@ -137,7 +141,7 @@ export class OpenAISdkClient implements LLMClient {
 
   async createMessage(params: LLMClient['createMessage'] extends (p: infer P) => unknown ? P : never): Promise<string> {
     // Type-safe params destructure (LLMClient.createMessage signature).
-    const { model, max_tokens, system, messages, temperature, top_p, repetition_penalty, seed, enableThinking, response_format, onFinish } = params;
+    const { model, max_tokens, system, messages, temperature, top_p, repetition_penalty, seed, enableThinking, response_format, abortSignal, onFinish } = params;
 
     try {
       const languageModel = this.getProvider(model, this.fetchImpl);
@@ -146,6 +150,7 @@ export class OpenAISdkClient implements LLMClient {
 
       const result = await generateText({
         model: languageModel,
+        abortSignal,
         ...(system ? { system } : {}),
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         maxOutputTokens: max_tokens,
@@ -174,6 +179,7 @@ export class OpenAISdkClient implements LLMClient {
       reportFinish(onFinish, result.finishReason, result.usage);
       return result.text;
     } catch (err) {
+      if (isAbortLike(err)) throw err;
       // v1.23.0 P1.5: URL fallback for custom baseURLs (Kimi / z.ai / GLM).
       // If user's baseURL is missing /v1, AI-SDK sends to wrong path and
       // gets 404. Try candidate URLs and cache the first working one.
@@ -189,6 +195,7 @@ export class OpenAISdkClient implements LLMClient {
         const { generateText } = await import('ai');
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -226,6 +233,7 @@ export class OpenAISdkClient implements LLMClient {
         const { generateText } = await import('ai');
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -372,8 +380,9 @@ export class OpenAISdkClient implements LLMClient {
     top_p?: number;
     repetition_penalty?: number;
     seed?: number;
+    abortSignal?: AbortSignal;
   }): Promise<string> {
-    const { model, max_tokens, system, messages, onChunk, temperature, top_p, repetition_penalty, seed, enableThinking } = params;
+    const { model, max_tokens, system, messages, onChunk, temperature, top_p, repetition_penalty, seed, enableThinking, abortSignal } = params;
 
     // v1.23.0 P1.5: same URL fallback as createMessage, so streaming
     // (Query Wiki) is consistent with non-streaming (Ingest / Lint).
@@ -388,6 +397,7 @@ export class OpenAISdkClient implements LLMClient {
       // them at completion, defeating streaming UX.
       const result = streamText({
         model: languageModel,
+        abortSignal,
         ...(system ? { system } : {}),
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         maxOutputTokens: max_tokens,
@@ -424,8 +434,9 @@ export class OpenAISdkClient implements LLMClient {
         } else if (Array.isArray(reasoning)) {
           reasoningContent = reasoning.map((r) => (r as { text?: string }).text || '').join('');
         }
-      } catch {
-        // No reasoning for this provider (most non-reasoning models) — ignore.
+      } catch (reasoningErr) {
+        if (isAbortLike(reasoningErr)) throw reasoningErr;
+        // No reasoning for this provider (most non-reasoning models) - ignore.
       }
 
       // Prepend reasoning as <think> block (only in returned string,
@@ -436,6 +447,7 @@ export class OpenAISdkClient implements LLMClient {
 
       return fullText;
     } catch (err) {
+      if (isAbortLike(err)) throw err;
       // v1.23.0 P1.5: URL fallback for streaming path (Query Wiki)
       // — same logic as createMessage. If 404 on wrong URL, resolve
       // to the correct baseURL via the module-level cache and retry.
@@ -451,6 +463,7 @@ export class OpenAISdkClient implements LLMClient {
 
         const result = streamText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -475,7 +488,10 @@ export class OpenAISdkClient implements LLMClient {
           } else if (Array.isArray(reasoning)) {
             reasoningContent = reasoning.map((r) => (r as { text?: string }).text || '').join('');
           }
-        } catch { /* no reasoning */ }
+        } catch (reasoningErr) {
+          if (isAbortLike(reasoningErr)) throw reasoningErr;
+          /* no reasoning */
+        }
         if (reasoningContent) {
           fullText = wrapReasoningContent(reasoningContent, fullText);
         }
@@ -501,6 +517,7 @@ export class OpenAISdkClient implements LLMClient {
         const { streamText } = await import('ai');
         const result = streamText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -523,7 +540,10 @@ export class OpenAISdkClient implements LLMClient {
           } else if (Array.isArray(reasoning)) {
             reasoningContent = reasoning.map((r) => (r as { text?: string }).text || '').join('');
           }
-        } catch { /* no reasoning */ }
+        } catch (reasoningErr) {
+          if (isAbortLike(reasoningErr)) throw reasoningErr;
+          /* no reasoning */
+        }
         // Bug-3: markStrip AFTER retry succeeds. If the stream throws,
         // the cache stays untouched and the outer catch propagates.
         this.reasoningStripProber.markStrip(this.baseURL);

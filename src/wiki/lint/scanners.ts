@@ -3,6 +3,7 @@
 
 import { parseFrontmatter } from '../../core/frontmatter';
 import { getActiveEntityTags, getActiveConceptTags, getActiveSourceTags } from '../../core/tag-vocab';
+import { computeSlug } from '../../core/slug';
 import { normalizeQuote, isQuoteGrounded } from './utils';
 import { LLMWikiSettings } from '../../types';
 
@@ -32,6 +33,92 @@ export function buildKnownTargets(allVaultFiles: Array<{ basename: string; path:
     }
   }
   return { known, knownLower };
+}
+
+interface AliasTargetIndex {
+  exact: Map<string, Set<string>>;
+  slug: Map<string, Set<string>>;
+}
+
+/**
+ * Build the alias index used by the programmatic dead-link scanner.
+ *
+ * `buildKnownTargets` deliberately indexes filesystem names only. Generated
+ * pages, however, commonly emit a typed path whose basename is an alias
+ * (e.g. `[[entities/spm]]` for the page whose filename is
+ * `strategic-property-management.md`). Obsidian's resolver can answer that
+ * name from frontmatter, so treating it as dead is a scanner false positive.
+ *
+ * The index stores page paths rather than a single winner. This is important:
+ * two pages may claim the same alias, and lint must fail closed instead of
+ * choosing whichever page happened to be iterated first.
+ */
+function buildAliasTargetIndex(pageMap: Map<string, ScannerPage>): AliasTargetIndex {
+  const index: AliasTargetIndex = { exact: new Map(), slug: new Map() };
+
+  const add = (map: Map<string, Set<string>>, key: string, path: string): void => {
+    if (!key) return;
+    const paths = map.get(key) ?? new Set<string>();
+    paths.add(path);
+    map.set(key, paths);
+  };
+
+  for (const [path, page] of pageMap) {
+    const aliases = parseFrontmatter(page.content)?.aliases;
+    if (!Array.isArray(aliases)) continue;
+    for (const alias of aliases) {
+      if (typeof alias !== 'string') continue;
+      const trimmed = alias.trim();
+      if (!trimmed) continue;
+      add(index.exact, trimmed.toLowerCase(), path);
+      const slug = computeSlug(trimmed);
+      if (slug) add(index.slug, slug, path);
+    }
+  }
+
+  return index;
+}
+
+/**
+ * Return true only when a dead-link target has one unambiguous alias owner.
+ * Canonical path matching remains the caller's first choice; this helper is
+ * consulted only after exact and slugged filesystem forms failed.
+ */
+function hasUniqueAliasTarget(
+  target: string,
+  wikiFolder: string,
+  index: AliasTargetIndex,
+): boolean {
+  const withoutExtension = target.replace(/\.md$/i, '');
+  const parts = withoutExtension.split('/');
+  const prefix = parts.length > 1 ? parts[0] : undefined;
+  const aliasKey = parts[parts.length - 1].trim().toLowerCase();
+  if (!aliasKey) return false;
+
+  // A folder-qualified target is allowed to resolve through an alias only
+  // within that typed folder. Sources are excluded: source links are identity
+  // links and aliasing them would mask a missing provenance page.
+  if (prefix === 'sources' || prefix === 'source') return false;
+  const expectedFolder = prefix === 'entities' || prefix === 'entity'
+    ? `${wikiFolder}/entities/`
+    : prefix === 'concepts' || prefix === 'concept'
+      ? `${wikiFolder}/concepts/`
+      : undefined;
+
+  const filterToFolder = (paths: Set<string>): Set<string> => {
+    if (!expectedFolder) return paths;
+    return new Set([...paths].filter(path => path.startsWith(expectedFolder)));
+  };
+
+  // Exact alias ownership takes precedence over slug-normalized ownership,
+  // matching the resolver's exact-before-slug contract. Any collision is
+  // intentionally unresolved.
+  const exactPaths = filterToFolder(index.exact.get(aliasKey) ?? new Set());
+  if (exactPaths.size > 0) return exactPaths.size === 1;
+
+  const slug = computeSlug(aliasKey);
+  const slugPaths = filterToFolder(index.slug.get(slug) ?? new Set());
+  return slugPaths.size === 1;
 }
 
 // Detect pages with missing aliases (entities & concepts only).
@@ -123,6 +210,7 @@ export function scanDeadLinks(
   wikiFolder: string
 ): Array<{ source: string; target: string }> {
   const deadLinks: Array<{ source: string; target: string }> = [];
+  const aliasIndex = buildAliasTargetIndex(pageMap);
   // Per-(source,target) dedup so a page referencing the same missing target
   // 4 times shows up as 1 entry, not 4. Diff against (source, target) across
   // pages intentionally stays (different source pages should each list the
@@ -142,7 +230,8 @@ export function scanDeadLinks(
         const isSlugMatch =
           sluggedTarget !== target &&
           (knownTargets.has(sluggedTarget) || knownTargetsLower.has(sluggedTarget.toLowerCase()));
-        if (!isSlugMatch) {
+        const isAliasMatch = !isSlugMatch && hasUniqueAliasTarget(target, wikiFolder, aliasIndex);
+        if (!isSlugMatch && !isAliasMatch) {
           const source = path.replace(wikiFolder + '/', '').replace('.md', '');
           const key = `${source}::${target}`;
           if (!seen.has(key)) {
@@ -258,10 +347,16 @@ export function scanQuoteGrounding(
   // Avoids re-stripping frontmatter per quote and re-normalizing per source per quote.
   const sourceBodyMap = new Map<string, string>();
   const normalizedSourceBodies: string[] = [];
+  const wikiSourcePrefix = `${wikiFolder}/sources/`.toLowerCase();
   for (const [p, s] of sourceMap) {
     const body = extractSourceBody(s.content);
     sourceBodyMap.set(p, body);
-    normalizedSourceBodies.push(normalizeQuote(body));
+    // Raw linked notes are valid for an explicitly linked quote, but must not
+    // widen the legacy bare-quote fallback. That fallback predates raw-note
+    // provenance and is intentionally limited to generated wiki sources.
+    if (p.toLowerCase().startsWith(wikiSourcePrefix)) {
+      normalizedSourceBodies.push(normalizeQuote(body));
+    }
   }
 
   for (const [path, page] of pageMap) {

@@ -40,6 +40,10 @@ import { wrapReasoningContent } from '../core/markdown';
 // extractProviderMessage handles both via the same nested lookup.
 export { mapAiSdkError };
 
+function isAbortLike(error: unknown): error is Error {
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+}
+
 /**
  * Issue #449 v1.26.4 PATCH follow-up (DocTpoint blocking review 2026-08-15):
  * `cacheBreakpoint` is a byte offset into the FIRST user message's text
@@ -158,7 +162,7 @@ export class AnthropicSdkClient implements LLMClient {
   }
 
   async createMessage(params: LLMClient['createMessage'] extends (p: infer P) => unknown ? P : never): Promise<string> {
-    const { model, max_tokens, system, messages, temperature, top_p, repetition_penalty, enableThinking, cacheBreakpoint, onFinish } = params;
+    const { model, max_tokens, system, messages, temperature, top_p, repetition_penalty, enableThinking, cacheBreakpoint, abortSignal, onFinish } = params;
 
     // Issue #449 v1.26.4 PATCH follow-up: when cacheBreakpoint is defined,
     // split the FIRST user message's text content at the offset and attach
@@ -173,6 +177,7 @@ export class AnthropicSdkClient implements LLMClient {
 
       const result = await generateText({
         model: languageModel,
+        abortSignal,
         // Anthropic accepts system at top-level; AI-SDK abstracts this.
         // Truthy-check drops `system: ''` so it cannot consume one of
         // Anthropic's 4 cache breakpoints (Issue #449 Branch D fix).
@@ -188,6 +193,7 @@ export class AnthropicSdkClient implements LLMClient {
       reportFinish(onFinish, result.finishReason);
       return result.text;
     } catch (err) {
+      if (isAbortLike(err)) throw err;
       // v1.23.0 P1.5: URL fallback for custom baseURLs (Kimi / z.ai / GLM).
       // If the user's baseURL is missing /v1, AI-SDK sends to a wrong
       // path and gets 404. Try candidate URLs and cache the first
@@ -205,6 +211,7 @@ export class AnthropicSdkClient implements LLMClient {
         const { generateText } = await import('ai');
         const result = await generateText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messagesWithCacheControl,
           maxOutputTokens: max_tokens,
@@ -266,8 +273,9 @@ export class AnthropicSdkClient implements LLMClient {
     // Anthropic is not repeatable no matter what the setting says — see the
     // note on `samplingSeed` in types.ts.
     repetition_penalty?: number;
+    abortSignal?: AbortSignal;
   }): Promise<string> {
-    const { model, max_tokens, system, messages, onChunk, temperature, top_p, repetition_penalty, enableThinking } = params;
+    const { model, max_tokens, system, messages, onChunk, temperature, top_p, repetition_penalty, enableThinking, abortSignal } = params;
 
     // v1.23.0 P1.5: same URL fallback as createMessage, so streaming
     // (Query Wiki) is consistent with non-streaming (Ingest / Lint /
@@ -279,6 +287,7 @@ export class AnthropicSdkClient implements LLMClient {
 
       const result = streamText({
         model: languageModel,
+        abortSignal,
         ...(system ? { system } : {}),
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         maxOutputTokens: max_tokens,
@@ -307,15 +316,17 @@ export class AnthropicSdkClient implements LLMClient {
       let reasoningContent = '';
       try {
         reasoningContent = extractReasoningText(await result.reasoning);
-      } catch {
-        // No reasoning for this model — ignore.
+      } catch (reasoningErr) {
+        if (isAbortLike(reasoningErr)) throw reasoningErr;
+        // No reasoning for this model - ignore.
       }
       if (reasoningContent) {
         fullText = wrapReasoningContent(reasoningContent, fullText);
       }
       return fullText;
     } catch (err) {
-      // URL fallback for streaming — same logic as createMessage.
+      if (isAbortLike(err)) throw err;
+      // URL fallback for streaming - same logic as createMessage.
       if (isUrlError(err) && this.baseURL) {
         const mappedErr = mapAiSdkError(err);
         const resolved = await resolveBaseUrlWithFallback({
@@ -328,6 +339,7 @@ export class AnthropicSdkClient implements LLMClient {
 
         const result = streamText({
           model: retryLanguageModel,
+          abortSignal,
           ...(system ? { system } : {}),
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           maxOutputTokens: max_tokens,
@@ -346,7 +358,10 @@ export class AnthropicSdkClient implements LLMClient {
         let reasoningContent = '';
         try {
           reasoningContent = extractReasoningText(await result.reasoning);
-        } catch { /* no reasoning */ }
+        } catch (reasoningErr) {
+          if (isAbortLike(reasoningErr)) throw reasoningErr;
+          /* no reasoning */
+        }
         if (reasoningContent) {
           fullText = wrapReasoningContent(reasoningContent, fullText);
         }

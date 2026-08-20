@@ -156,7 +156,7 @@ export class SourceAnalyzer {
    * Returns null on blank content (defense-in-depth; the pre-ingest gate
    * normally rejects blank sources first).
    */
-  async analyzeSource(file: TFile, opts?: { contentOverride?: string }): Promise<SourceAnalysis | null> {
+  async analyzeSource(file: TFile, opts?: { contentOverride?: string; abortSignal?: AbortSignal }): Promise<SourceAnalysis | null> {
     console.debug('=== Source analysis started ===');
     console.debug('File:', file.path);
     if (opts?.contentOverride !== undefined) {
@@ -164,6 +164,7 @@ export class SourceAnalyzer {
     }
 
     const content = opts?.contentOverride ?? await this.ctx.app.vault.read(file);
+    const abortSignal = opts?.abortSignal ?? this.ctx.abortSignal;
     console.debug('File content length:', content.length);
 
     // #164 defense-in-depth: a blank source (empty / whitespace / frontmatter-only)
@@ -384,6 +385,7 @@ export class SourceAnalyzer {
           response_format: { type: 'json_object' as const, schema: SourceAnalysisLLMSchema },
           cacheBreakpoint: staticPrefix.length,
           maxTokensPerCall: retryCap,
+          abortSignal,
           // Extraction never mentioned the thinking setting, so whatever the
           // server had been started with decided it and the setting meant
           // nothing here. Not the only such call site — the lint alias and tag
@@ -447,6 +449,7 @@ export class SourceAnalyzer {
               messages: [{ role: 'user' as const, content: repairPrompt }],
               response_format: { type: 'json_object' as const, schema: SourceAnalysisLLMSchema },
               maxTokensPerCall: retryCap,
+              abortSignal,
               // v1.26.0 Batch 7 follow-up (DocTpoint measurement, PR #411
               // review 2026-08-05 05:38 UTC): eucher's finding that the
               // repair callback did not propagate `disableThinking` is
@@ -620,6 +623,7 @@ export class SourceAnalyzer {
 
       } catch (error) {
         console.error(`[Batch ${batchNum + 1}] Call failed:`, error);
+        if (this.ctx.abortSignal?.aborted) throw error;
         if (isFirstBatch) {
           const providerName = this.ctx.settings.provider;
           const modelName = this.ctx.settings.model;
@@ -860,6 +864,7 @@ Respond with this JSON object and nothing else: {"kind": "entity"} or {"kind": "
         messages: [{ role: 'user' as const, content: prompt }],
         response_format: { type: 'json_object' as const, schema: LemmaClassifyLLMSchema },
         ...(this.ctx.settings.disableThinking ? { enableThinking: false } : {}),
+        abortSignal: this.ctx.abortSignal,
       };
       const response = await callLlm(client, lemmaArgs);
       const parsed = (await parseJsonResponse(response, undefined, { silentOnEmpty: true })) as { kind?: unknown } | null;
@@ -868,6 +873,7 @@ Respond with this JSON object and nothing else: {"kind": "entity"} or {"kind": "
       console.debug(`[Lemma guarantee] unusable type answer: ${JSON.stringify(parsed)}`);
       return null;
     } catch (err) {
+      if (this.ctx.abortSignal?.aborted) throw err;
       console.warn('[Lemma guarantee] type classification call failed:', err);
       return null;
     }

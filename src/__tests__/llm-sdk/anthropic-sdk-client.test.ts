@@ -82,6 +82,31 @@ describe('AnthropicSdkClient', () => {
       expect(text).toBe('hello from claude');
     });
 
+    it('forwards abortSignal to generateText', async () => {
+      const controller = new AbortController();
+      const client = new AnthropicSdkClient({ apiKey: 'sk-ant-test' });
+      await client.createMessage({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        abortSignal: controller.signal,
+      });
+      expect((mockGenerateText.mock.calls[0][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+    });
+
+    it('propagates timeout without retrying', async () => {
+      const timeoutError = new DOMException('timed out', 'TimeoutError');
+      mockGenerateText.mockReset();
+      mockGenerateText.mockRejectedValueOnce(timeoutError);
+      const client = new AnthropicSdkClient({ apiKey: 'sk-ant-test' });
+      await expect(client.createMessage({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      })).rejects.toBe(timeoutError);
+      expect(mockGenerateText).toHaveBeenCalledOnce();
+    });
+
     it('forwards model + max_tokens', async () => {
       const client = new AnthropicSdkClient({ apiKey: 'sk-ant-test' });
       await client.createMessage({
@@ -522,6 +547,33 @@ describe('AnthropicSdkClient', () => {
 
     beforeEach(() => {
       mockStreamText.mockReset();
+    });
+
+    it('forwards abortSignal to streamText', async () => {
+      mockStreamText.mockReturnValue(makeStreamResult(['ok']));
+      const controller = new AbortController();
+      const client = new AnthropicSdkClient({ apiKey: 'sk-ant-test' });
+      await client.createMessageStream!({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        onChunk: vi.fn(),
+        abortSignal: controller.signal,
+      });
+      expect((mockStreamText.mock.calls[0][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+    });
+
+    it('propagates stream timeout without URL fallback', async () => {
+      const timeoutError = new DOMException('timed out', 'TimeoutError');
+      mockStreamText.mockImplementation(() => { throw timeoutError; });
+      const client = new AnthropicSdkClient({ apiKey: 'sk-ant-test' });
+      await expect(client.createMessageStream!({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        onChunk: vi.fn(),
+      })).rejects.toBe(timeoutError);
+      expect(mockStreamText).toHaveBeenCalledOnce();
     });
 
     it('calls onChunk with each text delta', async () => {

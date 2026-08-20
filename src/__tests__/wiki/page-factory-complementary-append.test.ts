@@ -454,6 +454,7 @@ describe('mergePage — complementary strategy dispatch', () => {
   function setupComplementary(opts: {
     classifyResponse: string;
     appendResponse: string;
+    appendError?: Error;
   }) {
     const calls: Array<{ messages: Array<{ content: string | MessageContentPart[] }> }> = [];
     const { ctx } = createMockContext({ vaultFiles: {}, llmResponses: [] });
@@ -463,13 +464,14 @@ describe('mergePage — complementary strategy dispatch', () => {
           calls.push(params);
           const isClassify = params.response_format?.type === 'json_object';
           if (isClassify) return opts.classifyResponse;
+          if (opts.appendError) throw opts.appendError;
           return opts.appendResponse;
         },
       };
       return client;
     };
     const factory = new PageFactory(ctx);
-    return { factory, calls };
+    return { factory, calls, ctx };
   }
 
   it('strategy=complementary → NO body-merge call (only classify + per-section append)', async () => {
@@ -517,6 +519,35 @@ describe('mergePage — complementary strategy dispatch', () => {
     );
     // 1 classify + 1 body-merge = 2 calls.
     expect(calls).toHaveLength(2);
+  });
+  it('rethrows complementary cancellation without falling through to full merge or write', async () => {
+    const abort = new Error('provider cancelled');
+    abort.name = 'AbortError';
+    const { factory, calls, ctx } = setupComplementary({
+      classifyResponse: JSON.stringify({
+        strategy: 'complementary',
+        items: [{ kind: 'complementary', content: 'new fact', target_section: 'Description' }],
+        reason: 'adds detail',
+      }),
+      appendResponse: 'unused',
+      appendError: abort,
+    });
+    const controller = new AbortController();
+    ctx.abortSignal = controller.signal;
+    const before = ctx.app.vault.getMarkdownFiles().length;
+
+    await expect((factory as unknown as HelperAccess).mergePage(
+      entityForMerge(),
+      'entity',
+      createMockFile('src.md'),
+      '## Description\nOriginal\n',
+      [],
+      'wiki/entities/microbiome.md',
+    )).rejects.toMatchObject({ name: 'AbortError' });
+
+    // classify + per-section append only; no body-merge call and no write.
+    expect(calls).toHaveLength(2);
+    expect(ctx.app.vault.getMarkdownFiles().length).toBe(before);
   });
 });
 // suppress vi unused import warning if any

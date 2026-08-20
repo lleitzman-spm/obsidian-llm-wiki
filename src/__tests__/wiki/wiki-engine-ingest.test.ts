@@ -54,6 +54,8 @@ describe('WikiEngine.ingestSource — empty source (#164)', () => {
     expect(last?.skipped).toBe(true);
     expect(last?.createdPages).toEqual([]);
     expect(h.stats.llmCalls).toBe(0);
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
   });
 });
 
@@ -66,6 +68,8 @@ describe('WikiEngine.ingestSource — requirements gate (#164)', () => {
     expect(h.reports.at(-1)?.rejectedFiles?.[0]?.reason).toBe('incompatible-type');
     expect(wikiPagesWritten(h.writtenPaths)).toEqual([]);
     expect(h.stats.llmCalls).toBe(0);
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
   });
 
   it('skips a file whose content already exists in the wiki (cross-session dedup)', async () => {
@@ -81,6 +85,97 @@ describe('WikiEngine.ingestSource — requirements gate (#164)', () => {
     expect(h.reports.at(-1)?.rejectedFiles?.[0]?.reason).toBe('duplicate');
     expect(wikiPagesWritten(h.writtenPaths)).toEqual([]);
     expect(h.stats.llmCalls).toBe(0);
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
+  });
+
+  it('releases ingest state when the vault read fails during preflight', async () => {
+    const h = createWikiEngineHarness({ readError: new Error('vault read failed') });
+
+    await expect(h.engine.ingestSource(sourceFile('sources/read-fails.md')))
+      .rejects.toThrow('vault read failed');
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
+  });
+
+  it('releases ingest state when duplicate confirmation rejects', async () => {
+    const dupBody = 'duplicate confirmation body';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/existing.md': `---\ntype: source\ncontentHash: ${hashBody(dupBody)}\n---\n\nexisting`,
+        'sources/copy.md': dupBody,
+      },
+    });
+    h.engine.onConfirmReingest = async () => { throw new Error('confirmation failed'); };
+
+    await expect(h.engine.ingestSource(sourceFile('sources/copy.md'), { interactive: true }))
+      .rejects.toThrow('confirmation failed');
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
+  });
+
+  it('releases ingest state when the skip completion callback throws', async () => {
+    const h = createWikiEngineHarness({
+      files: { 'sources/empty.md': '' },
+      onDoneError: new Error('completion callback failed'),
+    });
+
+    await expect(h.engine.ingestSource(sourceFile())).rejects.toThrow('completion callback failed');
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
+  });
+
+  it('rejects a concurrent ingest start without sharing the active controller', async () => {
+    const h = createWikiEngineHarness({
+      files: {
+        'sources/first.md': 'first source body',
+        'sources/second.md': 'second source body',
+      },
+      llmDelayMs: 25,
+      llmResponses: [JSON.stringify({ source_title: 'First', summary: 'summary', entities: [], concepts: [] })],
+    });
+
+    const first = h.engine.ingestSource(sourceFile('sources/first.md'));
+    expect(h.engine.isIngesting()).toBe(true);
+    await expect(h.engine.ingestSource(sourceFile('sources/second.md')))
+      .rejects.toThrow('Ingestion already in progress');
+    await first;
+    expect(h.engine.isIngesting()).toBe(false);
+  });
+
+  it('forwards cancellation to the active analysis call and stops promptly', async () => {
+    const h = createWikiEngineHarness({
+      files: { 'sources/slow.md': 'slow source body' },
+      llmAbortAware: true,
+      llmDelayMs: 5000,
+      llmResponses: [JSON.stringify({ source_title: 'Slow', summary: 'summary', entities: [], concepts: [] })],
+    });
+
+    const ingestPromise = h.engine.ingestSource(sourceFile('sources/slow.md'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(h.llmRequests[0]?.abortSignal).toBeDefined();
+    h.engine.cancelIngestion();
+
+    const completedPromptly = await Promise.race([
+      ingestPromise.then(() => true),
+      new Promise<boolean>(resolve => setTimeout(() => resolve(false), 250)),
+    ]);
+    expect(completedPromptly).toBe(true);
+    expect(h.engine.wasCancelled).toBe(true);
+    expect(h.reports.at(-1)?.cancelled).toBe(true);
+    expect(h.engine.isIngesting()).toBe(false);
+  });
+
+  it('releases ingest state when the start-status callback throws', async () => {
+    const h = createWikiEngineHarness({ files: { 'sources/start.md': 'body' } });
+    h.engine.setIngestionCallbacks(() => { throw new Error('status start failed'); }, () => {
+      h.ingestionEnds.count++;
+    });
+
+    await expect(h.engine.ingestSource(sourceFile('sources/start.md')))
+      .rejects.toThrow('status start failed');
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.ingestionEnds.count).toBe(1);
   });
 
   it('flags a second identical file in the same batch as a duplicate', async () => {

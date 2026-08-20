@@ -31,6 +31,16 @@ const SUMMARY_RESPONSE = JSON.stringify({
   body: '## Summary\n\nA lecture.',
 });
 
+const MODEL_RESPONSE_WITH_ENTITY_TAG = `---
+type: source
+tags: [document]
+---
+
+## Summary
+
+A governed operating article.
+`;
+
 function makeAnalysis(): SourceAnalysis {
   return {
     source_file: SOURCE_NOTE_PATH,
@@ -123,5 +133,28 @@ Existing summary.
     await h.engine.createSummaryPage(sourceFile(), makeAnalysis(), []);
 
     expect(tagsInPrompt(h)).toBe('paper');
+  });
+
+  it('stamps governed operating articles as article even when the model emits an entity tag', async () => {
+    // Replace the queued response with the intentionally invalid model output.
+    const governed = createWikiEngineHarness({
+      files: {
+        [SOURCE_NOTE_PATH]: `---
+origin_type: spm-repository-governed-operating-article
+tags: [document]
+---
+
+An operating article.
+`,
+      },
+      llmResponses: [MODEL_RESPONSE_WITH_ENTITY_TAG],
+    });
+
+    await governed.engine.createSummaryPage(sourceFile(), makeAnalysis(), []);
+
+    const generated = governed.files.get('wiki/sources/lecture-transcript.md') ?? '';
+    expect(generated).toMatch(/^tags:\n  - "article"$/m);
+    expect(generated).not.toMatch(/document/);
+    expect(tagsInPrompt(governed)).toBe('article');
   });
 });

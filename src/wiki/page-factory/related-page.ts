@@ -129,9 +129,10 @@ export async function updateRelatedPage(
     task: 'related-page',
     model: resolveModelForTask(ctx.settings, 'ingest'),
     max_tokens: TOKENS_PAGE_GENERATION,
-    system: await ctx.buildSystemPrompt('related'),
-    messages: [{ role: 'user', content: prompt }],
-    ...(ctx.settings.disableThinking ? { enableThinking: false } : {}),
+      system: await ctx.buildSystemPrompt('related'),
+      messages: [{ role: 'user', content: prompt }],
+      abortSignal: ctx.abortSignal,
+      ...(ctx.settings.disableThinking ? { enableThinking: false } : {}),
   });
 
   const cleanedBody = cleanMarkdownResponse(updatedBody);

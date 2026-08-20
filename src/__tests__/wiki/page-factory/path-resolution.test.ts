@@ -295,6 +295,29 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     const result = await resolvePagePath(ctx, 'WillRetry', 'entity', 'desc');
     expect(result.path).toBe('wiki/entities/WillRetry.md');
   });
+
+  it('forwards the active signal and rethrows abort/timeout errors', async () => {
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const ctx = makeCtx({
+      mockVault: {
+        getMarkdownFiles: () => [{ path: 'wiki/entities/Other.md', basename: 'Other' }],
+      },
+      client: {
+        createMessage: async (args: unknown) => {
+          receivedSignal = (args as { abortSignal?: AbortSignal }).abortSignal;
+          const error = new Error('provider timed out');
+          error.name = 'TimeoutError';
+          throw error;
+        },
+      },
+    });
+    ctx.abortSignal = controller.signal;
+
+    await expect(resolvePagePath(ctx, 'TimedOut', 'entity', 'desc'))
+      .rejects.toMatchObject({ name: 'TimeoutError' });
+    expect(receivedSignal).toBe(controller.signal);
+  });
 });
 
 describe('resolvePagePath — collision shape (cross-type)', () => {

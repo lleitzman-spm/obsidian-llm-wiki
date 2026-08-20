@@ -152,7 +152,7 @@ describe('ConversationIngestor — typed-output migration (#443 expanded scope)'
 // Migrating it eliminates the silent-success + parse-failure corner where
 // dedupStatus returns 'entirely_new' (fallback) instead of the model's
 // actual verdict on cloud cohort.
-describe('ConversationIngestor.checkDedup — typed-output migration', () => {
+describe('ConversationIngestor.checkDedup - typed-output migration', () => {
   it('passes ConversationDedupStatusLLMSchema on the wire (legacy client)', async () => {
     const spy = vi.fn(async (_params: unknown) => '{"status":"entirely_new"}');
     const client = { createMessage: spy };
@@ -218,5 +218,64 @@ describe('ConversationIngestor.checkDedup — typed-output migration', () => {
     }
 
     expect(legacySpy).toHaveBeenCalled();
+  });
+
+  it('forwards the active signal to dedup, extraction, repair, and summary calls', async () => {
+    const controller = new AbortController();
+    const calls: Array<{ task?: string; abortSignal?: AbortSignal }> = [];
+    const validAnalysis = JSON.stringify({
+      source_title: 'A conversation',
+      summary: 'Conversation about X.',
+      entities: [],
+      concepts: [],
+    });
+    const client = {
+      createMessage: vi.fn(async (params: { task?: string; abortSignal?: AbortSignal }) => {
+        calls.push(params);
+        if (params.task === 'conversation-save-dedup') return '{"status":"entirely_new"}';
+        if (params.task === 'conversation-extract') return '{"source_title":"broken","summary":}';
+        if (params.task === 'conversation-extract-retry') return validAnalysis;
+        return '# Summary';
+      }),
+    };
+    const { ctx, orch, pageFactory } = makeContextStub(client, {
+      indexMd: '# Existing Wiki\n',
+    });
+    (ctx as { abortSignal?: AbortSignal }).abortSignal = controller.signal;
+
+    const ingestor = new ConversationIngestor(ctx, pageFactory, orch);
+    try {
+      await ingestor.ingestConversation({
+        messages: [{ role: 'user', content: 'A conversation', timestamp: Date.now() }],
+      });
+    } catch {
+      // The minimal context intentionally omits vault-write collaborators;
+      // all signal-bearing calls occur before that downstream boundary.
+    }
+
+    expect(calls.map(call => call.task)).toEqual([
+      'conversation-save-dedup',
+      'conversation-extract',
+      'conversation-extract-retry',
+      'conversation-page',
+    ]);
+    expect(calls.every(call => call.abortSignal === controller.signal)).toBe(true);
+  });
+
+  it('does not swallow an abort from the conversation dedup call', async () => {
+    const controller = new AbortController();
+    const abort = new DOMException('Aborted', 'AbortError');
+    const client = {
+      createMessage: vi.fn(async () => { throw abort; }),
+    };
+    const { ctx, orch, pageFactory } = makeContextStub(client, {
+      indexMd: '# Existing Wiki\n',
+    });
+    (ctx as { abortSignal?: AbortSignal }).abortSignal = controller.signal;
+
+    const ingestor = new ConversationIngestor(ctx, pageFactory, orch);
+    await expect(ingestor.ingestConversation({
+      messages: [{ role: 'user', content: 'A conversation', timestamp: Date.now() }],
+    })).rejects.toMatchObject({ name: 'AbortError' });
   });
 });

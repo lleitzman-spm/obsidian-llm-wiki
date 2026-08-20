@@ -7,6 +7,8 @@ import { LintPhaseContext, ProgrammaticFindings, ScannerPage } from '../types';
 export interface ProgrammaticInput {
   wikiFiles: Array<{ path: string; basename: string }>;
   pageMap: Map<string, ScannerPage>;
+  /** Wiki sources plus raw source notes resolved during preparation. */
+  sourceMap?: Map<string, ScannerPage>;
   knownTargets: Set<string>;
   knownTargetsLower: Set<string>;
   /** v1.23.0 P1-6 — wiki-link graph for hub detection and PPR. */
@@ -67,12 +69,9 @@ export function runProgrammaticPhase(
   );
 
   // 6. Quote grounding (Issue #126) — reuses already-read source pages.
-  const sourceMap = new Map<string, ScannerPage>();
-  for (const [path, page] of input.pageMap) {
-    if (path.includes('/sources/')) {
-      sourceMap.set(path, page);
-    }
-  }
+  const sourceMap = input.sourceMap ?? new Map(
+    [...input.pageMap].filter(([path]) => path.includes('/sources/'))
+  );
   const ungroundedQuotes = scanQuoteGrounding(input.pageMap, sourceMap, ctx.settings.wikiFolder);
   console.debug(`lintWiki: ${ungroundedQuotes.length} ungrounded quote(s)`);
 

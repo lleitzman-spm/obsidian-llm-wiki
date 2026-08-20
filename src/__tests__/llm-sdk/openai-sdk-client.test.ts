@@ -99,6 +99,31 @@ describe('OpenAISdkClient', () => {
       expect(text).toBe('hello from openai');
     });
 
+    it('forwards abortSignal to generateText', async () => {
+      const controller = new AbortController();
+      const client = new OpenAISdkClient({ apiKey: 'sk-test', baseURL: 'https://api.openai.com/v1' });
+      await client.createMessage({
+        model: 'gpt-4.1',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        abortSignal: controller.signal,
+      });
+      expect((mockGenerateText.mock.calls[0][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+    });
+
+    it('propagates timeout without retrying', async () => {
+      const timeoutError = new DOMException('timed out', 'TimeoutError');
+      mockGenerateText.mockReset();
+      mockGenerateText.mockRejectedValueOnce(timeoutError);
+      const client = new OpenAISdkClient({ apiKey: 'sk-test', baseURL: 'https://api.openai.com/v1' });
+      await expect(client.createMessage({
+        model: 'gpt-4.1',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      })).rejects.toBe(timeoutError);
+      expect(mockGenerateText).toHaveBeenCalledOnce();
+    });
+
     it('forwards model + max_tokens to AI-SDK', async () => {
       const client = new OpenAISdkClient({ apiKey: 'sk-test', baseURL: 'https://api.openai.com/v1' });
       await client.createMessage({
@@ -420,6 +445,33 @@ describe('OpenAISdkClient', () => {
 
     beforeEach(() => {
       mockStreamText.mockReset();
+    });
+
+    it('forwards abortSignal to streamText', async () => {
+      mockStreamText.mockReturnValue(makeStreamTextResult(['ok']));
+      const controller = new AbortController();
+      const client = new OpenAISdkClient({ apiKey: 'sk-test', baseURL: 'https://api.openai.com/v1' });
+      await client.createMessageStream!({
+        model: 'gpt-4.1',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        onChunk: vi.fn(),
+        abortSignal: controller.signal,
+      });
+      expect((mockStreamText.mock.calls[0][0] as { abortSignal?: AbortSignal }).abortSignal).toBe(controller.signal);
+    });
+
+    it('propagates stream timeout without URL fallback', async () => {
+      const timeoutError = new DOMException('timed out', 'TimeoutError');
+      mockStreamText.mockImplementation(() => { throw timeoutError; });
+      const client = new OpenAISdkClient({ apiKey: 'sk-test', baseURL: 'https://api.openai.com/v1' });
+      await expect(client.createMessageStream!({
+        model: 'gpt-4.1',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        onChunk: vi.fn(),
+      })).rejects.toBe(timeoutError);
+      expect(mockStreamText).toHaveBeenCalledOnce();
     });
 
     it('calls onChunk with each text delta in order', async () => {
