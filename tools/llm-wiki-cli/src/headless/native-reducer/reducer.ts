@@ -805,15 +805,16 @@ function candidateForGroup(
   if (!sourceForRendering) throw new NativeReductionError(`group has no source: ${group.key.keyString}`);
   let content = '';
   if (existing) {
-    // Only the native frontmatter-only merge is deterministic. Preserve the
-    // existing bytes for every LLM-owned, reviewed, or shared-page case.
+    // Only native frontmatter-only merges are deterministic. Fold eligible
+    // shared pages in canonical source order; preserve existing bytes for
+    // every LLM-owned or reviewed case.
     const existingAliasKeys = new Set((existingMeta?.aliases ?? []).map(normalizeLabel));
     const existingTagKeys = new Set((existingMeta?.tags ?? []).map(normalizeLabel));
     const incomingAliases = aliases.filter(alias => !existingAliasKeys.has(normalizeLabel(alias)));
     const incomingTags = tags.filter(tag => !existingTagKeys.has(normalizeLabel(tag)));
     const existingFile = existingFileContent(options.existingFiles, path);
     const mergeEligible = !reviewed
-      && sourceIds.length === 1
+      && sourceIds.length > 0
       && bodyParts.length === 0
       && summaries.length === 0
       && statements.length === 0
@@ -826,7 +827,6 @@ function candidateForGroup(
       && incomingAliases.length === 0
       && incomingTags.length === 0
       && (existingFile === undefined || existingFile === existing.content);
-    if (sourceIds.length > 1) localReasons.push(`native-merge:shared-page-sequence-required:${path}`);
     if (reviewed) localReasons.push(`native-merge:reviewed-page:${path}`);
     if (bodyParts.length > 0 || summaries.length > 0 || statements.length > 0 || qualifications.length > 0 || evidence.length > 0 || related.length > 0) {
       localReasons.push(`native-merge:body-comparison-required:${path}`);
@@ -838,29 +838,14 @@ function candidateForGroup(
     if (incomingTags.length > 0) localReasons.push(`native-merge:tags-not-proven:${path}`);
     if (existingFile !== undefined && existingFile !== existing.content) localReasons.push(`native-merge:existing-content-mismatch:${path}`);
     if (mergeEligible) {
-      try {
-        const plan = planNativeMerge({
-          pagePath: path,
-          sourcePath: sourceForRendering.sourcePath,
-          existingContent: existing.content,
-          wikiFolder: options.wikiFolder,
-          date: options.date,
-          mode: 'frontmatter-only',
-          sourceSlug: sourceForRendering.sourceSlug,
-          slug: { preserveCase: options.slugCase === 'preserve' },
-        });
-        localReasons.push(...plannerReason('native-merge', plan));
-        if (plan.path !== path) localReasons.push(`native-merge:path-mismatch:expected ${path}, received ${plan.path}`);
-        if (plan.currentContent !== existing.content) localReasons.push(`native-merge:existing-content-mismatch:${path}`);
-        if (!plan.canApply || plan.content === undefined || plan.path !== path || (plan.action !== 'replace' && plan.action !== 'unchanged')) {
-          content = existing.content;
-        } else {
-          content = plan.content;
-        }
-      } catch (error) {
-        localReasons.push(plannerException('native-merge', error));
-        content = existing.content;
-      }
+      const mergeSources = sourceIds.map(sourceId => {
+        const source = group.sources.find(item => item.sourceId === sourceId);
+        if (!source) throw new NativeReductionError(`missing source ${sourceId} for native merge sequence ${group.key.keyString}`);
+        return source;
+      });
+      const sequence = planNativeMergeSequence(path, existing.content, mergeSources, options);
+      localReasons.push(...sequence.reasons);
+      content = sequence.reasons.length === 0 ? sequence.content : existing.content;
     } else {
       content = existing.content;
     }
@@ -939,6 +924,61 @@ function plannerReason(prefix: string, plan: NativePlannedFile): string[] {
 
 function plannerException(prefix: string, error: unknown): string {
   return `${prefix}:exception:${error instanceof Error ? error.message : String(error)}`;
+}
+
+interface NativeMergeSequenceResult {
+  readonly content: string;
+  readonly reasons: readonly string[];
+}
+
+/**
+ * Fold the native frontmatter-only merge once per source.  The prior planner
+ * output is the next planner's sealed existingContent; any failed binding or
+ * invariant rolls the candidate all the way back to the original bytes.
+ */
+function planNativeMergeSequence(
+  path: string,
+  originalContent: string,
+  sources: readonly NativeSourceScopedIR[],
+  options: NativeReducerOptions,
+): NativeMergeSequenceResult {
+  if (sources.length === 0) return { content: originalContent, reasons: [`native-merge:sequence-empty:${path}`] };
+  let priorContent = originalContent;
+  for (const source of sources) {
+    const stepReasons: string[] = [];
+    let plan: ReturnType<typeof planNativeMerge>;
+    try {
+      plan = planNativeMerge({
+        pagePath: path,
+        sourcePath: source.sourcePath,
+        existingContent: priorContent,
+        wikiFolder: options.wikiFolder,
+        date: options.date,
+        mode: 'frontmatter-only',
+        sourceSlug: source.sourceSlug,
+        slug: { preserveCase: options.slugCase === 'preserve' },
+      });
+    } catch (error) {
+      return {
+        content: originalContent,
+        reasons: [`native-merge:sequence-exception:${source.sourceId}:${error instanceof Error ? error.message : String(error)}`],
+      };
+    }
+    if (!plan.canApply) {
+      stepReasons.push(...plan.reasons.map(item => `native-merge:sequence-refused:${source.sourceId}:${item.code}:${item.message}`));
+    }
+    if (plan.path !== path) stepReasons.push(`native-merge:sequence-path-mismatch:${source.sourceId}:expected ${path}, received ${plan.path}`);
+    if (plan.currentContent !== priorContent) stepReasons.push(`native-merge:sequence-current-content-mismatch:${source.sourceId}`);
+    if (plan.sourceSlug !== source.sourceSlug) stepReasons.push(`native-merge:sequence-source-slug-mismatch:${source.sourceId}:expected ${source.sourceSlug}, received ${plan.sourceSlug}`);
+    if (plan.content === undefined) stepReasons.push(`native-merge:sequence-content-missing:${source.sourceId}`);
+    if (plan.action !== 'replace' && plan.action !== 'unchanged') stepReasons.push(`native-merge:sequence-action-mismatch:${source.sourceId}:${plan.action}`);
+    if (plan.content !== undefined && ((plan.action === 'unchanged' && plan.content !== priorContent) || (plan.action === 'replace' && plan.content === priorContent))) {
+      stepReasons.push(`native-merge:sequence-action-content-mismatch:${source.sourceId}:${plan.action}`);
+    }
+    if (stepReasons.length > 0) return { content: originalContent, reasons: stepReasons };
+    priorContent = plan.content as string;
+  }
+  return { content: priorContent, reasons: [] };
 }
 
 function pathFolder(path: string, name: string): string {

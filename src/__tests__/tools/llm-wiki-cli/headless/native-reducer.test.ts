@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_SETTINGS } from '../../../../../src/types';
 import {
@@ -9,6 +9,7 @@ import {
   planNativeMerge,
   planNativeSourcePage,
 } from '../../../../../tools/llm-wiki-cli/src/headless/native-compatibility';
+import * as nativeCompatibility from '../../../../../tools/llm-wiki-cli/src/headless/native-compatibility';
 import {
   NativeReductionError,
   reduceNativeMapIR,
@@ -239,21 +240,86 @@ describe('native reducer', () => {
     expect(result.reasons).toContain('native-merge-required:wiki/entities/body-target.md');
   });
 
-  it('refuses shared existing-page sequencing even when frontmatter is otherwise mergeable', () => {
+  it('folds native frontmatter-only merges across sources in canonical order', () => {
     const existing: NativeExistingPage = {
       path: 'wiki/entities/shared-existing.md',
       pageType: 'entity',
       label: 'Shared Existing',
       content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Shared Existing\n',
     };
-    const result = reduceNativeSourceIR([
-      source('shared-a', [{ proposalId: 'shared-a-proposal', sourceId: 'shared-a', pageType: 'entity', label: 'Shared Existing' }]),
-      source('shared-b', [{ proposalId: 'shared-b-proposal', sourceId: 'shared-b', pageType: 'entity', label: 'Shared Existing' }]),
-    ], options({ existingPages: [existing] }));
+    const sourceA = source('shared-a', [{ proposalId: 'shared-a-proposal', sourceId: 'shared-a', pageType: 'entity', label: 'Shared Existing' }]);
+    const sourceB = source('shared-b', [{ proposalId: 'shared-b-proposal', sourceId: 'shared-b', pageType: 'entity', label: 'Shared Existing' }]);
+    const reducerOptions = options({ existingPages: [existing] });
+    const result = reduceNativeSourceIR([sourceB, sourceA], reducerOptions);
+    const reversed = reduceNativeSourceIR([sourceA, sourceB], reducerOptions);
+    const first = planNativeMerge({
+      pagePath: existing.path,
+      sourcePath: sourceA.sourcePath,
+      sourceSlug: sourceA.sourceSlug,
+      existingContent: existing.content,
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'frontmatter-only',
+    });
+    const firstContent = first.content;
+    if (firstContent === undefined) throw new Error('first native merge plan unexpectedly omitted content');
+    const second = planNativeMerge({
+      pagePath: existing.path,
+      sourcePath: sourceB.sourcePath,
+      sourceSlug: sourceB.sourceSlug,
+      existingContent: firstContent,
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'frontmatter-only',
+    });
 
+    expect(first.canApply).toBe(true);
+    expect(second.canApply).toBe(true);
+    expect(result.pages[0]?.content).toBe(second.content);
+    expect(result.pages[0]?.comparisonReasons).toEqual([]);
+    expect(reversed).toEqual(result);
+    // The serialized log still refuses unattributed shared-page effects; the
+    // page merge sequence itself is fully proven and has no partial output.
     expect(result.canApply).toBe(false);
+    expect(result.reasons).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-log:ambiguous-shared-page-attribution'),
+    ]));
+  });
+
+  it('rolls back to original bytes when a later native merge step refuses', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/rollback-target.md',
+      pageType: 'entity',
+      label: 'Rollback Target',
+      content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Rollback Target\n',
+    };
+    const sourceA = source('rollback-a', [{ proposalId: 'rollback-a-proposal', sourceId: 'rollback-a', pageType: 'entity', label: 'Rollback Target' }]);
+    const sourceB = source('rollback-b', [{ proposalId: 'rollback-b-proposal', sourceId: 'rollback-b', pageType: 'entity', label: 'Rollback Target' }]);
+    const realPlan = nativeCompatibility.planNativeMerge;
+    let calls = 0;
+    const spy = vi.spyOn(nativeCompatibility, 'planNativeMerge').mockImplementation(input => {
+      calls += 1;
+      const plan = realPlan(input);
+      if (calls !== 2) return plan;
+      return Object.freeze({
+        ...plan,
+        status: 'requires-native-comparison' as const,
+        canApply: false as const,
+        reasons: [{ code: 'native-llm-seam-required', message: 'test refusal' }],
+        action: 'replace' as const,
+      });
+    });
+    let result: ReturnType<typeof reduceNativeSourceIR>;
+    try {
+      result = reduceNativeSourceIR([sourceB, sourceA], options({ existingPages: [existing] }));
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(calls).toBe(2);
     expect(result.pages[0]?.content).toBe(existing.content);
-    expect(result.reasons).toContain('native-merge:shared-page-sequence-required:wiki/entities/shared-existing.md');
+    expect(result.reasons).toContain('native-merge:sequence-refused:rollback-b:native-llm-seam-required:test refusal');
+    expect(result.canApply).toBe(false);
   });
 
   it('emits a complete serialized global phase without touching the filesystem', () => {
