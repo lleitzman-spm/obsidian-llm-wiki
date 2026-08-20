@@ -2,7 +2,18 @@ import { createHash } from 'node:crypto';
 
 import { computeSlug } from '../../../../../src/core/slug';
 import { canonicalPartitionKey, partitionKeyString } from '../engine/partition';
-import { NativeCompatibilityError, nativeSourceSlug } from '../native-compatibility';
+import {
+  NativeCompatibilityError,
+  nativeSourceSlug,
+  planNativeIndex,
+  planNativeIngestLog,
+  planNativeSourcePage,
+} from '../native-compatibility';
+import type {
+  NativeIndexPage,
+  NativeIndexSourcePage,
+  NativePlannedFile,
+} from '../native-compatibility';
 import type { NativeMapIR } from '../native-map/types';
 import type {
   NativeCanonicalKey,
@@ -330,15 +341,6 @@ function renderPage(
   source: NativeSourceScopedIR,
 ): string {
   return `${renderFrontmatter(pageType, date, sourceLinks, tags, aliases, reviewed)}${renderBody(label, body, summaries, statements, qualifications, evidence, related, source)}`;
-}
-
-function renderSourcePage(source: NativeSourceScopedIR, options: NativeReducerOptions): string {
-  const page = source.sourcePage;
-  const title = text(page?.title) || text(source.sourceTitle) || source.sourceSlug;
-  const aliases = uniqueSorted([...(source.sourceAliases ?? []), ...(page?.aliases ?? [])]);
-  const tags = uniqueSorted([...(source.sourceTags ?? []), ...(page?.tags ?? [])]);
-  const body = text(page?.body) || text(source.sourceBody) || text(source.sourceSummary) || `# ${title}`;
-  return `${renderFrontmatter('source', options.date, [], tags, aliases, page?.reviewed === true)}${body.trim()}\n`;
 }
 
 function desiredFile(
@@ -811,35 +813,191 @@ function sourcePath(source: NativeSourceScopedIR, options: NativeReducerOptions)
   return `${normalizeFolder(options.wikiFolder, 'wikiFolder')}/sources/${safeSlug(source.sourceSlug, options.slugCase === 'preserve')}.md`;
 }
 
-function renderIndex(options: NativeReducerOptions, pages: readonly NativePageCandidate[], sources: readonly NativeSourceScopedIR[]): string {
-  const entities = pages.filter(page => page.pageType === 'entity').sort((left, right) => left.path.localeCompare(right.path));
-  const concepts = pages.filter(page => page.pageType === 'concept').sort((left, right) => left.path.localeCompare(right.path));
-  const sourceRows = [...sources].sort((left, right) => sourcePath(left, options).localeCompare(sourcePath(right, options)));
-  const lines = ['# Wiki Index', ''];
-  const section = (heading: string, rows: readonly string[]) => {
-    lines.push(`## ${heading}`);
-    if (rows.length) lines.push(...rows.map(row => `- ${row}`));
-    else lines.push('- None');
-    lines.push('');
-  };
-  section('Entities', entities.map(page => `[[${page.path.slice(normalizeFolder(options.wikiFolder, 'wikiFolder').length + 1, -3)}|${page.label}]]`));
-  section('Concepts', concepts.map(page => `[[${page.path.slice(normalizeFolder(options.wikiFolder, 'wikiFolder').length + 1, -3)}|${page.label}]]`));
-  section('Sources', sourceRows.map(source => `[[sources/${safeSlug(source.sourceSlug, options.slugCase === 'preserve')}|${text(source.sourceTitle) || source.sourceSlug}]]`));
-  return `${lines.join('\n').trim()}\n`;
+function plannerReason(prefix: string, plan: NativePlannedFile): string[] {
+  return plan.canApply
+    ? []
+    : plan.reasons.map(item => `${prefix}:${item.code}:${item.message}`);
 }
 
-function renderLog(options: NativeReducerOptions, pages: readonly NativePageCandidate[], sources: readonly NativeSourceScopedIR[]): string {
-  const existing = options.global.existing?.get(options.global.paths.log) ?? options.existingFiles?.get(options.global.paths.log) ?? '';
-  const lines = [
-    `## Headless ingest ${options.global.runId}`,
-    '',
-    `- Sources: ${sources.length}`,
-    `- Canonical pages: ${pages.length}`,
-    `- Entities: ${pages.filter(page => page.pageType === 'entity').length}`,
-    `- Concepts: ${pages.filter(page => page.pageType === 'concept').length}`,
-    '',
-  ];
-  return `${existing.trimEnd()}${existing.trim() ? '\n\n' : ''}${lines.join('\n')}`;
+function plannerException(prefix: string, error: unknown): string {
+  return `${prefix}:exception:${error instanceof Error ? error.message : String(error)}`;
+}
+
+function pathFolder(path: string, name: string): string {
+  const normalized = assertRelativePath(path, name);
+  const parts = normalized.split('/');
+  const basename = parts.pop();
+  if (basename !== `${name}.md` || parts.length === 0) {
+    throw new NativeReductionError(`${name} must end in ${name}.md: ${JSON.stringify(path)}`);
+  }
+  return parts.join('/');
+}
+
+function sourceGeneratedContent(source: NativeSourceScopedIR): string {
+  if (source.sourcePage && Object.prototype.hasOwnProperty.call(source.sourcePage, 'body')) {
+    return source.sourcePage.body ?? '';
+  }
+  if (source.sourceBody !== undefined) return source.sourceBody;
+  if (source.sourceSummary !== undefined) return source.sourceSummary;
+  const title = text(source.sourcePage?.title) || text(source.sourceTitle) || source.sourceSlug;
+  return `# ${title}`;
+}
+
+function sourcePlannerInput(
+  source: NativeSourceScopedIR,
+  options: NativeReducerOptions,
+  existingContent?: string,
+): { readonly plan: NativePlannedFile; readonly path: string; readonly reasons: readonly string[] } {
+  const path = sourcePath(source, options);
+  const normalizedSourcePath = assertSourceReference(source.sourcePath, `source ${source.sourceId}.sourcePath`);
+  const sourceContent = source.sourceContent ?? options.sourceContents?.get(normalizedSourcePath);
+  if (sourceContent === undefined) {
+    return {
+      path,
+      plan: Object.freeze({
+        status: 'refused',
+        canApply: false,
+        reasons: [{ code: 'missing-source-content', message: `No sealed source content was bound for ${normalizedSourcePath}` }],
+        path,
+        action: 'replace',
+      }),
+      reasons: [`native-source-page:missing-source-content:No sealed source content was bound for ${normalizedSourcePath}`],
+    };
+  }
+  try {
+    const page = source.sourcePage;
+    const plan = planNativeSourcePage({
+      sourcePath: normalizedSourcePath,
+      wikiFolder: options.wikiFolder,
+      generatedContent: sourceGeneratedContent(source),
+      sourceContent,
+      sourceNoteAliases: uniqueSorted([...(source.sourceAliases ?? []), ...(page?.aliases ?? [])]),
+      sourceTags: uniqueSorted([...(source.sourceTags ?? []), ...(page?.tags ?? [])]),
+      existingContent,
+      slug: { preserveCase: options.slugCase === 'preserve' },
+    });
+    const reasons = plannerReason('native-source-page', plan);
+    if (plan.path !== path) reasons.push(`native-source-page:path-mismatch:expected ${path}, received ${plan.path}`);
+    return { path, plan, reasons };
+  } catch (error) {
+    return {
+      path,
+      plan: Object.freeze({
+        status: 'refused',
+        canApply: false,
+        reasons: [{ code: 'native-planner-exception', message: error instanceof Error ? error.message : String(error) }],
+        path,
+        action: 'replace',
+      }),
+      reasons: [plannerException('native-source-page', error)],
+    };
+  }
+}
+
+function indexPlannerInput(
+  options: NativeReducerOptions,
+  pages: readonly NativePageCandidate[],
+  sources: readonly NativeSourceScopedIR[],
+  sourceFiles: ReadonlyMap<string, NativePlannedFile>,
+): { readonly plan: ReturnType<typeof planNativeIndex>; readonly reasons: readonly string[] } {
+  const indexPath = assertRelativePath(options.global.paths.index, 'global.index');
+  const wikiFolder = pathFolder(indexPath, 'index');
+  const entities: NativeIndexPage[] = pages
+    .filter(page => page.pageType === 'entity')
+    .map(page => ({ path: page.path, content: page.content }));
+  const concepts: NativeIndexPage[] = pages
+    .filter(page => page.pageType === 'concept')
+    .map(page => ({ path: page.path, content: page.content }));
+  const sourcePages: NativeIndexSourcePage[] = sources.map(source => {
+    const sourcePagePath = sourcePath(source, options);
+    const planned = sourceFiles.get(source.sourceId);
+    return {
+      path: sourcePagePath,
+      basename: source.sourceSlug,
+      sourcePath: source.sourcePath,
+      content: planned?.content ?? '',
+    };
+  });
+  try {
+    const plan = planNativeIndex({
+      wikiFolder,
+      wikiLanguage: options.wikiLanguage ?? 'en',
+      entities,
+      concepts,
+      sources: sourcePages,
+      slug: { preserveCase: options.slugCase === 'preserve' },
+    });
+    const reasons = plannerReason('native-index', plan);
+    if (plan.path !== indexPath) reasons.push(`native-index:path-mismatch:expected ${indexPath}, received ${plan.path}`);
+    return { plan, reasons };
+  } catch (error) {
+    return {
+      plan: Object.freeze({
+        status: 'refused',
+        canApply: false,
+        reasons: [{ code: 'native-planner-exception', message: error instanceof Error ? error.message : String(error) }],
+        path: indexPath,
+        action: 'replace',
+        sectionCounts: { entities: entities.length, concepts: concepts.length, sources: sourcePages.length },
+      }),
+      reasons: [plannerException('native-index', error)],
+    };
+  }
+}
+
+function logPlannerInput(
+  options: NativeReducerOptions,
+  sources: readonly NativeSourceScopedIR[],
+  desiredPages: readonly NativeDesiredFile[],
+  sourceFiles: readonly NativeDesiredFile[],
+): { readonly plan: ReturnType<typeof planNativeIngestLog>; readonly reasons: readonly string[] } {
+  const logPath = assertRelativePath(options.global.paths.log, 'global.log');
+  const wikiFolder = pathFolder(logPath, 'log');
+  const createdPages = [...desiredPages, ...sourceFiles].filter(file => file.action === 'create').map(file => file.path);
+  const updatedPages = [...desiredPages, ...sourceFiles].filter(file => file.action === 'replace').map(file => file.path);
+  const sourceTitle = sources.map(source => text(source.sourceTitle) || source.sourceSlug).join(', ');
+  const existingContent = options.global.existing?.get(logPath) ?? options.existingFiles?.get(logPath);
+  if (options.time === undefined) {
+    return {
+      plan: Object.freeze({
+        status: 'refused',
+        canApply: false,
+        reasons: [{ code: 'missing-time', message: 'No sealed HH:MM run time was bound for the native log planner' }],
+        path: logPath,
+        action: 'replace',
+        entryKind: 'ingest',
+      }),
+      reasons: ['native-log:missing-time:No sealed HH:MM run time was bound for the native log planner'],
+    };
+  }
+  try {
+    const plan = planNativeIngestLog({
+      wikiFolder,
+      wikiLanguage: options.wikiLanguage ?? 'en',
+      existingContent,
+      operation: 'ingest',
+      sourceTitle,
+      createdPages,
+      updatedPages,
+      date: options.date,
+      time: options.time,
+    });
+    const reasons = plannerReason('native-log', plan);
+    if (plan.path !== logPath) reasons.push(`native-log:path-mismatch:expected ${logPath}, received ${plan.path}`);
+    return { plan, reasons };
+  } catch (error) {
+    return {
+      plan: Object.freeze({
+        status: 'refused',
+        canApply: false,
+        reasons: [{ code: 'native-planner-exception', message: error instanceof Error ? error.message : String(error) }],
+        path: logPath,
+        action: 'replace',
+        entryKind: 'ingest',
+      }),
+      reasons: [plannerException('native-log', error)],
+    };
+  }
 }
 
 function checkAliasCollisions(pages: readonly NativePageCandidate[], reasons: string[]): void {
@@ -1030,13 +1188,38 @@ export function reduceNativeSourceIR(
     }
   }
   const desiredPages = pages.map(page => desiredFile(page.path, page.pageType, 'partition', page.content, page.sourceIds, options.existingFiles, page.key));
-  const sourceFiles = sources.map(source => desiredFile(sourcePath(source, { ...options, wikiFolder }), 'source', 'serialized-global', renderSourcePage(source, options), [source.sourceId], options.existingFiles));
+  const sourcePlans = new Map<string, ReturnType<typeof sourcePlannerInput>>();
+  for (const source of sources) {
+    const path = sourcePath(source, { ...options, wikiFolder });
+    sourcePlans.set(source.sourceId, sourcePlannerInput(source, { ...options, wikiFolder }, existingFileContent(options.existingFiles, path)));
+  }
+  const sourcePlannerReasons = [...sourcePlans.values()].flatMap(item => item.reasons);
+  const sourceFiles = sources.map(source => {
+    const planned = sourcePlans.get(source.sourceId);
+    if (!planned) throw new NativeReductionError(`missing native source-page plan for ${source.sourceId}`);
+    return desiredFile(
+      planned.path,
+      'source',
+      'serialized-global',
+      planned.plan.content ?? '',
+      [source.sourceId],
+      options.existingFiles,
+    );
+  });
   const indexPath = assertRelativePath(options.global.paths.index, 'global.index');
   const logPath = assertRelativePath(options.global.paths.log, 'global.log');
   const schemaPath = assertRelativePath(options.global.paths.schema, 'global.schema');
+  const indexPlannerResult = indexPlannerInput(
+    { ...options, wikiFolder },
+    pages,
+    sources,
+    new Map([...sourcePlans.entries()].map(([sourceId, planned]) => [sourceId, planned.plan])),
+  );
+  const logPlannerResult = logPlannerInput({ ...options, wikiFolder }, sources, desiredPages, sourceFiles);
+  comparisonReasons.push(...sourcePlannerReasons, ...indexPlannerResult.reasons, ...logPlannerResult.reasons);
   const globalFiles = [
-    desiredFile(indexPath, 'index', 'serialized-global', renderIndex(options, pages, sources), sources.map(source => source.sourceId), options.existingFiles),
-    desiredFile(logPath, 'log', 'serialized-global', renderLog(options, pages, sources), sources.map(source => source.sourceId), options.existingFiles),
+    desiredFile(indexPath, 'index', 'serialized-global', indexPlannerResult.plan.content ?? '', sources.map(source => source.sourceId), options.existingFiles),
+    desiredFile(logPath, 'log', 'serialized-global', logPlannerResult.plan.content ?? '', sources.map(source => source.sourceId), options.existingFiles),
     desiredFile(schemaPath, 'schema', 'serialized-global', options.global.schemaContent, sources.map(source => source.sourceId), options.existingFiles),
   ];
   // Source pages are part of the serialized global phase because entity and
@@ -1072,7 +1255,10 @@ export function reduceNativeSourceIR(
       || reason.startsWith('path-collision:')
       || reason.startsWith('global-path-collision:')
       || reason.startsWith('existing-path-collision:')
-      || reason.startsWith('provider-frontmatter:')),
+      || reason.startsWith('provider-frontmatter:')
+      || reason.startsWith('native-source-page:')
+      || reason.startsWith('native-index:')
+      || reason.startsWith('native-log:')),
   ]);
   const status = reasons.length > 0 ? 'requires-native-comparison' as const : 'candidate' as const;
   return Object.freeze({

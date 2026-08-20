@@ -63,6 +63,8 @@ export interface NativeSourcePageInput {
   readonly sourceContent: string;
   /** Curated aliases from the raw source note frontmatter. */
   readonly sourceNoteAliases?: readonly string[];
+  /** Curated source-note tags retained by the native source-page tail. */
+  readonly sourceTags?: readonly string[];
   /** Existing generated source page, if this is a re-ingest. */
   readonly existingContent?: string;
   readonly slug?: NativeSourceSlugOptions;

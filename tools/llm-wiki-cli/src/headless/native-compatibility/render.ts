@@ -80,6 +80,9 @@ export function planNativeSourcePage(input: NativeSourcePageInput): NativePlanne
   if (input.sourceNoteAliases?.length) {
     content = mergeFrontmatterArrayField(content, 'aliases', [...input.sourceNoteAliases]);
   }
+  if (input.sourceTags?.length) {
+    content = mergeFrontmatterArrayField(content, 'tags', [...input.sourceTags]);
+  }
 
   return ready({
     status: 'ready',

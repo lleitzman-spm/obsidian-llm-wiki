@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { nativeSourceSlug } from '../../../../../tools/llm-wiki-cli/src/headless/native-compatibility';
+import {
+  nativeSourceSlug,
+  planNativeIndex,
+  planNativeIngestLog,
+  planNativeSourcePage,
+} from '../../../../../tools/llm-wiki-cli/src/headless/native-compatibility';
 import {
   NativeReductionError,
   reduceNativeMapIR,
@@ -13,6 +18,9 @@ import type { NativeMapIR } from '../../../../../tools/llm-wiki-cli/src/headless
 
 const options = (overrides: Partial<NativeReducerOptions> = {}): NativeReducerOptions => ({
   wikiFolder: 'wiki',
+  wikiLanguage: 'en',
+  time: '00:00',
+  sourceContents: new Map([['notes/mapped.md', 'Mapped source bytes\n']]),
   date: '2026-08-20',
   global: {
     paths: { index: 'wiki/index.md', log: '20 Brain/log.md', schema: '20 Brain/schema.md' },
@@ -26,6 +34,7 @@ const source = (sourceId: string, proposals: NativeSourceScopedIR['proposals'], 
   sourceId,
   sourcePath: `notes/${sourceId}.md`,
   sourceSlug: nativeSourceSlug(`notes/${sourceId}.md`),
+  sourceContent: `Source bytes for ${sourceId}\n`,
   sourceTitle: sourceId,
   proposals,
   ...extra,
@@ -155,7 +164,7 @@ describe('native reducer', () => {
     expect(globalKinds).toEqual(['source', 'index', 'log', 'schema']);
     expect(result.globalPhase.serializationOrder).toEqual(result.globalPhase.files.map(file => file.path));
     expect(result.desiredState.map(file => file.path)).toContain('20 Brain/schema.md');
-    expect(result.desiredState.find(file => file.path === '20 Brain/log.md')?.content).toContain('run-native-test');
+    expect(result.desiredState.find(file => file.path === '20 Brain/log.md')?.content).toContain('## [2026-08-20 00:00] ingest | s-one');
     expect(result.desiredState.find(file => file.path === `wiki/sources/${nativeSourceSlug('notes/s-one.md')}.md`)?.phase).toBe('serialized-global');
   });
 
@@ -195,6 +204,100 @@ describe('native reducer', () => {
         sourceSlug: 'about-this-course',
       }),
     ], options())).toThrow(/source slug does not match native path fingerprint/u);
+  });
+
+  it('uses native source, index, and log planners for serialized global bytes', () => {
+    const sourcePath = 'raw/Course X/Source.md';
+    const sourceSlug = nativeSourceSlug(sourcePath);
+    const sourceBody = '---\ntype: source\n---\n\n# Source\n\nGenerated source body.\n';
+    const sourceContent = '---\ntags:\n  - source\n---\n\nOriginal source bytes.\n';
+    const reducerOptions = options({
+      wikiFolder: 'wiki',
+      global: {
+        paths: { index: 'wiki/index.md', log: 'wiki/log.md', schema: 'wiki/schema.md' },
+        runId: 'planner-run',
+        schemaContent: '# Schema\n',
+      },
+      sourceContents: new Map([[sourcePath, sourceContent]]),
+      time: '03:04',
+    });
+    const input = source('planner-source', [{
+      proposalId: 'planner-proposal', sourceId: 'planner-source', pageType: 'entity', label: 'Planner Entity',
+    }], {
+      sourcePath,
+      sourceSlug,
+      sourceContent,
+      sourceBody,
+      sourceTitle: 'Planner Source',
+      sourceAliases: ['Raw Source'],
+      sourceTags: ['source'],
+      sourcePage: { title: 'Planner Source', body: sourceBody, aliases: ['Page Source'], tags: ['source'] },
+    });
+    const result = reduceNativeSourceIR([input], reducerOptions);
+    const sourceFile = result.desiredState.find(file => file.kind === 'source');
+    const indexFile = result.desiredState.find(file => file.kind === 'index');
+    const logFile = result.desiredState.find(file => file.kind === 'log');
+    const expectedSource = planNativeSourcePage({
+      sourcePath,
+      wikiFolder: 'wiki',
+      generatedContent: sourceBody,
+      sourceContent,
+      sourceNoteAliases: ['Page Source', 'Raw Source'],
+      sourceTags: ['source'],
+      slug: { preserveCase: false },
+    });
+    const expectedIndex = planNativeIndex({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      entities: [{ path: result.pages[0]?.path, content: result.pages[0]?.content ?? '' }],
+      concepts: [],
+      sources: [{ path: sourceFile?.path, basename: sourceSlug, sourcePath, content: sourceFile?.content ?? '' }],
+      slug: { preserveCase: false },
+    });
+    const expectedLog = planNativeIngestLog({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      operation: 'ingest',
+      sourceTitle: 'Planner Source',
+      createdPages: [result.pages[0]?.path ?? '', sourceFile?.path ?? ''],
+      updatedPages: [],
+      date: '2026-08-20',
+      time: '03:04',
+    });
+
+    expect(result.canApply).toBe(true);
+    expect(sourceFile?.content).toBe(expectedSource.content);
+    expect(indexFile?.content).toBe(expectedIndex.content);
+    expect(logFile?.content).toBe(expectedLog.content);
+    expect(sourceFile?.content).toContain('contentHash:');
+    expect(sourceFile?.content).toContain('tags:');
+    expect(sourceFile?.content).toContain('Raw Source');
+  });
+
+  it('propagates missing sealed source content and time as native planner refusals', () => {
+    const noBindings = options({
+      sourceContents: new Map(),
+      time: undefined,
+      global: {
+        paths: { index: 'wiki/index.md', log: 'wiki/log.md', schema: 'wiki/schema.md' },
+        runId: 'refusal-run',
+        schemaContent: '# Schema\n',
+      },
+    });
+    const result = reduceNativeSourceIR([source('unbound', [{
+      proposalId: 'unbound-proposal', sourceId: 'unbound', pageType: 'entity', label: 'Unbound',
+    }], { sourceContent: undefined })], noBindings);
+
+    expect(result.canApply).toBe(false);
+    expect(result.status).toBe('requires-native-comparison');
+    expect(result.reasons).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-source-page:missing-source-content'),
+      expect.stringContaining('native-log:missing-time'),
+    ]));
+    expect(result.unsupported).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-source-page:missing-source-content'),
+      expect.stringContaining('native-log:missing-time'),
+    ]));
   });
 
   it('fails closed for provider-owned unsupported frontmatter instead of applying it', () => {

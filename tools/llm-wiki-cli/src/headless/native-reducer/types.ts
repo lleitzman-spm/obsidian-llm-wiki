@@ -80,6 +80,8 @@ export interface NativeSourceScopedIR {
   readonly sourceId: string;
   readonly sourcePath: string;
   readonly sourceSlug: string;
+  /** Sealed UTF-8 source body used by the native source-page contentHash tail. */
+  readonly sourceContent?: string;
   readonly sourceTitle?: string;
   readonly sourceSummary?: string;
   readonly sourceBody?: string;
@@ -118,6 +120,12 @@ export interface NativeGlobalInput {
 export interface NativeReducerOptions {
   readonly wikiFolder: string;
   readonly global: NativeGlobalInput;
+  /** Native language used by the index/log planners; defaults to native English labels. */
+  readonly wikiLanguage?: string;
+  /** Sealed HH:MM run time required by the native log planner. */
+  readonly time?: string;
+  /** Optional source bytes decoded as UTF-8, keyed by normalized source path. */
+  readonly sourceContents?: ReadonlyMap<string, string>;
   /** Use the native default (lowercase) unless preserve-case is explicit. */
   readonly slugCase?: 'lower' | 'preserve';
   /** Stable date supplied by the run manifest; no wall-clock reads occur. */
