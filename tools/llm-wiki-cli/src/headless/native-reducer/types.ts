@@ -26,6 +26,8 @@ export interface NativeEvidence {
   readonly sourcePath?: string;
   readonly sourceSlug?: string;
   readonly sourceId?: string;
+  /** Sealed NativeMention extraction time; absent means legacy evidence has no full provenance. */
+  readonly extractedAt?: string;
   readonly byteRange?: NativeByteRange;
 }
 
@@ -130,6 +132,10 @@ export interface NativeReducerOptions {
   readonly slugCase?: 'lower' | 'preserve';
   /** Stable date supplied by the run manifest; no wall-clock reads occur. */
   readonly date: string;
+  /** Sealed native settings used by PageFactory's deterministic post-processing tail. */
+  readonly nativeSettings?: import('../../../../../src/types').LLMWikiSettings;
+  /** Provider-generated page bodies keyed by canonical key (`type\u001flabel`) or target path. */
+  readonly generatedPageContents?: ReadonlyMap<string, string>;
   readonly existingPages?: readonly NativeExistingPage[];
   readonly existingFiles?: ReadonlyMap<string, string>;
 }

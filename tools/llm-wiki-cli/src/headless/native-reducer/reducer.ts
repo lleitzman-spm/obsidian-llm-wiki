@@ -5,6 +5,7 @@ import { canonicalPartitionKey, partitionKeyString } from '../engine/partition';
 import {
   NativeCompatibilityError,
   nativeSourceSlug,
+  planNativeGeneratedPage,
   planNativeIndex,
   planNativeIngestLog,
   planNativeSourcePage,
@@ -14,7 +15,7 @@ import type {
   NativeIndexSourcePage,
   NativePlannedFile,
 } from '../native-compatibility';
-import type { NativeMapIR } from '../native-map/types';
+import type { NativeMapIR, NativeMention } from '../native-map/types';
 import type {
   NativeCanonicalKey,
   NativeDesiredAction,
@@ -33,6 +34,7 @@ import type {
   NativeSourceScopedIR,
   NativeStatement,
 } from './types';
+import type { MentionWithProvenance } from '../../../../../src/types';
 
 const KEY_SEPARATOR = '\u001f';
 const ROLE_ORDER: Readonly<Record<'supports' | 'qualifies' | 'contests', number>> = {
@@ -395,7 +397,7 @@ interface ProposalExtras {
 
 function mapMentionEvidence(
   source: NativeMapIR,
-  mention: { readonly quote: string; readonly source_path: string; readonly source_slug: string },
+  mention: NativeMention,
   ordinal: number,
   preserveCase = false,
 ): NativeEvidence {
@@ -411,6 +413,7 @@ function mapMentionEvidence(
     // distinct and every source link points at the same page.
     sourceSlug: nativeMapSourceSlug(sourcePath, preserveCase),
     sourceId: source.source.sourceId,
+    extractedAt: mention.extracted_at,
   };
 }
 
@@ -453,7 +456,7 @@ export function nativeMapIRToSourceScopedIR(
   const proposals: NativePageProposal[] = [];
   const makeProposal = (
     pageType: NativePageType,
-    item: { readonly name: string; readonly type: string; readonly aliases: readonly string[]; readonly summary: string; readonly mentions_with_provenance: readonly { readonly quote: string; readonly source_path: string; readonly source_slug: string }[]; readonly related_entities: readonly string[]; readonly related_concepts: readonly string[] },
+    item: { readonly name: string; readonly type: string; readonly aliases: readonly string[]; readonly summary: string; readonly mentions_with_provenance: readonly NativeMention[]; readonly related_entities: readonly string[]; readonly related_concepts: readonly string[] },
     ordinal: number,
   ): void => {
     const key = partitionKeyString(canonicalPartitionKey(pageType, item.name));
@@ -707,6 +710,34 @@ function dedupeRelated(values: readonly NativeRelatedProposal[]): NativeRelatedP
   return [...byKey.values()].sort((left, right) => relatedKey(left).localeCompare(relatedKey(right)));
 }
 
+/**
+ * Keep the native structured mention path only when every quoted evidence
+ * item carries sealed provenance. Legacy/claim-only evidence remains a quote
+ * fallback; no synthetic timestamp or source metadata is ever invented.
+ */
+function nativeMentionsFromEvidence(evidence: readonly NativeEvidence[]): MentionWithProvenance[] | string[] {
+  const quoted = evidence.map(item => text(item.quote)).filter(Boolean);
+  if (quoted.length === 0) return [];
+  const structured = evidence
+    .filter(item => text(item.quote))
+    .map(item => {
+      const quote = text(item.quote);
+      const sourcePath = text(item.sourcePath);
+      const sourceSlug = text(item.sourceSlug);
+      const extractedAt = text(item.extractedAt);
+      if (!sourcePath || !sourceSlug || !extractedAt) return undefined;
+      return {
+        quote,
+        source_path: sourcePath,
+        source_slug: sourceSlug,
+        extracted_at: extractedAt,
+      } satisfies MentionWithProvenance;
+    });
+  return structured.every((item): item is MentionWithProvenance => item !== undefined)
+    ? structured
+    : quoted;
+}
+
 function candidateForGroup(
   group: Group,
   options: NativeReducerOptions,
@@ -769,26 +800,71 @@ function candidateForGroup(
   if (group.crossTypeAlias) localReasons.push(`cross-type-alias:${group.key.normalizedLabel}`);
   if (existing && !reviewed && bodyParts.length > 0) localReasons.push(`native-merge-required:${path}`);
   if (existing && reviewed && (statements.length || qualifications.length || evidence.length || summaries.length)) localReasons.push(`reviewed-append-requires-native-comparison:${path}`);
-  const uniqueReasons = uniqueSorted(localReasons);
-  globalReasons.push(...uniqueReasons);
   const sourceForRendering = group.sources[0];
   if (!sourceForRendering) throw new NativeReductionError(`group has no source: ${group.key.keyString}`);
-  const content = renderPage(
-    pageType,
-    label,
-    options.date,
-    sourceLinks,
-    tags,
-    aliases,
-    reviewed,
-    body,
-    summaries,
-    statements,
-    qualifications,
-    evidence,
-    related,
-    sourceForRendering,
-  );
+  let content = '';
+  if (existing) {
+    // Existing-page merge and reviewed append semantics are still native LLM
+    // seams. Keep their deterministic comparison renderer unchanged.
+    content = renderPage(
+      pageType,
+      label,
+      options.date,
+      sourceLinks,
+      tags,
+      aliases,
+      reviewed,
+      body,
+      summaries,
+      statements,
+      qualifications,
+      evidence,
+      related,
+      sourceForRendering,
+    );
+  } else {
+    // New pages are applyable only when both sealed native settings and the
+    // provider's generated body are explicitly bound. Never use the generic
+    // renderer as a fallback when either binding is absent.
+    const generatedContent = options.generatedPageContents?.get(group.key.keyString)
+      ?? options.generatedPageContents?.get(path);
+    if (!options.nativeSettings) {
+      localReasons.push(`native-generated-page:missing-settings:${path}`);
+    }
+    if (generatedContent === undefined) {
+      localReasons.push(`native-generated-page:missing-generated-content:${group.key.keyString}:${path}`);
+    }
+    if (options.nativeSettings && generatedContent !== undefined) {
+      try {
+        const plan = planNativeGeneratedPage({
+          pageType,
+          path,
+          generatedContent,
+          settings: options.nativeSettings,
+          sourcePath: sourceForRendering.sourcePath,
+          sourceSlug: sourceForRendering.sourceSlug,
+          sourceFileBasename: sourceForRendering.sourcePath.replaceAll('\\', '/').split('/').pop(),
+          aliases,
+          tags,
+          relatedEntities: related.filter(item => item.pageType === 'entity').map(item => item.label),
+          relatedConcepts: related.filter(item => item.pageType === 'concept').map(item => item.label),
+          mentions: nativeMentionsFromEvidence(evidence),
+          date: options.date,
+        });
+        localReasons.push(...plannerReason('native-generated-page', plan));
+        if (plan.path !== path) localReasons.push(`native-generated-page:path-mismatch:expected ${path}, received ${plan.path}`);
+        if (plan.canApply && plan.content !== undefined && plan.path === path) {
+          content = plan.content;
+        } else if (plan.canApply && plan.content === undefined) {
+          localReasons.push(`native-generated-page:missing-page-body:${path}`);
+        }
+      } catch (error) {
+        localReasons.push(plannerException('native-generated-page', error));
+      }
+    }
+  }
+  const uniqueReasons = uniqueSorted(localReasons);
+  globalReasons.push(...uniqueReasons);
   return Object.freeze({
     key: group.key,
     path,
@@ -1315,6 +1391,7 @@ export function reduceNativeSourceIR(
       || reason.startsWith('global-path-collision:')
       || reason.startsWith('existing-path-collision:')
       || reason.startsWith('provider-frontmatter:')
+      || reason.startsWith('native-generated-page:')
       || reason.startsWith('native-source-page:')
       || reason.startsWith('native-index:')
       || reason.startsWith('native-log:')),

@@ -83,6 +83,9 @@ export interface NativeGeneratedPageInput {
   readonly relatedEntities?: readonly string[];
   readonly relatedConcepts?: readonly string[];
   readonly mentions?: readonly import('../../../../../src/types').MentionWithProvenance[] | readonly string[];
+  /** Typed reducer metadata retained in native frontmatter rather than inferred from the model body. */
+  readonly aliases?: readonly string[];
+  readonly tags?: readonly string[];
   readonly existingPages?: readonly import('../../../../../src/core/related-link-corrector').ExistingPageRef[];
   /** Native creation/updated date.  Must be explicit for reproducible plans. */
   readonly date: string;

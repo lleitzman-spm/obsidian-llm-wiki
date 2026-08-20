@@ -179,9 +179,10 @@ export function planNativeGeneratedPage(input: NativeGeneratedPageInput): Native
     },
   );
 
-  const content = input.sourceSlug
-    ? appendNativeSourceSlugToFrontmatter(mentionsInjected, input.sourceSlug)
-    : mentionsInjected;
+  let content = mentionsInjected;
+  if (input.aliases?.length) content = mergeFrontmatterArrayField(content, 'aliases', [...input.aliases]);
+  if (input.tags?.length) content = mergeFrontmatterArrayField(content, 'tags', [...input.tags]);
+  if (input.sourceSlug) content = appendNativeSourceSlugToFrontmatter(content, input.sourceSlug);
   if (!content.trim()) {
     return refusal<NativePlannedFile>({ path: input.path, action: 'replace' }, 'missing-page-body', 'Native post-processing produced an empty page');
   }

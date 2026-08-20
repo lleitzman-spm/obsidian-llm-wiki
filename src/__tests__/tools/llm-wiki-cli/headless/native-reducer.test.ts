@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
+import { DEFAULT_SETTINGS } from '../../../../../src/types';
 import {
   nativeSourceSlug,
+  planNativeGeneratedPage,
   planNativeIndex,
   planNativeIngestLog,
   planNativeSourcePage,
@@ -22,6 +24,12 @@ const options = (overrides: Partial<NativeReducerOptions> = {}): NativeReducerOp
   time: '00:00',
   sourceContents: new Map([['notes/mapped.md', 'Mapped source bytes\n']]),
   date: '2026-08-20',
+  nativeSettings: { ...DEFAULT_SETTINGS },
+  generatedPageContents: new Map([
+    ['entity\u001fmapped entity', '# Mapped Entity\n\n## Contested Evidence\n- The contrary quote.\n'],
+    ['entity\u001fa page', '# A Page\n'],
+    ['entity\u001fb page', '# B Page\n'],
+  ]),
   global: {
     paths: { index: 'wiki/index.md', log: '20 Brain/log.md', schema: '20 Brain/schema.md' },
     runId: 'run-native-test',
@@ -76,8 +84,12 @@ describe('native reducer', () => {
       statements: [{ statementId: 'stmt-a', text: 'A supported fact.', role: 'supports', evidenceIds: ['ev-a'] }],
       evidence: [{ evidenceId: 'ev-a', role: 'supports', quote: 'A supported fact.' }],
     }]);
-    const a = reduceNativeSourceIR([first, second], options());
-    const b = reduceNativeSourceIR([second, first], options());
+    const generated = `# Alice Example\n\n## Qualifications\n### Qualifies\n- A qualified fact.\n\n## Evidence\n### Supports\n- A supported fact.\n\n## Sources\n[[sources/${nativeSourceSlug('notes/s-a.md')}]]\n[[sources/${nativeSourceSlug('notes/s-b.md')}]]\n\n## Related Concepts\n- [[concepts/canonical-concept|Canonical Concept]]\n`;
+    const reducerOptions = options({
+      generatedPageContents: new Map([['entity\u001falice example', generated]]),
+    });
+    const a = reduceNativeSourceIR([first, second], reducerOptions);
+    const b = reduceNativeSourceIR([second, first], reducerOptions);
 
     expect(a).toEqual(b);
     expect(a.complete).toBe(true);
@@ -182,7 +194,12 @@ describe('native reducer', () => {
     const result = reduceNativeSourceIR([
       source('course-x', [proposal('course-x')], { sourcePath: firstPath, sourceSlug: firstSlug }),
       source('course-y', [proposal('course-y')], { sourcePath: secondPath, sourceSlug: secondSlug }),
-    ], options());
+    ], options({
+      generatedPageContents: new Map([[
+        'entity\u001fshared entity',
+        `# Shared entity\n\n## Sources\n[[sources/${firstSlug}]]\n[[sources/${secondSlug}]]\n`,
+      ]]),
+    }));
 
     expect(firstSlug).not.toBe(secondSlug);
     expect(result.desiredState.map(file => file.path)).toEqual(expect.arrayContaining([
@@ -223,6 +240,7 @@ describe('native reducer', () => {
       },
       sourceContents: new Map([[sourcePath, sourceContent]]),
       time: '03:04',
+      generatedPageContents: new Map([['entity\u001fplanner entity', '# Planner Entity\n\nPlanner body.\n']]),
     });
     const input = source('planner-source', [{
       proposalId: 'planner-proposal', sourceId: 'planner-source', pageType: 'entity', label: 'Planner Entity',
@@ -277,6 +295,138 @@ describe('native reducer', () => {
     expect(sourceFile?.content).toContain('Raw Source');
   });
 
+  it('uses native generated-page bytes for a new page and preserves typed metadata inputs', () => {
+    const generatedContent = '---\ntype: entity\n---\n\n# Generated Entity\n\nProvider body.\n\n## Related Concepts\n- [[Linked Concept]]\n';
+    const reducerOptions = options({
+      generatedPageContents: new Map([['entity\u001fgenerated entity', generatedContent]]),
+    });
+    const input = source('generated-source', [{
+      proposalId: 'generated-proposal',
+      sourceId: 'generated-source',
+      pageType: 'entity',
+      label: 'Generated Entity',
+      typeTag: 'person',
+      aliases: ['Generated Alias'],
+      relatedConcepts: ['Linked Concept'],
+      evidence: [
+        {
+          evidenceId: 'a-later-generated-evidence',
+          role: 'supports',
+          quote: 'A later generated-source mention.',
+          sourcePath: 'notes/generated-source.md',
+          sourceSlug: nativeSourceSlug('notes/generated-source.md'),
+          extractedAt: '2026-08-20T00:00:02.000Z',
+        },
+        {
+          evidenceId: 'b-earlier-generated-evidence',
+          role: 'supports',
+          quote: 'An earlier generated-source mention.',
+          sourcePath: 'notes/generated-source.md',
+          sourceSlug: nativeSourceSlug('notes/generated-source.md'),
+          extractedAt: '2026-08-20T00:00:01.000Z',
+        },
+      ],
+    }]);
+    const result = reduceNativeSourceIR([input], reducerOptions);
+    const page = result.pages[0];
+    const expected = planNativeGeneratedPage({
+      pageType: 'entity',
+      path: 'wiki/entities/generated-entity.md',
+      generatedContent,
+      settings: reducerOptions.nativeSettings as NonNullable<NativeReducerOptions['nativeSettings']>,
+      sourcePath: input.sourcePath,
+      sourceSlug: input.sourceSlug,
+      aliases: ['Generated Alias'],
+      tags: ['person'],
+      relatedEntities: [],
+      relatedConcepts: ['Linked Concept'],
+      mentions: [
+        {
+          quote: 'A later generated-source mention.',
+          source_path: 'notes/generated-source.md',
+          source_slug: nativeSourceSlug('notes/generated-source.md'),
+          extracted_at: '2026-08-20T00:00:02.000Z',
+        },
+        {
+          quote: 'An earlier generated-source mention.',
+          source_path: 'notes/generated-source.md',
+          source_slug: nativeSourceSlug('notes/generated-source.md'),
+          extracted_at: '2026-08-20T00:00:01.000Z',
+        },
+      ],
+      date: '2026-08-20',
+    });
+
+    expect(result.canApply).toBe(true);
+    expect(page?.content).toBe(expected.content);
+    expect(page?.content).toContain('Generated Alias');
+    expect(page?.content).toContain('person');
+    expect(page?.content).toContain('Linked Concept');
+    expect(page?.content).toContain('A later generated-source mention.');
+    expect(page?.content).toContain('An earlier generated-source mention.');
+    expect(page?.content.indexOf('An earlier generated-source mention.')).toBeLessThan(page?.content.indexOf('A later generated-source mention.'));
+  });
+
+  it('fails closed when new-page native settings or provider content is not sealed', () => {
+    const result = reduceNativeSourceIR([source('unbound-page', [{
+      proposalId: 'unbound-page-proposal',
+      sourceId: 'unbound-page',
+      pageType: 'entity',
+      label: 'Unbound Page',
+    }])], options({
+      nativeSettings: undefined,
+      generatedPageContents: new Map(),
+    }));
+    const page = result.pages[0];
+
+    expect(result.canApply).toBe(false);
+    expect(page?.content).toBe('');
+    expect(result.reasons).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-generated-page:missing-settings:wiki/entities/unbound-page.md'),
+      expect.stringContaining('native-generated-page:missing-generated-content:entity\u001funbound page:wiki/entities/unbound-page.md'),
+    ]));
+    expect(result.unsupported).toEqual(expect.arrayContaining([
+      expect.stringContaining('native-generated-page:missing-settings'),
+      expect.stringContaining('native-generated-page:missing-generated-content'),
+    ]));
+  });
+
+  it('retains sealed native-map mention extraction timestamps through reduction', () => {
+    const result = reduceNativeMapIR([mapped({
+      entities: [{
+        name: 'Mapped Entity',
+        type: 'person',
+        aliases: [],
+        summary: 'Entity summary',
+        mentions_in_source: ['Older mapped mention.', 'Newer mapped mention.'],
+        mentions_with_provenance: [
+          {
+            quote: 'Older mapped mention.',
+            source_path: 'notes/mapped.md',
+            source_slug: 'stale-mapped-slug',
+            extracted_at: '2026-08-20T00:00:01.000Z',
+          },
+          {
+            quote: 'Newer mapped mention.',
+            source_path: 'notes/mapped.md',
+            source_slug: 'stale-mapped-slug',
+            extracted_at: '2026-08-20T00:00:02.000Z',
+          },
+        ],
+        related_entities: [],
+        related_concepts: [],
+      }],
+    })], options());
+    const evidence = result.pages[0]?.evidence ?? [];
+
+    expect(evidence.map(item => item.extractedAt)).toEqual(expect.arrayContaining([
+      '2026-08-20T00:00:01.000Z',
+      '2026-08-20T00:00:02.000Z',
+    ]));
+    expect(evidence.every(item => item.sourcePath === 'notes/mapped.md')).toBe(true);
+    expect(evidence.every(item => item.sourceSlug === nativeSourceSlug('notes/mapped.md'))).toBe(true);
+  });
+
   it('propagates missing sealed source content and time as native planner refusals', () => {
     const noBindings = options({
       sourceContents: new Map(),
@@ -312,6 +462,10 @@ describe('native reducer', () => {
         existing: new Map([['wiki/log.md', '# Existing log\n']]),
       },
       time: '03:05',
+      generatedPageContents: new Map([
+        ['entity\u001fa page', '# A Page\n'],
+        ['entity\u001fb page', '# B Page\n'],
+      ]),
     });
     const result = reduceNativeSourceIR([
       source('source-b', [{ proposalId: 'b-page', sourceId: 'source-b', pageType: 'entity', label: 'B Page' }]),
