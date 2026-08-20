@@ -19,7 +19,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "typecheck:tools": "tsc -p tools/llm-wiki-cli/tsconfig.json --noEmit",
-    "gate:1": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm css-lint"
+    "gate:1": "pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm css-lint"
   },
   "keywords": [
     "obsidian",

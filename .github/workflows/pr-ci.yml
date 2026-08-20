@@ -5,8 +5,8 @@ name: Gate 1 (Five-Gate)
 # `git push`; this CI re-runs the same five checks on every PR against `main`
 # so reviewer never sees a mechanical failure that slipped through.
 #
-# CI does NOT enable auto-merge. Explicit "merge it" / "合并" from the
-# maintainer is still required (CLAUDE.md "NEVER auto-merge PRs").
+# CI does not replace independent review, native readback, or exact-SHA proof.
+# Agent-owned integration may merge only after those required gates pass.
 #
 # Obsidian Bot review remains a separate pipeline; CI green ≠ Bot-approved.
 # See [[feedback_obsidian_bot_double_lint]] for the double-lint invariant.

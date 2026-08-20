@@ -4,14 +4,15 @@ Runs the obsidian-llm-wiki plugin's real ingest pipeline under plain Node —
 no Obsidian, no Electron, no display — against a vault directory on disk.
 
 The engine is not simulated. `WikiEngine`, `SourceAnalyzer`, `PageFactory`,
-`SchemaManager` and the AI-SDK LLM clients are imported straight from
-`../../obsidian-llm-wiki/src/`. Only the host is replaced: the `obsidian`
-module and the vault it reads and writes.
+`SchemaManager` and the AI-SDK LLM clients are imported straight from the
+repository's `src/` directory (`../../../src/` from the CLI entry module). Only
+the host is replaced: the `obsidian` module and the vault it reads and writes.
 
 ## Running
 
 ```bash
 WIKI_API_KEY=... node tools/llm-wiki-cli/run-llm-wiki.mjs \
+  ingest \
   --vault /path/to/your/vault \
   --source "sources/Attention Is All You Need.md" \
   --dry-run
