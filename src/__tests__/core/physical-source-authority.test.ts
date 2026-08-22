@@ -17,6 +17,48 @@ function file(path: string): TFile {
 }
 
 describe('physical source authority', () => {
+  it('keeps the Obsidian DataAdapter receiver for authoritative disk reads', async () => {
+    class ReceiverBoundAdapter {
+      private readonly contents = new Map([['sources/live.md', 'bytes from disk']]);
+
+      async read(path: string): Promise<string> {
+        const content = this.contents.get(path);
+        if (content === undefined) throw new Error(`missing: ${path}`);
+        return content;
+      }
+
+      async exists(path: string): Promise<boolean> {
+        return this.contents.has(path);
+      }
+    }
+
+    const adapter = new ReceiverBoundAdapter();
+    const snapshot = await readAuthoritativeSource(adapter, 'sources\\live.md');
+    expect(snapshot.content).toBe('bytes from disk');
+
+    const combined = await checkPhysicalSource(adapter, 'sources/live.md');
+    expect(combined).toMatchObject({ exists: true, source: { content: 'bytes from disk' } });
+  });
+
+  it('preserves refusal semantics when a receiver-bound adapter cannot read the source', async () => {
+    class RefusingAdapter {
+      private readonly contents = new Map<string, string>();
+
+      async read(path: string): Promise<string> {
+        if (!this.contents.has(path)) throw new Error('source disappeared');
+        return this.contents.get(path)!;
+      }
+
+      async exists(path: string): Promise<boolean> {
+        return this.contents.has(path);
+      }
+    }
+
+    const result = await checkPhysicalSource(new RefusingAdapter(), 'sources/gone.md');
+    expect(result.exists).toBe(false);
+    expect(result.error).toContain('source disappeared');
+  });
+
   it('intersects 15 cached files with the 4 files physically present', async () => {
     const cached = [
       file('sources/1.md'),

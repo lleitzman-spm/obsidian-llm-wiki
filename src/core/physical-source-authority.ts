@@ -99,7 +99,11 @@ export async function checkPhysicalSource(
   // narrow test adapters and older hosts.
   if (adapter.read) {
     try {
-      const source = await readAuthoritativeSource({ read: adapter.read }, normalizedPath);
+      // Keep the adapter as the receiver. Obsidian's DataAdapter methods are
+      // not guaranteed to be receiver-independent; extracting `read` into a
+      // fresh object makes a real adapter lose its internal `this` binding.
+      const readableAdapter = adapter as Pick<DataAdapter, 'read'>;
+      const source = await readAuthoritativeSource(readableAdapter, normalizedPath);
       return { exists: true, source };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
