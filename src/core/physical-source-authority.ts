@@ -55,13 +55,20 @@ export function isAuthoritativeSourceSnapshot(value: unknown): value is Authorit
  * authoritative presence check and the returned snapshot is the read result.
  */
 export async function readAuthoritativeSource(
-  adapter: Pick<DataAdapter, 'read'>,
+  adapter: Pick<DataAdapter, 'read'> & Partial<Pick<DataAdapter, 'readBinary'>>,
   path: string,
 ): Promise<AuthoritativeSourceSnapshot> {
   const normalizedPath = normalizePhysicalPath(path);
   let content: string;
+  let sourceBytes: Uint8Array;
   try {
-    content = await adapter.read(normalizedPath);
+    if (typeof adapter.readBinary === 'function') {
+      sourceBytes = new Uint8Array(await adapter.readBinary(normalizedPath));
+      content = new TextDecoder('utf-8').decode(sourceBytes);
+    } else {
+      content = await adapter.read(normalizedPath);
+      sourceBytes = new TextEncoder().encode(content);
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new PhysicalSourceAuthorityError(
@@ -74,7 +81,6 @@ export async function readAuthoritativeSource(
     );
   }
 
-  const sourceBytes = new TextEncoder().encode(content);
   const snapshot = Object.freeze({
     path: normalizedPath,
     content,
@@ -89,7 +95,7 @@ export async function readAuthoritativeSource(
 }
 
 export async function checkPhysicalSource(
-  adapter: Pick<DataAdapter, 'exists'> & Partial<Pick<DataAdapter, 'read'>>,
+  adapter: Pick<DataAdapter, 'exists'> & Partial<Pick<DataAdapter, 'read' | 'readBinary'>>,
   path: string,
 ): Promise<PhysicalSourceCheck> {
   const normalizedPath = normalizePhysicalPath(path);
@@ -102,7 +108,7 @@ export async function checkPhysicalSource(
       // Keep the adapter as the receiver. Obsidian's DataAdapter methods are
       // not guaranteed to be receiver-independent; extracting `read` into a
       // fresh object makes a real adapter lose its internal `this` binding.
-      const readableAdapter = adapter as Pick<DataAdapter, 'read'>;
+      const readableAdapter = adapter as Pick<DataAdapter, 'read'> & Partial<Pick<DataAdapter, 'readBinary'>>;
       const source = await readAuthoritativeSource(readableAdapter, normalizedPath);
       return { exists: true, source };
     } catch (error) {

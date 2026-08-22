@@ -367,6 +367,11 @@ export class AutoMaintainManager {
     // Wait for vault to settle after startup
     await new Promise(resolve => window.setTimeout(resolve, 3000));
 
+    // Startup normalization, cleanup, and log migration share the same global
+    // mutation boundary as ingest. This prevents the incomplete-page cleaner
+    // from archiving governed pages while their transaction is active.
+    await withIngestionLease(this.wikiEngine, async () => {
+
     const texts = TEXTS[this.settings.language];
     console.debug('[QuickFixes] ===== Startup quick fixes START =====');
     console.debug(`[QuickFixes] Settings: wikiFolder="${this.settings.wikiFolder}", startupCheck=${this.settings.startupCheck}, language=${this.settings.language}`);
@@ -393,7 +398,9 @@ export class AutoMaintainManager {
         // Fire-and-forget. The user gets a separate Notice when
         // the async creation completes; the startup-check summary
         // below is not blocked.
-        void this.createWelcomeNoteAsync(decision);
+        // Defer submission until this lease callback has yielded. The welcome
+        // writer obtains its own lease and must not re-enter this one.
+        window.setTimeout(() => { void this.createWelcomeNoteAsync(decision); }, 0);
       }
     } catch (e) {
       console.warn('[QuickFixes] Phase 0 failed:', e);
@@ -543,6 +550,7 @@ export class AutoMaintainManager {
     } else {
       console.debug('[QuickFixes] Notice suppressed by startupCheckNoticeLevel=silent');
     }
+    });
   }
 
   // === Phase 0: Onboarding Welcome Note (v1.23.0) ===

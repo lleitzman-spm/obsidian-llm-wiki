@@ -37,6 +37,7 @@ export interface CommandRegistryHost extends Plugin {
   selectFolderToIngest(): void;
   selectMultipleFilesToIngest(): void;
   ingestActiveFile(): void;
+  forceReingestActiveFile(): void;
   queryWiki(): void;
   lintWiki(trigger?: 'auto' | 'manual'): void;
   clearPdfCache(): Promise<void>;
@@ -109,6 +110,12 @@ export function registerWikiCommands(plugin: CommandRegistryHost): void {
     id: 'ingest-active-file',
     name: t.cmdIngestActiveFile,
     callback: () => plugin.ingestActiveFile()
+  });
+
+  plugin.addCommand({
+    id: 'force-reingest-active-file',
+    name: getText(plugin.settings.language, 'reingestConfirmTitle'),
+    callback: () => plugin.forceReingestActiveFile(),
   });
 
   plugin.addCommand({

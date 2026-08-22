@@ -34,7 +34,7 @@ import { formatRateLimitNotice } from '../core/rate-limit';
 import { extractSourceTags } from '../core/arrays';
 import { cleanMarkdownResponse } from '../core/markdown';
 import { ensureGeneratedPageLinks, guardGeneratedWikiLinks } from '../core/generated-link-guard';
-import { SchemaManager, SchemaTask } from '../schema/schema-manager';
+import { assertSafeVaultPath, SchemaManager, SchemaTask } from '../schema/schema-manager';
 import {
   buildSystemPrompt,
   getSectionLabels,
@@ -66,12 +66,56 @@ import { PathWriteQueue } from './engine-internals/path-write-queue';
 import {
   isActiveIngestionLeaseContext,
   withIngestionLease,
+  type IngestionLeaseContext,
 } from '../core/ingestion-coordinator';
+import {
+  GovernedReingestTransaction,
+  recoverGovernedReingestTransactions,
+  type GovernedForceReingest,
+} from '../core/governed-reingest';
 import {
   isAuthoritativeSourceSnapshot,
   readAuthoritativeSource,
+  checkPhysicalSource,
+  PhysicalSourceAuthorityError,
   type AuthoritativeSourceSnapshot,
 } from '../core/physical-source-authority';
+import { isExcludedFromSourcePicker } from '../core/folder-scope';
+
+// Governed force capabilities are intentionally issued here, inside the
+// engine's command-facing path.  The capability module exports only the
+// structural type; there is no generic/public issuer that another caller can
+// use to mint a bypass token.
+const issuedGovernedForceCapabilities = new WeakSet<object>();
+
+function governedPathIdentity(path: string): string {
+  return normalizePath(path).replace(/\\/g, '/').normalize('NFC').toLowerCase();
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function assertTextMarkdownSource(source: AuthoritativeSourceSnapshot): void {
+  let decoded: string;
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(source.bytes);
+  } catch {
+    throw new PhysicalSourceAuthorityError(
+      `Governed force re-ingest refuses non-UTF-8 Markdown bytes: ${source.path}`,
+    );
+  }
+  // eslint-disable-next-line no-control-regex -- force boundary rejects binary/control payloads hidden behind .md
+  if (decoded !== source.content || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(decoded)) {
+    throw new PhysicalSourceAuthorityError(
+      `Governed force re-ingest refuses binary/control content in Markdown: ${source.path}`,
+    );
+  }
+}
 
 /**
  * Issue #173 Symptom B: drop exact-string duplicates from a page-path list
@@ -159,6 +203,10 @@ export class WikiEngine {
   private abortController: AbortController | null = null;
   private externalIngestAbortSignal: AbortSignal | null = null;
   private externalIngestAbortHandler: (() => void) | null = null;
+  /** Set only while the command-owned force path has an active preimage. */
+  private governedMutationActive = false;
+  private governedWrittenPaths = new Set<string>();
+  private governedTransaction: GovernedReingestTransaction | null = null;
   private lintAbortController: AbortController | null = null;
   wasCancelled = false;
   private onIngestionStart: ((filename?: string) => void) | null = null;
@@ -206,6 +254,10 @@ export class WikiEngine {
     this.onProgress = onProgress || null;
     this.onDone = onDone || null;
     this.subtle = subtle;
+    this.schemaManager.setMutationCustody?.({
+      beforeFileMutation: (path, content) => this.journalGovernedFileMutation(path, content),
+      beforeFolderMutation: path => this.journalGovernedFolderMutation(path),
+    });
 
     const ctx: EngineContext = {
       app: this.app,
@@ -236,7 +288,10 @@ export class WikiEngine {
 
     this.ctx = ctx;
 
-    this.contradictionManager = new ContradictionManager(ctx);
+    this.contradictionManager = new ContradictionManager(
+      ctx,
+      path => this.journalGovernedFolderMutation(path),
+    );
     this.sourceAnalyzer = new SourceAnalyzer(ctx);
     this.pageFactory = new PageFactory(ctx);
 
@@ -329,11 +384,70 @@ export class WikiEngine {
     const file = this.resolveFileBySafePath(path);
     if (!(file instanceof TFile)) throw new Error(`Cannot complete missing wiki page: ${path}`);
     this.checkCancelled();
-    await this.app.vault.process(file, current => setGenerationComplete(current, true));
+    const current = await this.app.vault.read(file);
+    const completed = setGenerationComplete(current, true);
+    await this.journalGovernedFileMutation(file.path, completed);
+    await this.app.vault.process(file, () => completed);
     const verified = await this.app.vault.read(file);
     if (parseFrontmatter(verified)?.generation_complete !== 'true') {
       throw new Error(`Wiki page completion could not be verified: ${path}`);
     }
+  }
+
+  /** Flip governed pages only after every retryable generation phase succeeds. */
+  private async completeGovernedPages(): Promise<void> {
+    for (const path of this.governedWrittenPaths) {
+      this.checkCancelled();
+      await this.markPageComplete(path);
+    }
+  }
+
+  private async journalGovernedFileMutation(
+    path: string,
+    plannedContent?: string | Uint8Array,
+    plannedDeletion = false,
+  ): Promise<void> {
+    if (this.governedTransaction) {
+      await this.governedTransaction.beforeFileMutation(path, plannedContent, plannedDeletion);
+    }
+  }
+
+  private async journalGovernedFolderMutation(path: string): Promise<void> {
+    if (this.governedTransaction) await this.governedTransaction.beforeFolderMutation(path);
+  }
+
+  private async assertGovernedSourceAuthority(file: TFile, capability: GovernedForceReingest): Promise<void> {
+    if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
+      throw new PhysicalSourceAuthorityError(
+        `Active source identity changed before governed completion: ${file.path}`,
+      );
+    }
+    const authority = await checkPhysicalSource(this.app.vault.adapter, file.path);
+    if (!authority.exists || !authority.source) {
+      throw new PhysicalSourceAuthorityError(
+        authority.error ?? `Source disappeared before governed completion: ${file.path}`,
+      );
+    }
+    if (authority.source.path !== capability.sourceSnapshot.path
+      || authority.source.content !== capability.sourceSnapshot.content
+      || !bytesEqual(authority.source.bytes, capability.sourceSnapshot.bytes)) {
+      throw new PhysicalSourceAuthorityError(
+        `Authoritative source changed before governed completion: ${file.path}`,
+      );
+    }
+    await this.governedTransaction?.assertSourceUnchanged(authority.source);
+  }
+
+  /** Must complete before startup maintenance can inspect incomplete pages. */
+  async recoverGovernedForceTransactions(): Promise<number> {
+    if (!this.subtle) throw new Error('SubtleCrypto is required for governed re-ingest recovery');
+    // Reuse the engine-wide ingestion lease so recovery and every in-process
+    // ingest mutation are mutually exclusive. The journal module adds a
+    // vault-local recovery mutex for duplicate startup calls; neither boundary
+    // is represented as cross-process filesystem CAS.
+    return withIngestionLease(this, async () =>
+      recoverGovernedReingestTransactions(this.app, this.subtle!),
+    );
   }
 
   setDoneCallback(cb: ((report: IngestReport) => void) | null): void {
@@ -726,10 +840,12 @@ export class WikiEngine {
       });
     } catch (error) {
       if (error instanceof UnsupportedProviderError) {
+        if (opts?.forceReingest !== undefined) throw error;
         this.reportSkip(file, { reason: 'unsupported-pdf', detail: error.message }, opts);
         return;
       }
       if (error instanceof EncryptedPdfError) {
+        if (opts?.forceReingest !== undefined) throw error;
         this.reportSkip(file, { reason: 'unsupported-pdf', detail: error.message }, opts);
         return;
       }
@@ -757,6 +873,7 @@ export class WikiEngine {
       // runtimes (Ollama, vLLM, etc.).
       const message = inspectCauseChain(error);
       if (this.isPdfRelatedLlmError(message)) {
+        if (opts?.forceReingest !== undefined) throw error;
         this.reportSkip(file, { reason: 'unsupported-pdf', detail: message }, opts);
         return;
       }
@@ -795,8 +912,10 @@ export class WikiEngine {
         this.checkCancelled();
         const existing = this.app.vault.getAbstractFileByPath(sidecarPath);
         if (existing instanceof TFile) {
+          await this.journalGovernedFileMutation(existing.path, conversionResult.markdown);
           await this.app.vault.modify(existing, conversionResult.markdown);
         } else {
+          await this.journalGovernedFileMutation(sidecarPath, conversionResult.markdown);
           await this.app.vault.create(sidecarPath, conversionResult.markdown);
         }
         this.pathWriteQueue.registerExistingPath(sidecarPath);
@@ -856,11 +975,193 @@ export class WikiEngine {
     );
   }
 
+  private issueGovernedForceReingest(
+    sourcePath: string,
+    sourceSnapshot: AuthoritativeSourceSnapshot,
+    ingestionContext: IngestionLeaseContext,
+    signal: AbortSignal,
+  ): GovernedForceReingest {
+    const capability = Object.freeze({
+      sourcePath: governedPathIdentity(sourcePath),
+      sourceSnapshot,
+      ingestionContext,
+      signal,
+    });
+    issuedGovernedForceCapabilities.add(capability);
+    return capability;
+  }
+
+  private isGovernedForceReingest(
+    value: unknown,
+    sourcePath: string,
+    sourceSnapshot: AuthoritativeSourceSnapshot,
+    ingestionContext: IngestionLeaseContext | undefined,
+  ): value is GovernedForceReingest {
+    if (typeof value !== 'object' || value === null || !issuedGovernedForceCapabilities.has(value)) return false;
+    const capability = value as GovernedForceReingest;
+    return isAuthoritativeSourceSnapshot(capability.sourceSnapshot)
+      && capability.sourcePath === governedPathIdentity(sourcePath)
+      && sourceSnapshot.path === capability.sourceSnapshot.path
+      && capability.ingestionContext === ingestionContext
+      && !capability.signal.aborted
+      && isActiveIngestionLeaseContext(this, capability.ingestionContext);
+  }
+
+  /** Re-ingest one active source only through the registered command path. */
+  async forceReingestSource(file: TFile): Promise<boolean> {
+    const safeSourcePath = assertSafeVaultPath(file.path);
+    if (safeSourcePath !== file.path.normalize('NFC') || !safeSourcePath.endsWith('.md') || file.extension !== 'md') {
+      throw new Error('Governed force re-ingest is restricted to canonical Markdown (.md) physical sources');
+    }
+    if (isExcludedFromSourcePicker(safeSourcePath, this.settings.wikiFolder, this.app.vault.configDir)) {
+      throw new Error('Governed force re-ingest refuses generated, configuration, hidden, and trash surfaces');
+    }
+    const resolvedFile = this.app.vault.getAbstractFileByPath(file.path);
+    if (!(file instanceof TFile) || !(resolvedFile instanceof TFile) || resolvedFile !== file) {
+      throw new Error('Governed re-ingest requires the exact active TFile object resolved by this vault');
+    }
+    if (!this.subtle) throw new Error('SubtleCrypto is required for governed re-ingest custody');
+    if (this.abortController !== null) {
+      throw new Error('An ingestion is already active; governed re-ingest cannot be nested');
+    }
+    // Install cancellation before opening the confirmation modal. This keeps
+    // the lease signal and the UI cancel command alive for the entire modal →
+    // revalidation → ingest interval, not merely the LLM phase.
+    const controller = new AbortController();
+    this.abortController = controller;
+    this.wasCancelled = false;
+    this.onIngestionStart?.(file.basename);
+    try {
+      return await withIngestionLease(this, async (signal, ingestionContext) => {
+        this.checkCancelled();
+        const physicalCheck = await checkPhysicalSource(this.app.vault.adapter, file.path);
+        if (!physicalCheck.exists || !physicalCheck.source) {
+          throw new PhysicalSourceAuthorityError(
+            physicalCheck.error ?? `Source is not physically available: ${file.path}`,
+          );
+        }
+        assertTextMarkdownSource(physicalCheck.source);
+        const rejection = await this.checkRequirements(file, physicalCheck.source.content);
+        if (!rejection || rejection.reason !== 'duplicate') {
+          throw new Error(
+            `Governed re-ingest is only available for an already-ingested duplicate source: ${file.path}`,
+          );
+        }
+        const confirmed = this.onConfirmReingest
+          ? await this.onConfirmReingest(file, rejection)
+          : false;
+        this.checkCancelled();
+        if (!confirmed) {
+          this.reportSkip(file, rejection, { interactive: true });
+          return false;
+        }
+
+        // The confirmation is a TOCTOU boundary. Re-read immediately after it
+        // and bind the capability to the new physical identity and exact bytes.
+        const revalidated = await checkPhysicalSource(this.app.vault.adapter, file.path);
+        if (!revalidated.exists || !revalidated.source) {
+          throw new PhysicalSourceAuthorityError(
+            revalidated.error ?? `Source is no longer physically available: ${file.path}`,
+          );
+        }
+        assertTextMarkdownSource(revalidated.source);
+        if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
+          throw new PhysicalSourceAuthorityError(
+            `Active source identity changed while confirmation was open: ${file.path}`,
+          );
+        }
+        if (revalidated.source.path !== physicalCheck.source.path
+          || revalidated.source.content !== physicalCheck.source.content
+          || !bytesEqual(revalidated.source.bytes, physicalCheck.source.bytes)) {
+          throw new PhysicalSourceAuthorityError(
+            `Source changed while confirmation was open; refusing governed re-ingest: ${file.path}`,
+          );
+        }
+        this.checkCancelled();
+        if (!signal || signal.aborted || !ingestionContext || !isActiveIngestionLeaseContext(this, ingestionContext)) {
+          throw new DOMException('Ingestion lease cancelled', 'AbortError');
+        }
+        // The preimage can require many vault reads. Re-check once more at the
+        // exact handoff into ingestion so no source edit can slip into that
+        // interval with a still-valid confirmation.
+        const finalCheck = await checkPhysicalSource(this.app.vault.adapter, file.path);
+        if (!finalCheck.exists || !finalCheck.source) {
+          throw new PhysicalSourceAuthorityError(
+            finalCheck.error ?? `Source is no longer physically available: ${file.path}`,
+          );
+        }
+        if (finalCheck.source.path !== revalidated.source.path
+          || finalCheck.source.content !== revalidated.source.content
+          || !bytesEqual(finalCheck.source.bytes, revalidated.source.bytes)) {
+          throw new PhysicalSourceAuthorityError(
+            `Source changed before governed ingest began; refusing: ${file.path}`,
+          );
+        }
+        this.checkCancelled();
+        if (!signal || signal.aborted || !ingestionContext || !isActiveIngestionLeaseContext(this, ingestionContext)) {
+          throw new DOMException('Ingestion lease cancelled', 'AbortError');
+        }
+        const forceReingest = this.issueGovernedForceReingest(
+          file.path,
+          finalCheck.source,
+          ingestionContext,
+          signal,
+        );
+        if (!this.isGovernedForceReingest(forceReingest, file.path, finalCheck.source, ingestionContext)) {
+          throw new Error('Governed force capability failed immediate lease validation');
+        }
+        const transaction = await GovernedReingestTransaction.begin(this.app, finalCheck.source, this.subtle!);
+        this.governedTransaction = transaction;
+        this.governedMutationActive = true;
+        this.governedWrittenPaths.clear();
+        try {
+          await this.ingestSourceInternal(file, {
+            interactive: true,
+            sourceSnapshot: finalCheck.source,
+            ingestionContext,
+            forceReingest,
+          });
+          return true;
+        } catch (error) {
+          await transaction.rollback();
+          throw error;
+        } finally {
+          this.governedTransaction = null;
+          this.governedMutationActive = false;
+          this.governedWrittenPaths.clear();
+        }
+      }, controller.signal);
+    } finally {
+      if (this.abortController === controller) this.finishIngestion();
+    }
+  }
+
   private async ingestSourceInternal(file: TFile, opts?: IngestOptions) {
     console.debug('=== Ingestion started ===');
     console.debug('Source file:', file.path);
     if (opts?.contentOverride !== undefined) {
       console.debug('Content override length:', opts.contentOverride.length);
+    }
+
+    // Validate the unforgeable governed capability before *any* PDF dispatch,
+    // UI state, cache lookup/write, or optional sidecar mutation. The converted
+    // Markdown re-entry validates again against its authoritative snapshot.
+    if (opts?.forceReingest !== undefined) {
+      const claimed = opts.forceReingest as unknown;
+      const claimedSnapshot = typeof claimed === 'object' && claimed !== null
+        ? (claimed as Partial<GovernedForceReingest>).sourceSnapshot
+        : undefined;
+      if (!claimedSnapshot || !isAuthoritativeSourceSnapshot(claimedSnapshot)
+        || !this.isGovernedForceReingest(
+          claimed,
+          file.path,
+          claimedSnapshot,
+          opts.ingestionContext,
+        )) {
+        throw new Error(
+          `Refusing ungoverned force re-ingest for ${file.path}; use the source-specific Obsidian action`,
+        );
+      }
     }
 
     // v1.25.0 PR3 follow-up #7 + #8 (Bug C + D, e2e 2026-07-17): cancellation
@@ -936,12 +1237,30 @@ export class WikiEngine {
         );
       }
       fileContent = sourceSnapshot.content;
-      const rejection = opts?.forceReingest ? null : await this.checkRequirements(file, fileContent, opts?.batchCtx);
+      const governedForce = opts?.forceReingest;
+      if (governedForce !== undefined && !this.isGovernedForceReingest(
+        governedForce,
+        file.path,
+        sourceSnapshot,
+        opts?.ingestionContext,
+      )) {
+        throw new Error(
+          `Refusing ungoverned force re-ingest for ${file.path}; use the source-specific Obsidian action`,
+        );
+      }
+      const rejection = governedForce === undefined
+        ? await this.checkRequirements(file, fileContent, opts?.batchCtx)
+        : null;
       if (rejection) {
-        const confirmed = rejection.reason === 'duplicate' && opts?.interactive && this.onConfirmReingest
+        // A duplicate may only cross this gate with the command-owned
+        // capability. Generic ingest callers can remain interactive for UX,
+        // but their confirmation never mints a bypass token.
+        const confirmed = rejection.reason === 'duplicate'
+          && opts?.interactive
+          && this.onConfirmReingest
           ? await this.onConfirmReingest(file, rejection)
           : false;
-        if (!confirmed) {
+        if (!confirmed || opts?.forceReingest === undefined) {
           this.reportSkip(file, rejection, opts);
           this.finishIngestion();
           return;
@@ -1211,6 +1530,9 @@ export class WikiEngine {
           reason: f.reason,
         });
       }
+      if (opts?.forceReingest !== undefined && pageGenResult.failed.length > 0) {
+        throw new Error(`Governed re-ingest page generation failed for ${pageGenResult.failed.length} item(s)`);
+      }
       if (pageGenResult.rateLimitInfo) {
         console.warn(
           `[Rate Limit] Page generation: ${pageGenResult.rateLimitInfo.count} item(s) failed with 429, ` +
@@ -1290,6 +1612,9 @@ export class WikiEngine {
           NOTICE_RATE_LIMIT
         );
       }
+      if (opts?.forceReingest !== undefined && relatedResult.failed.length > 0) {
+        throw new Error(`Governed re-ingest related-page update failed for ${relatedResult.failed.length} item(s)`);
+      }
 
       // Reconcile only pages touched by this run. Entity/concept paths are
       // already authoritative write results; related-page tasks report names,
@@ -1315,12 +1640,25 @@ export class WikiEngine {
       for (const contradiction of analysis.contradictions) {
         try {
           await this.noteContradiction(contradiction);
-        } catch {
-          // non-critical
+        } catch (error) {
+          // Ordinary ingest keeps contradiction notes best-effort. Governed
+          // force re-ingest is an all-or-nothing transaction, so a failed
+          // contradiction artifact must roll the entire local mutation set
+          // back instead of committing a partial result.
+          if (opts?.forceReingest !== undefined) throw error;
         }
       }
       const contradictionTime = Date.now() - contradictionStart;
       console.debug(`[Time] Contradiction recording phase: ${contradictionTime}ms (${analysis.contradictions.length} items)`);
+
+      // Governed force writes stay auditable/incomplete until all generation
+      // phases have succeeded. A retryable transport or cancellation therefore
+      // cannot run the completion flip before the preimage rollback.
+      if (opts?.forceReingest !== undefined) {
+        await this.assertGovernedSourceAuthority(file, opts.forceReingest);
+        await this.completeGovernedPages();
+        await this.assertGovernedSourceAuthority(file, opts.forceReingest);
+      }
 
       // Stage 6: Index & Log Update
       const indexStart = Date.now();
@@ -1340,6 +1678,10 @@ export class WikiEngine {
         model: this.settings.model,
         sourceBytes: sourceSize,
       });
+      if (opts?.forceReingest !== undefined) {
+        await this.assertGovernedSourceAuthority(file, opts.forceReingest);
+        await this.governedTransaction?.commit();
+      }
       const indexTime = Date.now() - indexStart;
       console.debug(`[Time] Index Index & log update: ${indexTime}ms`);
 
@@ -1415,6 +1757,7 @@ export class WikiEngine {
           // v1.22.6 #204: Propagate trigger so completion can route UI.
           trigger: opts?.trigger,
         });
+        if (opts?.forceReingest !== undefined) throw error;
         return;
       }
 
@@ -1457,6 +1800,7 @@ export class WikiEngine {
     for (const folder of folders) {
       try {
         this.checkCancelled();
+        await this.journalGovernedFolderMutation(folder);
         await this.app.vault.createFolder(folder);
         console.debug('Creating folder:', folder);
       } catch (error) {
@@ -1466,6 +1810,7 @@ export class WikiEngine {
     }
 
     this.checkCancelled();
+    await this.journalGovernedFileMutation(normalizePath(`${this.settings.wikiFolder}/schema/config.md`));
     await this.schemaManager.ensureSchemaExists();
   }
 
@@ -1641,6 +1986,8 @@ export class WikiEngine {
   /** Write implementation for callers that already hold the canonical path lease. */
   private async createOrUpdateFileUnlocked(path: string, content: string): Promise<void> {
     this.checkCancelled();
+    const governedPath = this.governedMutationActive && this.isInWikiContentFolder(path, this.settings.wikiFolder);
+    if (governedPath) this.governedWrittenPaths.add(path);
     // The first physical write must carry the incomplete marker.  A crash or
     // cancellation between the write and the verified completion flip then
     // leaves an auditable page for startup cleanup instead of a false-green
@@ -1708,9 +2055,10 @@ export class WikiEngine {
         if (file instanceof TFile) {
           console.debug(`Attempt ${attempt + 1}: File exists, updating:`, path);
           this.checkCancelled();
+          await this.journalGovernedFileMutation(file.path, content);
           await this.app.vault.process(file, () => content);
           console.debug('Update success:', path);
-          if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
+          if (this.isInWikiContentFolder(path, this.settings.wikiFolder) && !this.governedMutationActive) {
             await this.markPageComplete(path);
           }
           this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
@@ -1728,9 +2076,10 @@ export class WikiEngine {
           if (resolved instanceof TFile) {
             console.debug('createOrUpdateFile: resolved via directory scan:', path);
             this.checkCancelled();
+            await this.journalGovernedFileMutation(resolved.path, content);
             await this.app.vault.process(resolved, () => content);
             console.debug('Update success (resolved path):', path);
-            if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
+            if (this.isInWikiContentFolder(path, this.settings.wikiFolder) && !this.governedMutationActive) {
               await this.markPageComplete(path);
             }
             this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
@@ -1743,9 +2092,10 @@ export class WikiEngine {
         // File genuinely does not appear to exist — attempt to create it.
         console.debug(`Attempt ${attempt + 1}: File not found, creating:`, path);
         this.checkCancelled();
+        await this.journalGovernedFileMutation(path, content);
         await this.app.vault.create(path, content);
         console.debug('Create success:', path);
-        if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
+        if (this.isInWikiContentFolder(path, this.settings.wikiFolder) && !this.governedMutationActive) {
           await this.markPageComplete(path);
         }
         this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
@@ -1769,9 +2119,10 @@ export class WikiEngine {
           }
           if (resolved instanceof TFile) {
             this.checkCancelled();
+            await this.journalGovernedFileMutation(resolved.path, content);
             await this.app.vault.process(resolved, () => content);
             console.debug('Update succeeded after file resolution:', path);
-            await this.markPageComplete(path);
+            if (!this.governedMutationActive) await this.markPageComplete(path);
             this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
             this.pathWriteQueue.registerExistingPath(resolved.path);
             this.invalidatePageCaches();
@@ -1799,9 +2150,10 @@ export class WikiEngine {
     }
     if (file) {
       this.checkCancelled();
+      await this.journalGovernedFileMutation(file.path, content);
       await this.app.vault.process(file, () => content);
       console.debug('Final update succeeded:', path);
-      await this.markPageComplete(path);
+      if (!this.governedMutationActive) await this.markPageComplete(path);
       this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
       this.pathWriteQueue.registerExistingPath(file.path);
       this.invalidatePageCaches();
@@ -1825,7 +2177,12 @@ export class WikiEngine {
     this.checkCancelled();
     const file = this.resolveFileBySafePath(path);
     if (!file) throw new Error(`Cannot delete missing file: ${path}`);
-    await this.app.fileManager.trashFile(file);
+    if (this.governedTransaction) {
+      await this.journalGovernedFileMutation(file.path, undefined, true);
+      await this.app.vault.adapter.remove(file.path);
+    } else {
+      await this.app.fileManager.trashFile(file);
+    }
     if (this.resolveFileBySafePath(path)) {
       throw new Error(`File deletion could not be verified: ${path}`);
     }

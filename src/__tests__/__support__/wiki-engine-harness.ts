@@ -59,6 +59,20 @@ function mkFile(path: string): TFile {
 
 export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHarness {
   const files = new Map<string, string>(Object.entries(opts.files ?? {}));
+  const fileObjects = new Map<string, TFile>();
+  const folders = new Set<string>();
+  const getFile = (path: string): TFile => {
+    let file = fileObjects.get(path);
+    if (!file) {
+      file = mkFile(path);
+      fileObjects.set(path, file);
+    }
+    return file;
+  };
+  for (const path of files.keys()) {
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i++) folders.add(parts.slice(0, i).join('/'));
+  }
   const llmRequests: LLMRequest[] = [];
   const writtenPaths: string[] = [];
   const reports: IngestReport[] = [];
@@ -67,21 +81,82 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
 
   const app = {
     vault: {
+      configDir: '.obsidian',
+      adapter: {
+        read: async (path: string) => {
+          const content = files.get(path);
+          if (content === undefined) throw new Error(`missing physical source: ${path}`);
+          return content;
+        },
+        exists: async (path: string) => files.has(path) || folders.has(path),
+        write: async (path: string, content: string) => { files.set(path, content); },
+        remove: async (path: string) => { files.delete(path); fileObjects.delete(path); },
+        rename: async (from: string, to: string) => {
+          const content = files.get(from);
+          if (content !== undefined) {
+            files.delete(from);
+            fileObjects.delete(from);
+            files.set(to, content);
+            return;
+          }
+          if (!folders.has(from)) throw new Error(`missing rename source: ${from}`);
+          const prefix = `${from}/`;
+          const replacements = [...files.entries()].filter(([path]) => path.startsWith(prefix));
+          for (const [path, value] of replacements) {
+            files.delete(path);
+            fileObjects.delete(path);
+            files.set(`${to}/${path.slice(prefix.length)}`, value);
+          }
+          const folderReplacements = [...folders].filter(path => path === from || path.startsWith(prefix));
+          for (const path of folderReplacements) folders.delete(path);
+          for (const path of folderReplacements) {
+            folders.add(path === from ? to : `${to}/${path.slice(prefix.length)}`);
+          }
+        },
+        mkdir: async (path: string) => { folders.add(path); },
+        rmdir: async (path: string, recursive: boolean) => {
+          const prefix = `${path}/`;
+          const children = [...files.keys()].filter(candidate => candidate.startsWith(prefix));
+          if (!recursive && children.length > 0) throw new Error(`folder not empty: ${path}`);
+          for (const child of children) { files.delete(child); fileObjects.delete(child); }
+          for (const folder of [...folders]) if (folder === path || (recursive && folder.startsWith(prefix))) folders.delete(folder);
+        },
+        list: async (path: string) => {
+          const prefix = path ? `${path}/` : '';
+          const listedFiles = [...files.keys()].filter(candidate => {
+            if (!candidate.startsWith(prefix)) return false;
+            return !candidate.slice(prefix.length).includes('/');
+          });
+          const listedFolders = [...folders].filter(candidate => {
+            if (!candidate.startsWith(prefix)) return false;
+            return !candidate.slice(prefix.length).includes('/');
+          });
+          return { files: listedFiles, folders: listedFolders };
+        },
+        readBinary: async (path: string) => {
+          const content = files.get(path);
+          if (content === undefined) throw new Error(`missing physical source: ${path}`);
+          return new TextEncoder().encode(content).buffer;
+        },
+        writeBinary: async (path: string, bytes: ArrayBuffer) => {
+          files.set(path, new TextDecoder().decode(new Uint8Array(bytes)));
+        },
+      },
       read: async (f: { path: string }) => files.get(f.path) ?? '',
-      create: async (p: string, c: string) => { files.set(p, c); },
+      create: async (p: string, c: string) => { files.set(p, c); getFile(p); },
       process: async (f: { path: string }, fn: (d: string) => string) => {
         files.set(f.path, fn(files.get(f.path) ?? ''));
       },
       modify: async (f: { path: string }, c: string) => { files.set(f.path, c); },
-      createFolder: async () => { /* no-op */ },
+      createFolder: async (path: string) => { folders.add(path); },
       getAbstractFileByPath: (p: string) => {
         if (opts.nfcNfdPaths?.includes(p)) return null;
-        if (files.has(p)) return mkFile(p);
+        if (files.has(p)) return getFile(p);
         // Return a TFolder stub for any intermediate directory path that has
         // children in the file map — needed by resolveFileInVault (Issue #173).
         const prefix = p.endsWith('/') ? p : p + '/';
         const children = [...files.keys()].filter(k => k.startsWith(prefix)).map(k =>
-          files.has(k) ? mkFile(k) : null
+          files.has(k) ? getFile(k) : null
         ).filter(Boolean) as TFile[];
         if (children.length > 0) {
           const folder = new TFolder();
@@ -91,8 +166,8 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
         }
         return null;
       },
-      getMarkdownFiles: () => { stats.vaultMarkdownScans++; return [...files.keys()].filter(p => p.endsWith('.md')).map(mkFile); },
-      getFiles: () => [...files.keys()].map(mkFile),
+      getMarkdownFiles: () => { stats.vaultMarkdownScans++; return [...files.keys()].filter(p => p.endsWith('.md')).map(getFile); },
+      getFiles: () => [...files.keys()].map(getFile),
     },
     metadataCache: {
       // Reflect stored frontmatter from the in-memory vault so content-hash
@@ -105,7 +180,7 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
       },
     },
     fileManager: {
-      trashFile: async (file: { path: string }) => { files.delete(file.path); },
+      trashFile: async (file: { path: string }) => { files.delete(file.path); fileObjects.delete(file.path); },
     },
   } as unknown as App;
 
@@ -136,6 +211,7 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
     // placeholder).
     (msg: string) => { progressMessages.push(msg); },
     (report: IngestReport) => { reports.push(report); }, // onDone
+    (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle,
   );
   // Wire ingestion callbacks (onIngestionStart / onIngestionEnd). Tests
   // can read `startedFilenames` to assert the status bar text was set.

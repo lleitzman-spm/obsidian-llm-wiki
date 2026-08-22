@@ -22,6 +22,7 @@ import type { SchemaTask } from '../schema/schema-manager';
 import { TEXTS } from '../texts';
 import { runLintWiki } from '../wiki/lint/controller';
 import { QueryView, VIEW_TYPE_QUERY } from '../wiki/query-engine';
+import { withIngestionLease } from '../core/ingestion-coordinator';
 
 /** Host interface: minimal surface for these methods to compile. */
 export interface QueryLintHost {
@@ -76,21 +77,23 @@ export const queryLintCommands = {
 
   async lintWiki(this: QueryLintHost, trigger: 'auto' | 'manual' = 'manual'): Promise<void> {
     if (!this.requireLLMReady()) return;
-    const signal = this.wikiEngine.startLintOperation();
-    try {
-      await runLintWiki({
-        app: this.app,
-        settings: this.settings,
-        llmClient: this.llmClient,
-        wikiEngine: this.wikiEngine,
-        // #328 Phase 1 follow-up: wire the shared system-prompt composer
-        // so fix-runners can mirror the Phase 1 "system layer is the
-        // sole tag-vocab injection point" pattern (e.g. retag).
-        buildSystemPrompt: (task) => this.wikiEngine.buildSystemPrompt(task as SchemaTask),
-        onAnalyzeSchema: (context?: string) => { void this.suggestSchemaUpdate(context); },
-      }, signal, trigger);
-    } finally {
-      this.wikiEngine.endLintOperation();
-    }
+    await withIngestionLease(this.wikiEngine, async () => {
+      const signal = this.wikiEngine.startLintOperation();
+      try {
+        await runLintWiki({
+          app: this.app,
+          settings: this.settings,
+          llmClient: this.llmClient,
+          wikiEngine: this.wikiEngine,
+          // #328 Phase 1 follow-up: wire the shared system-prompt composer
+          // so fix-runners can mirror the Phase 1 "system layer is the
+          // sole tag-vocab injection point" pattern (e.g. retag).
+          buildSystemPrompt: (task) => this.wikiEngine.buildSystemPrompt(task as SchemaTask),
+          onAnalyzeSchema: (context?: string) => { void this.suggestSchemaUpdate(context); },
+        }, signal, trigger);
+      } finally {
+        this.wikiEngine.endLintOperation();
+      }
+    });
   },
 };

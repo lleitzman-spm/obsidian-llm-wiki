@@ -18,7 +18,10 @@ import { isInFolderScope } from '../core/folder-scope';
 import { getVaultPathWriteQueue } from '../core/path-write-safety';
 
 export class ContradictionManager {
-  constructor(private ctx: EngineContext) {}
+  constructor(
+    private ctx: EngineContext,
+    private beforeFolderMutation?: (path: string) => Promise<void>,
+  ) {}
 
   async noteContradiction(contradiction: ContradictionInfo): Promise<void> {
     const pagePath = contradiction.source_page.replace(
@@ -84,6 +87,7 @@ ${contradiction.source_page}
     };
     const createFolder = async (): Promise<void> => {
       if (this.ctx.app.vault.getAbstractFileByPath(path)) return;
+      await this.beforeFolderMutation?.(path);
       await this.ctx.app.vault.createFolder(path);
       if (!this.ctx.app.vault.getAbstractFileByPath(path)) {
         throw new Error(`Contradictions folder creation could not be verified: ${path}`);

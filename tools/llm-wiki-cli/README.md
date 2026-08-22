@@ -23,7 +23,7 @@ WIKI_API_KEY=... node tools/llm-wiki-cli/run-llm-wiki.mjs \
 | `--vault` | Vault root. Required, no default. |
 | `--source` | Source file, relative to the vault. Required. |
 | `--dry-run` | Run everything, keep every write in memory. |
-| `--force` | Ignore the duplicate-content gate and re-ingest anyway. |
+| `--force` | Refused by the headless CLI. Canonical Markdown sources may use Obsidian's source-specific confirmed re-ingest action. |
 | `--extract-only` | Stop after extraction. Implies `--dry-run`, so a run that cannot write cannot touch the vault by forgetting a second flag. |
 | `--model` | Override the model, so two arms differ by which one answered rather than by an edited `data.json`. |
 | `--temperature` | Sampling temperature. Named for extraction because it comes from `extractionTemperature`, and it reaches more than extraction: the wrapper applies it to every `createMessage` that does not set its own, and the schema manager arrives at the same value by passing `extractionTemperature` itself. Unset, the server's own preset applies — and presets differ per model, so comparing two models without this compares their presets too. |
@@ -152,6 +152,6 @@ the plugin to set.
   unit-test mock uses. It is a reimplementation, not Obsidian's own code, so
   exotic inputs may differ.
 - **Confirmation prompts.** `onConfirmReingest` is never wired, so a
-  duplicate is always auto-skipped; use `--force` to re-ingest.
+  duplicate is always auto-skipped; use Obsidian's source-specific confirmed re-ingest action to re-ingest.
 - **PDF sources** should work (the converter's `adapter.readBinary` and disk
   cache are implemented) but have not been exercised.

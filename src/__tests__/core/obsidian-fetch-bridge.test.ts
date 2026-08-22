@@ -22,6 +22,7 @@ import {
   isObsidianFetchBridge,
   streamingObsidianFetch,
   isLocalBaseURL,
+  ProviderTransportError,
 } from '../../core/obsidian-fetch-bridge';
 
 const mockRequestUrl = vi.mocked(requestUrl);
@@ -216,6 +217,21 @@ describe('obsidianFetchBridge', () => {
       const res = await obsidianFetchBridge('https://api.example.com/v1/chat', { method: 'POST', body: '{}' });
       expect(res.status).toBe(200);
     });
+  });
+
+  it('types HTTP/2 protocol resets as retry-safe transport failures', async () => {
+    mockRequestUrl.mockRejectedValue(new Error('request failed: ERR_HTTP2_PROTOCOL_ERROR'));
+
+    await expect(
+      obsidianFetchBridge('https://api.example.com/v1/chat', { method: 'POST', body: '{}' }),
+    ).rejects.toMatchObject({
+      name: 'ProviderTransportError',
+      code: 'ERR_HTTP2_PROTOCOL_ERROR',
+      retryable: true,
+    });
+    await expect(
+      obsidianFetchBridge('https://api.example.com/v1/chat', { method: 'POST', body: '{}' }),
+    ).rejects.toBeInstanceOf(ProviderTransportError);
   });
 
   describe('Headers conversion', () => {

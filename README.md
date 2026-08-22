@@ -191,7 +191,7 @@ Three paths, pick what fits your setup:
 - **🔍 Lint health scan** — single command catches: duplicates, dead links, empty pages, orphans, missing aliases, contradictions.
 - **⚡ Smart Fix All** — one-click causal-order repair: fill aliases → merge duplicates → fix dead links → link orphans → expand empty pages, with per-phase report.
 - **📊 Operation history panel** — searchable, filterable UI for past ingestions, lint reports, and maintenance runs.
-- **🛡️ Pre-ingest gate** — empty / whitespace / frontmatter-only notes are rejected before any LLM call; content-hash dedup catches identical files across paths.
+- **🛡️ Pre-ingest gate** — empty / whitespace / frontmatter-only notes are rejected before any LLM call; content-hash dedup catches identical files across paths. A duplicate Markdown source can only be re-ingested through Obsidian's source-specific confirmation action; PDF/binary force re-ingest and headless CLI `--force` are refused.
 
 ### 🔒 Privacy
 
@@ -280,7 +280,7 @@ The flag set is small. The big ones:
 | `--vault` | Vault root. Required. |
 | `--source` | Source file relative to the vault. Required. One source per run — for batches, loop over it. |
 | `--dry-run` | Run the full pipeline, keep every write in memory. Drop it to write for real. |
-| `--force` | Re-ingest even if the duplicate-content gate says it's a duplicate. |
+| `--force` | Refused by the headless CLI; canonical Markdown sources may use Obsidian's source-specific confirmed re-ingest action. |
 | `--extract-only` | Stop after extraction. Implies `--dry-run` — you can't accidentally write from this flag. |
 | `--model` | Override the model from `data.json`. Useful for A/B comparisons. |
 | `--temperature` / `--top-p` | Sampling overrides. Pass them together: a preset is the pair. |

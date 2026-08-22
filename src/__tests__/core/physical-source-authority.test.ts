@@ -17,6 +17,18 @@ function file(path: string): TFile {
 }
 
 describe('physical source authority', () => {
+  it('binds authority to exact adapter bytes instead of reconstructed decoded text', async () => {
+    const bytes = Uint8Array.from([0xef, 0xbb, 0xbf, 0x61, 0x0d, 0x0a]);
+    const adapter = {
+      read: vi.fn().mockResolvedValue('a\r\n'),
+      readBinary: vi.fn().mockResolvedValue(bytes.buffer),
+    };
+
+    const snapshot = await readAuthoritativeSource(adapter, 'sources/exact.md');
+    expect([...snapshot.bytes]).toEqual([...bytes]);
+    expect(adapter.read).not.toHaveBeenCalled();
+  });
+
   it('keeps the Obsidian DataAdapter receiver for authoritative disk reads', async () => {
     class ReceiverBoundAdapter {
       private readonly contents = new Map([['sources/live.md', 'bytes from disk']]);

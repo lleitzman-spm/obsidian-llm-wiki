@@ -50,6 +50,7 @@ export interface IngestHost {
 export interface IngestMethods {
   selectSourceToIngest(): void;
   ingestActiveFile(): void;
+  forceReingestActiveFile(): void;
   selectFolderToIngest(): void;
   selectMultipleFilesToIngest(): void;
 }
@@ -85,6 +86,29 @@ export async function ingestPhysicalSingleSource(
 }
 
 export const ingestCommands = {
+  forceReingestActiveFile(this: IngestHost): void {
+    if (!this.requireLLMReady()) return;
+    if (!this.llmClient) {
+      new Notice(TEXTS[this.settings.language].errorNoApiKey);
+      return;
+    }
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) {
+      new Notice(getText(this.settings.language, 'noActiveFile'), NOTICE_NORMAL);
+      return;
+    }
+    this.showProgressFor(ProgressScope.IngestManual,
+      getText(this.settings.language, 'ingestSingleFileStart').replace('{filename}', activeFile.basename));
+    void this.wikiEngine.forceReingestSource(activeFile)
+      .then(ingested => { if (!ingested) this.dismissProgress(); })
+      .catch(error => {
+        console.error('Governed re-ingest failed:', error);
+        const errMsg = error instanceof Error ? error.message : String(error);
+        new Notice(TEXTS[this.settings.language].errorIngestFailed + errMsg, NOTICE_ERROR);
+        this.dismissProgress();
+      });
+  },
+
   async isAlreadyIngested(this: IngestHost, sourceFile: TFile): Promise<boolean> {
     const slug = slugify(sourceFile.basename, this.settings.slugCase === 'preserve');
     const wikiPath = `${this.settings.wikiFolder}/sources/${slug}.md`;

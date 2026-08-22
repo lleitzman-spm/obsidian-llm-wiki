@@ -136,6 +136,10 @@ export class LLMWikiPlugin extends Plugin {
       () => this.lintWiki('auto')
     );
 
+    // Recover governed force-reingest journals before cache housekeeping,
+    // watchers, or the incomplete-page cleaner can mutate their artifacts.
+    await this.wikiEngine.recoverGovernedForceTransactions();
+
     void this.performPdfCacheHousekeeping();
 
     if (this.settings.autoWatchSources) {

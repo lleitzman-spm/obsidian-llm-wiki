@@ -39,6 +39,12 @@ function finalizeSummaryLinks(
   return internal.finalizeGeneratedPageLinks.call(engine, summaryPath, actualPagePaths, touchedPaths);
 }
 
+function vaultFile(h: ReturnType<typeof createWikiEngineHarness>, path: string): TFile {
+  const file = h.app.vault.getAbstractFileByPath(path);
+  if (!(file instanceof TFile)) throw new Error(`missing test vault file: ${path}`);
+  return file;
+}
+
 describe('WikiEngine generated-page provenance reconciliation', () => {
   it('removes a preflight-only page when its write fails', async () => {
     const h = createWikiEngineHarness({
@@ -276,7 +282,7 @@ describe('WikiEngine.ingestSource — requirements gate (#164)', () => {
     expect(h.stats.llmCalls).toBe(0);
   });
 
-  it('re-ingests past the gate when the interactive prompt is confirmed', async () => {
+  it('keeps generic interactive ingest fail-closed even when its prompt is confirmed', async () => {
     const dupBody = 'dup body text';
     const h = createWikiEngineHarness({
       files: {
@@ -287,12 +293,291 @@ describe('WikiEngine.ingestSource — requirements gate (#164)', () => {
     });
     h.engine.onConfirmReingest = async () => true;
 
-    // Confirming bypasses the duplicate skip → the engine proceeds to analysis
-    // (which calls the LLM). Full ingest may hit mock edges; we only assert the
-    // gate was passed.
+    // A generic ingest caller cannot mint the governed force capability. The
+    // command-owned force path below is the only path that may proceed.
     try { await h.engine.ingestSource(sourceFile('sources/copy.md'), { interactive: true }); } catch { /* mock edge */ }
 
+    expect(h.stats.llmCalls).toBe(0);
+    expect(h.reports.at(-1)?.skipped).toBe(true);
+  });
+
+  it('runs governed force re-ingest only for the confirmed active physical source', async () => {
+    const dupBody = 'governed duplicate body';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/x_1.md': `---\ntype: source\ncontentHash: ${hashBody(dupBody)}\n---\n\nx`,
+        'sources/source10.md': dupBody,
+      },
+      llmResponses: [JSON.stringify({ source_title: 't', summary: 's', entities: [], concepts: [] })],
+    });
+    let confirmations = 0;
+    h.engine.onConfirmReingest = async () => { confirmations++; return true; };
+
+    await expect(h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md'))).resolves.toBe(true);
+
+    expect(confirmations).toBe(1);
     expect(h.stats.llmCalls).toBeGreaterThan(0);
+    expect(h.reports).toHaveLength(1);
+    expect(h.reports[0]?.sourceFile).toBe('sources/source10.md');
+    expect(h.writtenPaths.filter(path => path === 'wiki/log.md')).toHaveLength(1);
+  });
+
+  it('refuses a constructed path-bearing TFile instead of resolving by path alone', async () => {
+    const h = createWikiEngineHarness({ files: { 'sources/source10.md': 'existing source' } });
+    const constructed = sourceFile('sources/source10.md');
+
+    await expect(h.engine.forceReingestSource(constructed))
+      .rejects.toThrow('exact active TFile object');
+    expect(h.stats.llmCalls).toBe(0);
+    expect([...h.files.keys()]).toEqual(['sources/source10.md']);
+  });
+
+  it.each([
+    'wiki/sources/generated.md',
+    '.obsidian/plugins/karpathywiki/generated.md',
+    'notes/.trash/recovered.md',
+  ])('refuses generated/configuration/hidden Markdown as a force source: %s', async (path) => {
+    const h = createWikiEngineHarness({ files: { [path]: 'not a physical source' } });
+
+    await expect(h.engine.forceReingestSource(vaultFile(h, path)))
+      .rejects.toThrow('refuses generated, configuration, hidden, and trash surfaces');
+    expect(h.stats.llmCalls).toBe(0);
+    expect(h.writtenPaths).toEqual([]);
+  });
+
+  it('refuses invalid UTF-8 and control-bearing bytes hidden behind a .md extension', async () => {
+    const h = createWikiEngineHarness({ files: { 'sources/source10.md': 'placeholder' } });
+    const adapter = h.app.vault.adapter;
+    const originalReadBinary = adapter.readBinary!.bind(adapter);
+    adapter.readBinary = async (path: string) => path === 'sources/source10.md'
+      ? Uint8Array.from([0xff, 0xfe, 0x00, 0x41]).buffer
+      : originalReadBinary(path);
+
+    await expect(h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md')))
+      .rejects.toThrow('refuses non-UTF-8 Markdown bytes');
+    expect(h.stats.llmCalls).toBe(0);
+    expect(h.writtenPaths).toEqual([]);
+  });
+
+  it('re-reads and rejects a source edited while confirmation is open', async () => {
+    const dupBody = 'source body before confirmation';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/x_1.md': `---\ntype: source\ncontentHash: ${hashBody(dupBody)}\n---\n\nx`,
+        'sources/source10.md': dupBody,
+      },
+    });
+    let confirmStarted!: () => void;
+    let releaseConfirm!: () => void;
+    const confirmationStarted = new Promise<void>(resolve => { confirmStarted = resolve; });
+    const confirmation = new Promise<void>(resolve => { releaseConfirm = resolve; });
+    h.engine.onConfirmReingest = async () => {
+      confirmStarted();
+      await confirmation;
+      return true;
+    };
+
+    const run = h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md'));
+    await confirmationStarted;
+    h.files.set('sources/source10.md', 'edited after the modal opened');
+    releaseConfirm();
+
+    await expect(run).rejects.toThrow('Source changed while confirmation was open');
+    expect(h.files.get('wiki/sources/x_1.md')).toContain('contentHash:');
+    expect([...h.files.keys()].filter(path => path.startsWith('wiki/'))).toEqual(['wiki/sources/x_1.md']);
+    expect(h.stats.llmCalls).toBe(0);
+  });
+
+  it('fails closed when the confirmed source is deleted', async () => {
+    const dupBody = 'source body before deletion';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/x_1.md': `---\ntype: source\ncontentHash: ${hashBody(dupBody)}\n---\n\nx`,
+        'sources/source10.md': dupBody,
+      },
+    });
+    let confirmStarted!: () => void;
+    let releaseConfirm!: () => void;
+    const confirmationStarted = new Promise<void>(resolve => { confirmStarted = resolve; });
+    const confirmation = new Promise<void>(resolve => { releaseConfirm = resolve; });
+    h.engine.onConfirmReingest = async () => {
+      confirmStarted();
+      await confirmation;
+      return true;
+    };
+
+    const run = h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md'));
+    await confirmationStarted;
+    h.files.delete('sources/source10.md');
+    releaseConfirm();
+
+    await expect(run).rejects.toThrow('Could not read authoritative source file');
+    expect(h.stats.llmCalls).toBe(0);
+    expect([...h.files.keys()].filter(path => path.startsWith('wiki/'))).toEqual(['wiki/sources/x_1.md']);
+  });
+
+  it('re-reads authority before completion/index/log and rolls back when source bytes drift mid-generation', async () => {
+    const body = 'stable source before generation';
+    const originalSummary = `---\ntype: source\ncontentHash: ${hashBody(body)}\n---\n\noriginal summary`;
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/source10.md': originalSummary,
+        'sources/source10.md': body,
+      },
+      llmResponses: [JSON.stringify({ source_title: 'source10', summary: 'changed', entities: [], concepts: [] })],
+    });
+    h.engine.onConfirmReingest = async () => true;
+    const originalCreate = h.app.vault.create.bind(h.app.vault);
+    let drifted = false;
+    h.app.vault.create = async (path: string, content: string) => {
+      const created = await originalCreate(path, content);
+      if (!drifted && path.startsWith('wiki/')) {
+        drifted = true;
+        h.files.set('sources/source10.md', 'source changed during generation');
+      }
+      return created;
+    };
+
+    await expect(h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md')))
+      .rejects.toThrow('changed before governed completion');
+    expect(h.files.get('wiki/sources/source10.md')).toBe(originalSummary);
+    expect(h.files.has('wiki/index.md')).toBe(false);
+    expect(h.files.has('wiki/log.md')).toBe(false);
+  });
+
+  it('revalidates source after index/log writes and before durable transaction commit', async () => {
+    const body = 'stable until final log';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/source10.md': `---\ntype: source\ncontentHash: ${hashBody(body)}\n---\n\noriginal`,
+        'sources/source10.md': body,
+      },
+      llmResponses: [JSON.stringify({ source_title: 'source10', summary: 's', entities: [], concepts: [] })],
+    });
+    h.engine.onConfirmReingest = async () => true;
+    const originalCreate = h.app.vault.create.bind(h.app.vault);
+    h.app.vault.create = async (path: string, content: string) => {
+      const created = await originalCreate(path, content);
+      if (path === 'wiki/log.md') h.files.set('sources/source10.md', 'changed at final commit boundary');
+      return created;
+    };
+
+    await expect(h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md')))
+      .rejects.toThrow('changed before governed completion');
+    expect(h.files.has('wiki/index.md')).toBe(false);
+    expect(h.files.has('wiki/log.md')).toBe(false);
+  });
+
+  it('cancels before confirmation can mint a capability', async () => {
+    const dupBody = 'source body cancellation';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/x_1.md': `---\ntype: source\ncontentHash: ${hashBody(dupBody)}\n---\n\nx`,
+        'sources/source10.md': dupBody,
+      },
+    });
+    let confirmStarted!: () => void;
+    let releaseConfirm!: () => void;
+    const confirmationStarted = new Promise<void>(resolve => { confirmStarted = resolve; });
+    const confirmation = new Promise<void>(resolve => { releaseConfirm = resolve; });
+    h.engine.onConfirmReingest = async () => {
+      confirmStarted();
+      await confirmation;
+      return true;
+    };
+
+    const run = h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md'));
+    await confirmationStarted;
+    h.engine.cancelIngestion();
+    releaseConfirm();
+
+    await expect(run).rejects.toThrow('Ingestion lease cancelled');
+    expect(h.engine.isIngesting()).toBe(false);
+    expect(h.stats.llmCalls).toBe(0);
+    expect([...h.files.keys()].filter(path => path.startsWith('wiki/'))).toEqual(['wiki/sources/x_1.md']);
+  });
+
+  it('rolls back generated pages and leaves index/log untouched after a mid-batch transport failure', async () => {
+    const dupBody = 'source body transport failure';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/x_1.md': `---\ntype: source\ncontentHash: ${hashBody(dupBody)}\n---\n\noriginal`,
+        'sources/source10.md': dupBody,
+      },
+      llmResponses: [
+        JSON.stringify({
+          entities: [{ name: 'Generated Entity', type: 'other', summary: 'generated', mentions_in_source: [] }],
+          concepts: [],
+        }),
+        JSON.stringify({ source_title: 't', summary: 's', entities: [], concepts: [] }),
+      ],
+    });
+    h.engine.onConfirmReingest = async () => true;
+    const originalCreate = h.app.vault.create.bind(h.app.vault);
+    h.app.vault.create = async (path: string, content: string) => {
+      if (path.includes('/entities/')) throw new Error('simulated mid-batch transport failure');
+      return originalCreate(path, content);
+    };
+
+    const before = new Map(h.files);
+    await expect(h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md')))
+      .rejects.toThrow('Governed re-ingest page generation failed');
+
+    const userFiles = [...h.files].filter(([path]) => !path.startsWith('.obsidian/'));
+    expect(userFiles).toEqual([...before]);
+    expect(h.files.has('wiki/index.md')).toBe(false);
+    expect(h.files.has('wiki/log.md')).toBe(false);
+    expect(h.engine.isIngesting()).toBe(false);
+  });
+
+  it('treats contradiction artifact failure as fatal and rolls governed writes back', async () => {
+    const body = 'source body with a contradiction';
+    const original = `---\ntype: source\ncontentHash: ${hashBody(body)}\n---\n\noriginal summary`;
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/source10.md': original,
+        'sources/source10.md': body,
+      },
+      llmResponses: [JSON.stringify({
+        source_title: 'source10',
+        summary: 'replacement',
+        entities: [],
+        concepts: [],
+        contradictions: [{
+          claim: 'new claim',
+          contradicted_by: 'old claim',
+          source_page: 'wiki/concepts/existing.md',
+          resolution: 'review',
+        }],
+      })],
+    });
+    h.engine.onConfirmReingest = async () => true;
+    h.engine.noteContradiction = async () => { throw new Error('simulated contradiction write failure'); };
+
+    await expect(h.engine.forceReingestSource(vaultFile(h, 'sources/source10.md')))
+      .rejects.toThrow('simulated contradiction write failure');
+    expect(h.files.get('wiki/sources/source10.md')).toBe(original);
+    expect(h.files.has('wiki/index.md')).toBe(false);
+    expect(h.files.has('wiki/log.md')).toBe(false);
+  });
+
+  it('rejects a generic or forged force flag without any mutation', async () => {
+    const dupBody = 'forged duplicate body';
+    const h = createWikiEngineHarness({
+      files: {
+        'wiki/sources/x_1.md': `---\ntype: source\ncontentHash: ${hashBody(dupBody)}\n---\n\nx`,
+        'sources/source10.md': dupBody,
+      },
+    });
+    const before = new Map(h.files);
+
+    await expect(h.engine.ingestSource(sourceFile('sources/source10.md'), {
+      forceReingest: true as never,
+    })).rejects.toThrow('Refusing ungoverned force re-ingest');
+
+    expect(h.stats.llmCalls).toBe(0);
+    expect(h.writtenPaths).toEqual([]);
+    expect([...h.files]).toEqual([...before]);
   });
 });
 

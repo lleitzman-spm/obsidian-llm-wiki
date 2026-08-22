@@ -25,6 +25,21 @@
 
 import { requestUrl, RequestUrlParam } from 'obsidian';
 
+/** A retry-safe provider transport interruption (for example HTTP/2 reset). */
+export class ProviderTransportError extends TypeError {
+  readonly retryable = true;
+  readonly code: string;
+
+  constructor(code: string, cause: unknown) {
+    super(
+      `Provider transport interrupted (${code}). No response was committed; retry the same source-specific operation safely.`,
+    );
+    this.name = 'ProviderTransportError';
+    this.code = code;
+    if (cause !== undefined) (this as Error & { cause?: unknown }).cause = cause;
+  }
+}
+
 export interface ObsidianFetchInit {
   method?: string;
   /** Fetch-API HeadersInit: plain object, Headers instance, or tuple array. */
@@ -130,6 +145,8 @@ export async function obsidianFetchBridge(
     // Re-throw as a fetch-like TypeError so AI-SDK treats it as a
     // network failure (vs. an API error with a body).
     if (err instanceof Error) {
+      const http2Code = /ERR_HTTP2_PROTOCOL_ERROR/i.exec(`${err.name} ${err.message}`)?.[0];
+      if (http2Code) throw new ProviderTransportError('ERR_HTTP2_PROTOCOL_ERROR', err);
       throw new TypeError(`obsidianFetchBridge network error: ${err.message}`);
     }
     throw err;

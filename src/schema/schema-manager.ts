@@ -300,6 +300,10 @@ Rules:
 }
 
 export class SchemaManager {
+  private mutationCustody?: {
+    beforeFileMutation: (path: string, content: string) => Promise<void>;
+    beforeFolderMutation: (path: string) => Promise<void>;
+  };
   private app: App;
   private settings: LLMWikiSettings;
   private getLLMClient: () => LLMClient | null;
@@ -338,6 +342,13 @@ export class SchemaManager {
   updateSettings(settings: LLMWikiSettings): void {
     this.settings = settings;
     this.invalidateCache();
+  }
+
+  setMutationCustody(hooks: {
+    beforeFileMutation: (path: string, content: string) => Promise<void>;
+    beforeFolderMutation: (path: string) => Promise<void>;
+  }): void {
+    this.mutationCustody = hooks;
   }
 
   async getSchemaContext(task: SchemaTask = 'full'): Promise<string> {
@@ -437,9 +448,13 @@ ${selectedBody}
 
       const schemaFolder = assertSafeVaultPath(`${this.settings.wikiFolder}/schema`);
       try {
+        await this.mutationCustody?.beforeFolderMutation(schemaFolder);
         await held.runRaw(canonicalPath, () => this.app.vault.createFolder(schemaFolder));
-      } catch {
-        // Already exists
+      } catch (error) {
+        // Obsidian may report an already-existing directory as an error. A
+        // custody/journal failure is never benign, so accept the catch only
+        // when the folder is now physically present.
+        if (!this.app.vault.getAbstractFileByPath(schemaFolder)) throw error;
       }
 
       const today = new Date().toISOString().slice(0, 10);
@@ -452,6 +467,7 @@ auto_suggestion_count: 0
 
 ${body}`;
 
+      await this.mutationCustody?.beforeFileMutation(canonicalPath, content);
       await held.runRaw(canonicalPath, () => this.app.vault.create(canonicalPath, content));
       await verifyVaultFile(this.app, canonicalPath, content, 'Schema creation', held);
       this.cachedBody = body;
@@ -479,12 +495,16 @@ ${body}`;
       // Ensure parent folders exist (handles empty vault or custom wikiFolder)
       const schemaFolder = assertSafeVaultPath(`${this.settings.wikiFolder}/schema`);
       try {
+        await this.mutationCustody?.beforeFolderMutation(schemaFolder);
         await held.runRaw(canonicalPath, () => this.app.vault.createFolder(schemaFolder));
-      } catch {
-        // Already exists or path invalid
+      } catch (error) {
+        // Preserve the ordinary already-exists behavior without swallowing a
+        // governed custody failure or an invalid/missing parent path.
+        if (!this.app.vault.getAbstractFileByPath(schemaFolder)) throw error;
       }
 
       const existing = this.app.vault.getAbstractFileByPath(canonicalPath);
+      await this.mutationCustody?.beforeFileMutation(canonicalPath, content);
       if (existing instanceof TFile) {
         await held.runRaw(canonicalPath, () => this.app.vault.process(existing, () => content));
       } else {

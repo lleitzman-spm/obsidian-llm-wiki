@@ -51,7 +51,7 @@ const INGEST_USAGE = `Usage:
   --vault         Path to the Obsidian vault. Required.
   --source        Source file path relative to the vault. Required.
   --dry-run       Run the full ingest but keep every write in memory.
-  --force         Ignore the duplicate-content gate and re-ingest anyway.
+  --force         Refused for safety; use Obsidian's source-specific confirmed re-ingest action.
   --extract-only  Stop after extraction; write no pages. Implies --dry-run.
   --seed          Fix the sampling seed. Without it the provider picks one per
                   request. Some local servers honour it, not all: LM Studio
@@ -611,6 +611,12 @@ async function runIngest(argv: string[]): Promise<void> {
     return;
   }
 
+  if (options.force) {
+    throw new Error(
+      'Direct CLI force re-ingest is refused. Use the source-specific Obsidian re-ingest action, which performs physical preflight and interactive confirmation.',
+    );
+  }
+
   await installObsidianGlobals();
 
   // A nonexistent vault is the most common first-run mistake; surface it as a
@@ -684,10 +690,7 @@ async function runIngest(argv: string[]): Promise<void> {
     if (options.extractOnly) {
       await runExtractionOnly(engine, sourceFile);
     } else {
-      await engine.ingestSource(sourceFile, {
-        interactive: false,
-        ...(options.force ? { forceReingest: true } : {}),
-      });
+      await engine.ingestSource(sourceFile, { interactive: false });
     }
   } finally {
     printSummary(options, report, totals, app.vault.writes, Date.now() - startedAt);

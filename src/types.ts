@@ -8,6 +8,7 @@ import type { OutputMode } from './llm-sdk/output-mode-prober';
 import type { PathWriteLease } from './wiki/engine-internals/path-write-queue';
 import type { AuthoritativeSourceSnapshot } from './core/physical-source-authority';
 import type { IngestionLeaseContext } from './core/ingestion-coordinator';
+import type { GovernedForceReingest } from './core/governed-reingest';
 
 /**
  * Issue #244 — Programmatic Mentions writes (v1.23.3 / v1.24.0).
@@ -600,8 +601,8 @@ export interface IngestOptions {
   batchCtx?: BatchRequirementsContext;
   /** Interactive (explicit single-file) ingest — prompt the user on a duplicate. */
   interactive?: boolean;
-  /** Bypass the uniqueness check (the user confirmed re-ingest). */
-  forceReingest?: boolean;
+  /** Internal capability issued only by the source-specific confirmed action. */
+  forceReingest?: GovernedForceReingest;
   /**
    * v1.22.6 #204: Distinguishes watch-mode auto-ingest from manual ingest.
    * Propagated into IngestReport.trigger so the completion callback can

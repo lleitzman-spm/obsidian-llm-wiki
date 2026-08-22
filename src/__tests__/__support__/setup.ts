@@ -169,6 +169,11 @@ Object.defineProperty(globalThis, 'crypto', {
   configurable: true,
   writable: true,
   value: {
+    getRandomValues: <T extends ArrayBufferView>(array: T): T => {
+      const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 37 + 11) & 0xff;
+      return array;
+    },
     subtle: {
       digest: async (_algo: string, data: ArrayBuffer) => {
         // Test-only SubtleCrypto.digest: produce a deterministic 32-byte

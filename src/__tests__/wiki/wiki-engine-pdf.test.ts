@@ -56,6 +56,12 @@ function pdfFile(path = 'sources/paper.pdf'): TFile {
   return file;
 }
 
+function vaultPdfFile(h: ReturnType<typeof createWikiEngineHarness>, path: string): TFile {
+  const file = h.app.vault.getAbstractFileByPath(path);
+  if (!(file instanceof TFile)) throw new Error(`missing test PDF: ${path}`);
+  return file;
+}
+
 describe('WikiEngine.ingestSource — PDF cache-only branch (#PR2 redo)', () => {
   beforeEach(() => {
     mockedConvert.mockReset();
@@ -122,6 +128,51 @@ describe('WikiEngine.ingestSource — PDF cache-only branch (#PR2 redo)', () => 
     expect(wikiPagesWritten(h.writtenPaths)).toEqual([]);
     expect(h.reports.at(-1)?.skipped).toBe(true);
     expect(h.reports.at(-1)?.rejectedFiles?.[0]?.reason).toBe('unsupported-pdf');
+  });
+
+  it('refuses governed PDF force before confirmation, converter, cache, or sidecar work', async () => {
+    const h = createWikiEngineHarness({
+      files: {
+        'sources/paper.pdf': '%PDF binary bytes',
+        'wiki/sources/paper.md': '---\ntype: source\nsource_file: "[[sources/paper.pdf]]"\ncontentHash: converted-markdown-hash\n---\n\nprior summary',
+      },
+    });
+    h.engine.onConfirmReingest = async () => { throw new Error('must not prompt'); };
+
+    await expect(h.engine.forceReingestSource(vaultPdfFile(h, 'sources/paper.pdf')))
+      .rejects.toThrow('restricted to canonical Markdown');
+    expect(mockedConvert).not.toHaveBeenCalled();
+  });
+
+  it('refuses a provider-supported PDF force without opening a transaction', async () => {
+    const h = createWikiEngineHarness({
+      files: {
+        'sources/paper.pdf': '%PDF binary bytes',
+        'wiki/sources/paper.md': '---\ntype: source\nsource_file: "[[sources/paper.pdf]]"\n---\n\nprior summary',
+      },
+    });
+    h.engine.onConfirmReingest = async () => true;
+
+    await expect(h.engine.forceReingestSource(vaultPdfFile(h, 'sources/paper.pdf')))
+      .rejects.toThrow('restricted to canonical Markdown');
+    expect(h.files.get('wiki/sources/paper.md')).toContain('prior summary');
+    await expect(h.engine.recoverGovernedForceTransactions()).resolves.toBe(0);
+    const journals = await h.app.vault.adapter.list('.obsidian/plugins/karpathywiki/governed-reingest-transactions');
+    expect(journals.folders).toEqual([]);
+  });
+
+  it('rejects a forged generic PDF force flag before cache, sidecar, or converter mutation', async () => {
+    const h = createWikiEngineHarness({
+      files: { 'sources/paper.pdf': '%PDF binary bytes' },
+      settings: { writePdfMarkdownToVault: true },
+    });
+    const before = new Map(h.files);
+
+    await expect(h.engine.ingestSource(vaultPdfFile(h, 'sources/paper.pdf'), {
+      forceReingest: true as never,
+    })).rejects.toThrow('Refusing ungoverned force re-ingest');
+    expect(mockedConvert).not.toHaveBeenCalled();
+    expect([...h.files]).toEqual([...before]);
   });
 
   it('propagates LLM errors verbatim (preserves retry/log semantics)', async () => {
