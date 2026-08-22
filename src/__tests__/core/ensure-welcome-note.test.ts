@@ -61,6 +61,38 @@ function makeTranslatingClient(marker = '[ZH]') {
 }
 
 describe('ensureWelcomeNote — Tier A (empty vault)', () => {
+  it('serializes concurrent creation attempts on one adapter', async () => {
+    const vault = makeFakeVault();
+    vault.written.set('notes/existing.md', '# Existing');
+    let creates = 0;
+    const originalCreate = vault.create.bind(vault);
+    vault.create = async (path, content) => {
+      creates += 1;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await originalCreate(path, content);
+    };
+
+    await Promise.all([
+      ensureWelcomeNote({
+        vault,
+        settings: { wikiFolder: 'wiki', createWelcomeNote: true },
+        targetLanguage: 'en',
+        createdAt: '2026-06-27',
+        smokeTestProbe: async () => ({ ok: true, provider: 'OpenAI', model: 'gpt-4o-mini' }),
+      }),
+      ensureWelcomeNote({
+        vault,
+        settings: { wikiFolder: 'wiki', createWelcomeNote: true },
+        targetLanguage: 'en',
+        createdAt: '2026-06-27',
+        smokeTestProbe: async () => ({ ok: true, provider: 'OpenAI', model: 'gpt-4o-mini' }),
+      }),
+    ]);
+
+    expect(creates).toBe(1);
+    expect(vault.written.has(TEST_WELCOME_PATH)).toBe(true);
+  });
+
   it('does NOT create welcome note when LLM is not configured', async () => {
     // Brand-new vault + no LLM → tier A short-circuits. The user
     // should run Configuration Test first; no Welcome is useful

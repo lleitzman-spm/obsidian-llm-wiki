@@ -19,12 +19,22 @@ import { TOKENS_CONVERSATION_EXTRACTION, TOKENS_CONVERSATION_PAGE, TOKENS_PAGE_G
 import { PageFactory } from './page-factory';
 import { SourceAnalysisLLMSchema, ConversationDedupStatusLLMSchema } from '../llm-sdk/output-schemas';
 import { callLlm } from '../core/llm-dispatch';
+import { guardGeneratedWikiLinks, ensureGeneratedPageLinks, type GeneratedLinkPageRef } from '../core/generated-link-guard';
+import type { PathWriteLease } from './engine-internals/path-write-queue';
 
 export interface ConversationOrchestration {
   ensureWikiStructure: () => Promise<void>;
   apiDelay: (ms?: number) => Promise<void>;
-  generateIndex: () => Promise<void>;
-  updateLog: (operation: string, analysis: SourceAnalysis) => Promise<void>;
+  /**
+   * The optional lease is supplied only by a write-gate aware production
+   * orchestrator. Legacy callers may keep the one/two argument functions.
+   * Conversation ingest never calls a lease-aware function without first
+   * entering `withWriteGate`, which prevents nested path-lock deadlocks.
+   */
+  generateIndex: (held?: PathWriteLease) => Promise<void>;
+  updateLog: (operation: string, analysis: SourceAnalysis, held?: PathWriteLease) => Promise<void>;
+  /** Acquire index + log paths once and pass the held lease to both writers. */
+  withWriteGate?: <T>(paths: readonly string[], operation: (held: PathWriteLease) => Promise<T>) => Promise<T>;
 }
 
 export interface ConversationHistory {
@@ -190,13 +200,14 @@ CRITICAL RULES:
       throw new Error('Conversation analysis JSON parsing failed');
     }
 
-    // The page lists are bookkeeping we own, not content the model reports: the
-    // prompt asks for them as empty arrays and we push to them as pages are
-    // written. Assert them here rather than trusting the reply to have included
-    // them — a model that omits `updated_pages` must not turn into a TypeError
-    // several stages later, once pages have already been written to disk.
-    parsed.created_pages = parsed.created_pages ?? [];
-    parsed.updated_pages = parsed.updated_pages ?? [];
+    // The page lists are bookkeeping we own, not content the model reports.
+    // Always discard model-supplied values: accepting a fabricated path here
+    // would make the index/log and the final provenance pass claim a page that
+    // was never written.
+    parsed.created_pages = [];
+    parsed.updated_pages = [];
+    parsed.entities = parsed.entities ?? [];
+    parsed.concepts = parsed.concepts ?? [];
 
     console.debug('[LLM分析结果]', parsed);
     console.debug('[生成的标题]', parsed.source_title);
@@ -252,8 +263,15 @@ CRITICAL RULES:
     });
 
     const cleanedSummary = cleanMarkdownResponse(summaryPageContent);
-    await this.ctx.createOrUpdateFile(summaryPath, cleanedSummary);
+    // The child paths are preflight candidates at this point, so the summary
+    // may retain useful display labels for them during the child-write phase.
+    // They are not authoritative: the final pass below removes any candidate
+    // whose write failed and adds only verified paths. Unknown/fabricated
+    // targets are still stripped before this first write.
+    await this.writeGuardedFile(summaryPath, cleanedSummary, convPlannedPaths);
     parsed.created_pages.push(summaryPath);
+
+    const actualPagePaths: string[] = [summaryPath];
 
     const failedItems: Array<{ type: 'entity' | 'concept'; name: string; reason: string }> = [];
 
@@ -265,8 +283,16 @@ CRITICAL RULES:
       try {
         const entityResult = await this.pageFactory.createOrUpdateEntityPage(entity, parsed, { path: summaryPath, basename: semanticSlug }, convPlannedPaths);
         if (entityResult.path) {
+          await this.verifyWrittenPage(entityResult.path, 'entity', entity.name);
           (entityResult.created ? parsed.created_pages : parsed.updated_pages)
             .push(entityResult.path);
+          actualPagePaths.push(entityResult.path);
+        } else {
+          failedItems.push({
+            type: 'entity',
+            name: entity.name,
+            reason: 'Page path resolution did not produce a writable path',
+          });
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
@@ -283,8 +309,16 @@ CRITICAL RULES:
       try {
         const conceptResult = await this.pageFactory.createOrUpdateConceptPage(concept, parsed, { path: summaryPath, basename: semanticSlug }, convPlannedPaths);
         if (conceptResult.path) {
+          await this.verifyWrittenPage(conceptResult.path, 'concept', concept.name);
           (conceptResult.created ? parsed.created_pages : parsed.updated_pages)
             .push(conceptResult.path);
+          actualPagePaths.push(conceptResult.path);
+        } else {
+          failedItems.push({
+            type: 'concept',
+            name: concept.name,
+            reason: 'Page path resolution did not produce a writable path',
+          });
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
@@ -293,10 +327,14 @@ CRITICAL RULES:
       }
     }
 
+    // Remove links to failed/preflight-only pages from every generated page,
+    // then add exactly the paths that were verified on disk. This is the
+    // authoritative reconciliation boundary for conversation ingest.
+    await this.reconcileGeneratedPages(summaryPath, actualPagePaths, convPlannedPaths);
+
     this.ctx.onProgress?.(getText(this.ctx.settings.language, 'convGeneratingIndex'));
-    await this.orch.generateIndex();
     parsed.contradictions = parsed.contradictions || [];
-    await this.orch.updateLog('conversation', parsed);
+    await this.generateIndexAndLog(parsed);
 
     const entitiesCreated = parsed.created_pages.filter(p => p.includes('/entities/')).length;
     const conceptsCreated = parsed.created_pages.filter(p => p.includes('/concepts/')).length;
@@ -309,7 +347,10 @@ CRITICAL RULES:
       conceptsCreated,
       failedItems,
       contradictionsFound: parsed.contradictions?.length || 0,
-      success: true,
+      success: failedItems.length === 0,
+      ...(failedItems.length > 0
+        ? { errorMessage: `Conversation ingest completed partially: ${failedItems.length} item(s) failed` }
+        : {}),
       elapsedSeconds: Math.round((Date.now() - startTime) / 1000),
     };
 
@@ -318,6 +359,155 @@ CRITICAL RULES:
 
     this.ctx.onDone?.(report);
     return report;
+  }
+
+  /**
+   * Verify a PageFactory result before allowing it into provenance. A path
+   * returned by a resolver is only a plan; it becomes authoritative after the
+   * vault can read the page and the path remains in the expected namespace.
+   */
+  private async verifyWrittenPage(
+    path: string,
+    type: 'entity' | 'concept',
+    name: string,
+  ): Promise<void> {
+    const folder = type === 'entity' ? 'entities' : 'concepts';
+    const prefix = `${this.ctx.settings.wikiFolder}/${folder}/`;
+    if (!path.startsWith(prefix) || !path.endsWith('.md')) {
+      throw new Error(`Conversation ${type} "${name}" returned invalid page path: ${path}`);
+    }
+    if (await this.ctx.tryReadFile(path) === null) {
+      throw new Error(`Conversation ${type} "${name}" returned a page path that was not written: ${path}`);
+    }
+  }
+
+  private async existingGeneratedRefs(): Promise<GeneratedLinkPageRef[]> {
+    const wikiPages = await this.ctx.getExistingWikiPages();
+    const external = this.ctx.app.vault.getMarkdownFiles()
+      .filter(file => !file.path.startsWith(`${this.ctx.settings.wikiFolder}/`))
+      .map(file => ({ path: file.path, title: file.basename }));
+    return [...wikiPages, ...external];
+  }
+
+  /** Guard one conversation-owned write, using an already-held lease when one exists. */
+  private async writeGuardedFile(
+    path: string,
+    content: string,
+    additionalPaths: string[],
+  ): Promise<void> {
+    const write = async (held?: PathWriteLease): Promise<void> => {
+      const pages = await this.existingGeneratedRefs();
+      const additionalPages = additionalPaths.map(pagePath => ({
+        path: pagePath,
+        title: pagePath.replace(/\.md$/i, '').split('/').pop() ?? pagePath,
+      }));
+      const guarded = guardGeneratedWikiLinks(content, {
+        wikiFolder: this.ctx.settings.wikiFolder,
+        pages,
+        additionalPages,
+      });
+      if (held && this.ctx.createOrUpdateFileUnlocked) {
+        await held.runRaw(path, () => this.ctx.createOrUpdateFileUnlocked!(path, guarded));
+      } else {
+        await this.ctx.createOrUpdateFile(path, guarded);
+      }
+    };
+
+    // `createOrUpdateFile` already acquires this path. Only use a held/raw
+    // lease when the context exposes the corresponding unlocked write API;
+    // otherwise acquiring here and calling the public writer would deadlock.
+    if (this.ctx.withPathWriteLocks && this.ctx.createOrUpdateFileUnlocked) {
+      await this.ctx.withPathWriteLocks([path], held => write(held));
+    } else {
+      await write();
+    }
+  }
+
+  /**
+   * Re-read and reconcile every generated page after child writes finish.
+   * Preflight candidates never enter `additionalPages`; only verified paths do.
+   */
+  private async reconcileGeneratedPages(
+    summaryPath: string,
+    actualPagePaths: string[],
+    preflightPaths: string[] = [],
+  ): Promise<void> {
+    const uniquePaths = [...new Set(actualPagePaths)];
+    const actualPathKeys = new Set(uniquePaths.map(path => path.toLowerCase()));
+    const stalePreflightKeys = new Set(
+      preflightPaths
+        .filter(path => !actualPathKeys.has(path.toLowerCase()))
+        .map(path => path.toLowerCase()),
+    );
+    const reconcile = async (held?: PathWriteLease): Promise<void> => {
+      // A preflight path which was not returned by a verified write is not
+      // allowed back in through the general existing-page index. This matters
+      // when a stale file happens to occupy the old slug: it must not preserve
+      // a dead/stale edge merely because that unrelated file exists.
+      const pages = (await this.existingGeneratedRefs())
+        .filter(page => !stalePreflightKeys.has(page.path.toLowerCase()));
+      const actualRefs = uniquePaths.map(path => ({
+        path,
+        title: path.replace(/\.md$/i, '').split('/').pop() ?? path,
+      }));
+      for (const path of uniquePaths) {
+        const current = await this.ctx.tryReadFile(path);
+        if (current === null) continue;
+        const guarded = guardGeneratedWikiLinks(current, {
+          wikiFolder: this.ctx.settings.wikiFolder,
+          pages,
+          additionalPages: actualRefs,
+        });
+        const finalContent = path === summaryPath
+          ? ensureGeneratedPageLinks(
+            guarded,
+            uniquePaths.filter(candidate => candidate !== summaryPath),
+            this.ctx.settings.wikiFolder,
+          )
+          : guarded;
+        if (finalContent === current) continue;
+        if (held && this.ctx.createOrUpdateFileUnlocked) {
+          await held.runRaw(path, () => this.ctx.createOrUpdateFileUnlocked!(path, finalContent));
+        } else {
+          await this.ctx.createOrUpdateFile(path, finalContent);
+        }
+      }
+    };
+
+    if (this.ctx.withPathWriteLocks && this.ctx.createOrUpdateFileUnlocked) {
+      await this.ctx.withPathWriteLocks(uniquePaths, held => reconcile(held));
+    } else {
+      // The public writer supplies per-path serialization for legacy contexts.
+      // This branch intentionally avoids wrapping it in another lock.
+      await reconcile();
+    }
+  }
+
+  /** Serialize index + log as one write-gate transaction when available. */
+  private async generateIndexAndLog(parsed: SourceAnalysis): Promise<void> {
+    const indexPath = `${this.ctx.settings.wikiFolder}/index.md`;
+    const logPath = `${this.ctx.settings.wikiFolder}/log.md`;
+    // Prefer the context's canonical multi-path lease when the orchestrator
+    // exposes unlocked writers. Calling the public writer while this lease is
+    // held would wait on itself forever, hence the explicit capability check.
+    if (this.ctx.withPathWriteLocks && this.ctx.createOrUpdateFileUnlocked) {
+      await this.ctx.withPathWriteLocks([indexPath, logPath], async held => {
+        await this.orch.generateIndex(held);
+        await this.orch.updateLog('conversation', parsed, held);
+      });
+      return;
+    }
+    // Some callers own a higher-level gate that binds both writers to the
+    // lease internally. Keep that adapter for those callers.
+    if (this.orch.withWriteGate) {
+      await this.orch.withWriteGate([indexPath, logPath], async held => {
+        await this.orch.generateIndex(held);
+        await this.orch.updateLog('conversation', parsed, held);
+      });
+      return;
+    }
+    await this.orch.generateIndex();
+    await this.orch.updateLog('conversation', parsed);
   }
 
   private async checkDedup(wikiIndex: string, conversationText: string): Promise<string> {

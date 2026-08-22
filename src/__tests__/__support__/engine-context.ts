@@ -20,6 +20,8 @@
 import { TFile } from 'obsidian'; // mocked in setup.ts
 import { EngineContext, LLMClient, LLMWikiSettings } from '../../types';
 import { parseFrontmatter } from '../../core/frontmatter';
+import { PathWriteQueue } from '../../wiki/engine-internals/path-write-queue';
+import type { PathWriteLease } from '../../wiki/engine-internals/path-write-queue';
 
 // ── Mock File ────────────────────────────────────────────────────
 
@@ -125,6 +127,7 @@ export interface MockContextOptions {
 
 export function createMockContext(opts: MockContextOptions = {}): { ctx: EngineContext; vault: MockVault } {
   const vault = new MockVault(opts.vaultFiles);
+  const pathWriteQueue = new PathWriteQueue({ existingPaths: Object.keys(opts.vaultFiles ?? {}) });
   const client = createMockClient(opts.llmResponses ?? []);
   const settings = { ...DEFAULT_SETTINGS, ...opts.settings };
 
@@ -169,6 +172,10 @@ export function createMockContext(opts: MockContextOptions = {}): { ctx: EngineC
     settings,
     getClient: () => client,
     createOrUpdateFile: async (path, content) => { vault.write(path, content); },
+    withPathWriteLock: <T>(path: string, operation: () => Promise<T>): Promise<T> =>
+      pathWriteQueue.run(path, operation),
+    withPathWriteLocks: <T>(paths: readonly string[], operation: (held: PathWriteLease) => Promise<T>): Promise<T> =>
+      pathWriteQueue.withPaths(paths, operation),
     tryReadFile: async (path) => vault.read(path),
     deleteFile: async () => {},
     buildSystemPrompt: async () => undefined,

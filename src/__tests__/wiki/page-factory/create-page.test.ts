@@ -44,6 +44,9 @@ function makeCtx(opts: {
     async createOrUpdateFile(p: string, c: string): Promise<void> {
       files.set(p, c);
     },
+    async withPathWriteLock<T>(_path: string, operation: () => Promise<T>): Promise<T> {
+      return operation();
+    },
     getClient: () => opts.llmResponse === null
       ? null
       : { createMessage: async () => opts.llmResponse ?? '## Description\nLLM body.' },
@@ -169,6 +172,125 @@ describe('createNewPage — programmatic Mentions injection (Issue #244)', () =>
     expect(written).toContain('quote-A');
     expect(written).toContain('quote-B');
   });
+
+  it('writes only source-grounded mentions when ingest content is supplied', async () => {
+    const ctx = makeCtx({ llmResponse: '## Description\nBody without mentions.' });
+    await createNewPage(
+      ctx,
+      createMockEntity({ name: 'X', mentions_in_source: ['quote-A', 'fabricated quote'] }),
+      'entity',
+      { path: 'notes/article.md', basename: 'article.md' },
+      [],
+      'wiki/entities/X.md',
+      undefined,
+      '---\ntype: note\n---\n\nquote-A appears in the source.',
+    );
+    const written = ctx.written.get('wiki/entities/X.md')!;
+    expect(written).toContain('quote-A');
+    expect(written).not.toContain('fabricated quote');
+  });
+
+  it('honors the preflight-resolved path instead of recomputing a guessed slug', async () => {
+    const ctx = makeCtx({
+      files: {
+        'wiki/entities/canonical-target.md': '---\ntype: entity\naliases: []\n---\n\n# Existing\n',
+      },
+      llmResponse: '## Description\nCanonical entity.',
+    });
+    const result = await createOrUpdateEntityPage(
+      ctx,
+      createMockEntity({ name: 'Alias-shaped input' }),
+      EMPTY_ANALYSIS,
+      { path: 'notes/article.md', basename: 'article.md' },
+      [],
+      undefined,
+      undefined,
+      {
+        path: 'wiki/entities/canonical-target.md',
+        aliasCommit: {
+          targetPath: 'wiki/entities/canonical-target.md',
+          alias: 'Alias-shaped input',
+        },
+      },
+    );
+    expect(result.path).toBe('wiki/entities/canonical-target.md');
+    expect(ctx.written.has('wiki/entities/Alias-shaped-input.md')).toBe(false);
+    expect(ctx.written.get('wiki/entities/canonical-target.md')).toContain('Alias-shaped input');
+  });
+
+  it('rejects a mismatched deferred alias target before writing', async () => {
+    const ctx = makeCtx({ llmResponse: '## Description\nMust not be written.' });
+    await expect(createOrUpdateEntityPage(
+      ctx,
+      createMockEntity({ name: 'Unsafe alias' }),
+      EMPTY_ANALYSIS,
+      { path: 'notes/article.md', basename: 'article.md' },
+      [],
+      undefined,
+      undefined,
+      {
+        path: 'wiki/entities/intended.md',
+        aliasCommit: {
+          targetPath: 'wiki/entities/different.md',
+          alias: 'Unsafe alias',
+        },
+      },
+    )).rejects.toThrow('resolved write path is wiki/entities/intended.md');
+    expect(ctx.written.has('wiki/entities/intended.md')).toBe(false);
+    expect(ctx.written.has('wiki/entities/different.md')).toBe(false);
+  });
+});
+
+describe('createNewPage — generated link guard', () => {
+  it('keeps guaranteed same-run pages and unwraps unplanned targets', async () => {
+    const ctx = makeCtx({
+      llmResponse: '## Related Concepts\n- [[concepts/Planned Concept]]\n- [[concepts/Fabricated Concept]]',
+    });
+    await createNewPage(
+      ctx,
+      createMockEntity({ name: 'X' }),
+      'entity',
+      { path: 'notes/article.md', basename: 'article.md' },
+      ['wiki/concepts/Planned-Concept.md'],
+      'wiki/entities/X.md',
+    );
+    const written = ctx.written.get('wiki/entities/X.md')!;
+    expect(written).toContain('[[concepts/Planned-Concept|Planned Concept]]');
+    expect(written).toContain('Fabricated Concept');
+    expect(written).not.toContain('[[concepts/Fabricated Concept]]');
+  });
+});
+
+describe('createNewPage — taxonomy guard', () => {
+  it('rejects a concept-only tag on an entity page before writing', async () => {
+    const ctx = makeCtx({
+      llmResponse: '---\ntype: entity\ntags: [method]\n---\n\n## Description\nMethod body.',
+    });
+    await expect(createNewPage(
+      ctx,
+      createMockEntity({ name: 'Spawn wait receive' }),
+      'entity',
+      { path: 'notes/article.md', basename: 'article.md' },
+      [],
+      'wiki/entities/Spawn-wait-receive.md',
+    )).rejects.toThrow(/Taxonomy mismatch.*method/);
+    expect(ctx.written.has('wiki/entities/Spawn-wait-receive.md')).toBe(false);
+  });
+
+  it('rejects an entity-only tag on a concept page before writing', async () => {
+    const ctx = makeCtx({
+      llmResponse: '---\ntype: concept\ntags: [product]\n---\n\n## Description\nProduct body.',
+    });
+    await expect(createNewPage(
+      ctx,
+      createMockConcept({ name: 'Widget theory' }),
+      'concept',
+      { path: 'notes/article.md', basename: 'article.md' },
+      [],
+      'wiki/concepts/Widget-theory.md',
+    )).rejects.toThrow(/Taxonomy mismatch.*product/);
+    expect(ctx.written.has('wiki/concepts/Widget-theory.md')).toBe(false);
+  });
 });
 
 describe('createNewPage — conversation source uses single synthetic citation', () => {
@@ -199,6 +321,7 @@ describe('createNewPage — wraps errors with entity context', () => {
       settings: { wikiFolder: 'wiki', wikiLanguage: 'en', slugCase: 'preserve', disableThinking: false } as LLMWikiSettings,
       async tryReadFile() { return null; },
       async createOrUpdateFile() {},
+      async withPathWriteLock<T>(_path: string, operation: () => Promise<T>): Promise<T> { return operation(); },
       getClient: () => failingClient,
       buildSystemPrompt: async () => 'system',
     };

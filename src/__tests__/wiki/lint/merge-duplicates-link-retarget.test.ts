@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mergeDuplicatePages } from '../../../wiki/lint/merge-duplicates';
+import { acquireJournalFileLock, mergeDuplicatePages } from '../../../wiki/lint/merge-duplicates';
 import { createFakeLinkVault } from '../../__support__/link-vault';
 import type { EngineContext } from '../../../types';
 
@@ -12,6 +12,58 @@ import type { EngineContext } from '../../../types';
 
 const TARGET = 'wiki/entities/Osteopontin.md';
 const SOURCE = 'wiki/entities/Osteopontin-2.md';
+
+function makeJournalAdapter() {
+  const files = new Map<string, string>();
+  const directories = new Set<string>();
+  const operations: string[] = [];
+  const descendants = (path: string): string[] => [...files.keys()].filter(key => key.startsWith(`${path}/`));
+  return {
+    operations,
+    exists: async (path: string) => files.has(path) || directories.has(path),
+    read: async (path: string) => {
+      const value = files.get(path);
+      if (value === undefined) throw new Error(`Missing adapter path: ${path}`);
+      return value;
+    },
+    write: async (path: string, content: string) => {
+      operations.push(`write:${path}`);
+      files.set(path, content);
+    },
+    mkdir: async (path: string) => {
+      operations.push(`mkdir:${path}`);
+      if (files.has(path) || directories.has(path)) throw new Error('already exists');
+      directories.add(path);
+    },
+    rename: async (oldPath: string, newPath: string) => {
+      operations.push(`rename:${oldPath}->${newPath}`);
+      if (directories.has(newPath) || files.has(newPath)) throw new Error('destination exists');
+      if (directories.has(oldPath)) {
+        directories.delete(oldPath);
+        directories.add(newPath);
+        for (const child of descendants(oldPath)) {
+          const moved = `${newPath}${child.slice(oldPath.length)}`;
+          const content = files.get(child);
+          files.delete(child);
+          files.set(moved, content!);
+        }
+        return;
+      }
+      const content = files.get(oldPath);
+      if (content === undefined) throw new Error('source missing');
+      files.delete(oldPath);
+      files.set(newPath, content);
+    },
+    remove: async (path: string) => {
+      operations.push(`remove:${path}`);
+      directories.delete(path);
+      for (const child of descendants(path)) files.delete(child);
+      files.delete(path);
+    },
+    seed: (path: string, content: string) => { files.set(path, content); },
+    seedDirectory: (path: string) => { directories.add(path); },
+  };
+}
 
 function makeCtx(files: Record<string, string>) {
   const fake = createFakeLinkVault(files);
@@ -27,6 +79,57 @@ function makeCtx(files: Record<string, string>) {
   } as unknown as EngineContext;
   return { ctx, fake, deleted };
 }
+
+function makeLeaseCtx(adapter: ReturnType<typeof makeJournalAdapter>, wikiFolder = 'wiki'): EngineContext {
+  return {
+    app: { vault: { adapter } },
+    settings: { wikiFolder, language: 'en' },
+  } as unknown as EngineContext;
+}
+
+describe('merge journal lease and path boundary', () => {
+  it.each(['../outside', '/absolute/wiki', 'C:/outside/wiki', 'wiki/../outside', 'wiki\\junction\\..\\outside'])
+    ('rejects unsafe wikiFolder %j before adapter access', async wikiFolder => {
+      const adapter = makeJournalAdapter();
+      const ctx = makeLeaseCtx(adapter, wikiFolder);
+
+      await expect(mergeDuplicatePages(ctx, TARGET, SOURCE)).rejects.toThrow();
+      expect(adapter.operations).toEqual([]);
+    });
+
+  it('keeps a long-running owner alive through heartbeat while a replacement waits', async () => {
+    const adapter = makeJournalAdapter();
+    const ctx = makeLeaseCtx(adapter);
+    const first = await acquireJournalFileLock(ctx, 'wiki/.karpathywiki-merge-journal.json');
+    await new Promise<void>(resolve => window.setTimeout(resolve, 2_100));
+    let secondAcquired = false;
+    const secondPromise = acquireJournalFileLock(ctx, 'wiki/.karpathywiki-merge-journal.json')
+      .then(lease => { secondAcquired = true; return lease; });
+    await new Promise<void>(resolve => window.setTimeout(resolve, 75));
+    expect(secondAcquired).toBe(false);
+    await first.release();
+    const second = await secondPromise;
+    await second.release();
+  });
+
+  it('recovers a stale lease by atomic replacement, never direct stale deletion', async () => {
+    const adapter = makeJournalAdapter();
+    const lockPath = 'wiki/.karpathywiki-merge-journal.json.lock';
+    adapter.seedDirectory(lockPath);
+    adapter.seed(`${lockPath}/lease.json`, JSON.stringify({
+      version: 1,
+      token: 'abandoned-owner',
+      createdAt: Date.now() - 11 * 60 * 1000,
+      heartbeatAt: Date.now() - 11 * 60 * 1000,
+    }));
+    const lease = await acquireJournalFileLock(makeLeaseCtx(adapter), 'wiki/.karpathywiki-merge-journal.json');
+    const acquisitionOperations = [...adapter.operations];
+    await lease.release();
+
+    expect(acquisitionOperations.some(op => op === `remove:${lockPath}`)).toBe(false);
+    expect(acquisitionOperations.some(op => op.startsWith(`rename:${lockPath}->${lockPath}.recovery-`))).toBe(true);
+  });
+});
 
 describe('mergeDuplicatePages — link retargeting (#386)', () => {
   it('retargets a bare-title link in a user note outside the wiki folder', async () => {

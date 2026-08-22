@@ -261,7 +261,13 @@ export function scanQuoteGrounding(
   for (const [p, s] of sourceMap) {
     const body = extractSourceBody(s.content);
     sourceBodyMap.set(p, body);
-    normalizedSourceBodies.push(normalizeQuote(body));
+    // Legacy bare quotes intentionally search only canonical wiki source
+    // pages. Raw-note bodies are loaded into sourceMap solely to resolve an
+    // explicit attribution link; allowing them into this fallback would make
+    // an unrelated raw note silently bless an unlinked quote.
+    if (p.startsWith(`${wikiFolder}/sources/`)) {
+      normalizedSourceBodies.push(normalizeQuote(body));
+    }
   }
 
   for (const [path, page] of pageMap) {

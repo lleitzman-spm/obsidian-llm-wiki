@@ -27,7 +27,6 @@ import { parseJsonResult } from '../../core/json';
 import { normalizeLLMPath } from '../../core/prompt-builders';
 import { renderTemplate } from '../../core/template-renderer';
 import { resolveModelForTask } from '../../core/model-resolver';
-import { appendAliases, type AliasesContext } from './aliases';
 import { PathResolutionLLMSchema } from '../../llm-sdk/output-schemas';
 import { callLlm } from '../../core/llm-dispatch';
 
@@ -79,9 +78,16 @@ export function selectDedupCandidates(
     .filter((p): p is DedupCandidatePage => p !== undefined);
 }
 
-/** Mirrors the subset of PageCreationResult we return. */
+/** A write that must be committed only after the resolved page succeeds. */
+export interface PathAliasCommit {
+  targetPath: string;
+  alias: string;
+}
+
+/** Mirrors the subset of PageCreationResult we return plus deferred provenance. */
 export interface ResolvedPathResult {
   path: string | null;
+  aliasCommit?: PathAliasCommit;
 }
 
 /**
@@ -91,9 +97,12 @@ export interface ResolvedPathResult {
  * shape (no index signature) since production callers want type-safe access
  * to other settings (provider, model, etc.).
  */
-export interface PathResolutionContext extends AliasesContext {
+export interface PathResolutionContext {
   app: unknown;
   settings: import('../../types').LLMWikiSettings;
+  tryReadFile: (path: string) => Promise<string | null>;
+  /** Legacy test/facade compatibility; resolution itself never writes. */
+  createOrUpdateFile?: (path: string, content: string) => Promise<void>;
   getClient(): {
     createMessage: (...args: unknown[]) => Promise<string>;
     // v1.26.3 PATCH Issue #443 expanded scope: typed-output path. Optional
@@ -107,6 +116,12 @@ export interface PathResolutionContext extends AliasesContext {
 /**
  * Determine the actual file path for a new entity/concept, using slug-based
  * matching first and falling back to LLM semantic resolution.
+ *
+ * This function is deliberately side-effect-free with respect to the vault.
+ * When a semantic/deterministic match should acquire an alias, it returns a
+ * deferred commit instruction. The page-write layer commits that instruction
+ * only after its own read/modify/write operation succeeds under the target
+ * path lock.
  *
  * Issue #472: the opposite folder is never consulted. A page there carrying
  * the same letters is a different designator, so it can neither be a merge
@@ -122,26 +137,6 @@ export async function resolvePagePath(
   const folder = pageType === 'entity' ? WIKI_SUBFOLDERS.entities : WIKI_SUBFOLDERS.concepts;
   const slug = slugify(name, ctx.settings.slugCase === 'preserve');
   const slugPath = `${ctx.settings.wikiFolder}/${folder}/${slug}.md`;
-
-  // Issue #446: what this call falls back to when it reaches no decision.
-  // `slugPath` (create a new page) for the ordinary case; for an ambiguous
-  // designator the matching pages demonstrably exist, so a new page is the one
-  // answer that is certainly wrong — it is replaced by the top-ranked
-  // candidate below, which is also what the pre-#446 code merged into, minus
-  // the dependency on vault iteration order.
-  let fallbackPath = slugPath;
-
-  // The ambiguous fallback deliberately does NOT latch the designator as an
-  // alias on the page it falls back to. The latch is the pre-#446 behaviour of
-  // the *decided* merge paths and stays there; on an ambiguous designator it
-  // cannot do what it does on a decided match, because ConflictResolver matches
-  // over slug keys (`slugMatchKeys`): an alias whose slug the page already
-  // carries adds no key, `slugMatches.length > 1` still holds, and the next
-  // ingest reaches this same fallback. What it would do is write the designator
-  // onto whichever candidate ranked first this time — and onto the next one
-  // when the ranking moves — so an unanswered question would spread as a global
-  // claim across the candidates. See the ConflictResolver test for the
-  // measurement.
 
   // Fast path: exact slug match (same type folder)
   const existing = await ctx.tryReadFile(slugPath);
@@ -163,8 +158,10 @@ export async function resolvePagePath(
     const cr = resolver.resolve({ name, slug, pageType, tags });
 
     if (cr.action === 'merge') {
-      await appendAliases(ctx, cr.targetPath, [name]);
-      return { path: cr.targetPath };
+      return {
+        path: cr.targetPath,
+        aliasCommit: { targetPath: cr.targetPath, alias: name },
+      };
     }
 
     // Issue #446: more than one same-type page carries this designator. The
@@ -175,7 +172,6 @@ export async function resolvePagePath(
     // yield first and the ambiguity left no trace.
     const ambiguous = cr.action === 'disambiguate' ? cr.candidates ?? [] : [];
     if (ambiguous.length > 0) {
-      fallbackPath = cr.targetPath;
       console.debug(`Entity resolution: ${cr.reason}`);
     }
 
@@ -214,7 +210,10 @@ export async function resolvePagePath(
       .join('\n');
 
     const client = ctx.getClient();
-    if (!client) return { path: fallbackPath };
+    if (!client) {
+      console.error(`Entity resolution for "${name}": semantic decision required but no LLM client is available`);
+      return { path: null };
+    }
 
     const prompt = renderTemplate(PROMPTS.resolveEntityDedup, {
       wikiFolder: ctx.settings.wikiFolder,
@@ -253,38 +252,41 @@ export async function resolvePagePath(
       // that may already have one — without leaving a trace, because the
       // `catch` further down only sees thrown errors.
       //
-      // The fallback is deliberately unchanged: this function must return a
-      // path, and `slugPath` is still it. What changes is that the fallback is
-      // now taken as a failure to read the reply, not as an answer to the
-      // question. What to do about it beyond reporting — retry on `empty`,
-      // surface the uncertainty to the caller — needs a return channel this
-      // signature does not have, and is left to the later stages.
       const detail =
         parsed.reason === 'exception'
           ? `exception: ${String(parsed.error)}`
           : `${parsed.reason}, raw length ${parsed.rawLength}`;
       console.error(
-        `Entity resolution for "${name}": dedup reply unreadable (${detail}) — using ${fallbackPath}, no match decided`,
+        `Entity resolution for "${name}": dedup reply unreadable (${detail}) — refusing to write`,
       );
-      return { path: fallbackPath };
+      return { path: null };
     }
 
     const result = parsed.value as { match?: boolean; path?: string | null };
 
     if (result.match && result.path) {
       const normalizedPath = normalizeLLMPath(result.path, ctx.settings.wikiFolder);
+      const allowedPaths = new Set(sameTypePages.map(page => page.path));
+      if (!allowedPaths.has(normalizedPath)) {
+        console.error(
+          `Entity resolution for "${name}": model selected unknown or wrong-type path "${normalizedPath}" — refusing to write`,
+        );
+        return { path: null };
+      }
       console.debug(`Entity resolution: "${name}" matched existing page "${normalizedPath}"`);
-      // Append the new name as an alias to the existing page to prevent future duplicates
-      await appendAliases(ctx, normalizedPath, [name]);
-      return { path: normalizedPath };
+      // Append the new name as an alias only after the page operation succeeds.
+      return {
+        path: normalizedPath,
+        aliasCommit: { targetPath: normalizedPath, alias: name },
+      };
     }
-  } catch (error) {
-    console.debug(`Entity resolution for "${name}" failed, using ${fallbackPath}:`, error);
-  }
 
-  // Also the `match === false` exit: for an ambiguous designator this is the
-  // one place where "neither candidate is it" would create a third page for a
-  // name that is already an alias twice, so it resolves to the top-ranked
-  // candidate instead. For every other call `fallbackPath` is `slugPath`.
-  return { path: fallbackPath };
+    // A clean negative answer is actionable only when the designator was not
+    // already ambiguous. Creating a third page for an alias carried by two
+    // existing pages would preserve and deepen the ambiguity.
+    return { path: ambiguous.length > 0 ? null : slugPath };
+  } catch (error) {
+    console.error(`Entity resolution for "${name}" failed — refusing to write:`, error);
+    return { path: null };
+  }
 }

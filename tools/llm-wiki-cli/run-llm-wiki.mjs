@@ -8,7 +8,7 @@
 // `instanceof` keeps working. The bundle is then imported and run.
 
 import { createRequire } from 'node:module';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import * as nodePath from 'node:path';
 import { readdir, rm } from 'node:fs/promises';
 
@@ -79,7 +79,7 @@ await esbuild.build({
   },
 });
 
-const { main } = await import(pathToFileURL(BUNDLE_PATH).href);
+const { main } = require(BUNDLE_PATH);
 // Node keeps the loaded module, so removing the file now is safe — the stack
 // traces and the inline sourcemap survive it. A run killed before this line
 // leaves its bundle behind; the sweep above collects it on the next run.

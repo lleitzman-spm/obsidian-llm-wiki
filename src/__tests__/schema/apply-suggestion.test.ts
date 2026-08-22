@@ -174,4 +174,39 @@ describe('applySchemaSuggestion (#97)', () => {
     });
     expect(invalidated).toBe(1);
   });
+
+  it('refuses Windows-unsafe paths before touching the vault', async () => {
+    const vault = mkMockVault({ 'wiki/schema/config.md': CURRENT_FILE });
+    await expect(applySchemaSuggestion({
+      app: vault as unknown as App,
+      currentPath: 'wiki/schema/../config.md',
+      newBody: NEW_BODY,
+    })).rejects.toThrow(/unsafe|traversal/i);
+    expect(vault.vault.files).toEqual(new Map([['wiki/schema/config.md', CURRENT_FILE]]));
+  });
+
+  it('serializes same-timestamp applies and preserves both backups', async () => {
+    const vault = mkMockVault({ 'wiki/schema/config.md': CURRENT_FILE });
+    const now = () => new Date('2026-06-22T10:30:00.000Z');
+    const secondBody = '# Wiki Schema\n\n## Wiki Structure\n- Entity pages (second)\n';
+
+    await Promise.all([
+      applySchemaSuggestion({
+        app: vault as unknown as App,
+        currentPath: 'wiki/schema/config.md',
+        newBody: NEW_BODY,
+        now,
+      }),
+      applySchemaSuggestion({
+        app: vault as unknown as App,
+        currentPath: 'wiki/schema/config.md',
+        newBody: secondBody,
+        now,
+      }),
+    ]);
+
+    expect(vault.vault.files.get('wiki/schema/config.md')).toContain('second');
+    expect(vault.vault.files.get('wiki/schema/config.md.bak.2026-06-22T10-30-00.000Z')).toBe(CURRENT_FILE);
+    expect(vault.vault.files.get('wiki/schema/config.md.bak.2026-06-22T10-30-00.000Z-1')).toContain('Entity pages (custom)');
+  });
 });

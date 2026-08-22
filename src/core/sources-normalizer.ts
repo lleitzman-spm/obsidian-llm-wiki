@@ -17,6 +17,7 @@
 
 import { computeSlug } from './slug';
 import { isInFolderScope } from './folder-scope';
+import { getVaultPathWriteQueue, notifyVaultWrite } from './path-write-safety';
 
 /**
  * The minimum `app.vault` surface used by `normalizeSourcesInFolder`.
@@ -28,6 +29,7 @@ interface VaultLike {
   getMarkdownFiles: () => Array<{ path: string }>;
   read: (file: { path: string }) => Promise<string>;
   process: (file: { path: string }, fn: (data: string) => string | Promise<string>) => Promise<unknown>;
+  onFileWrite?: (path: string) => void;
 }
 
 /**
@@ -237,17 +239,29 @@ export async function normalizeSourcesInFolder(
   try {
     const wikiFiles = app.vault.getMarkdownFiles()
       .filter(f => isInFolderScope(f.path, wikiFolder, false));
+    const queue = getVaultPathWriteQueue(
+      app.vault,
+      wikiFiles.map(file => file.path),
+    );
     let polluted = 0;
     for (const file of wikiFiles) {
-      const content = await app.vault.read(file);
-      if (!scanPollutedSources(content, wikiFolder, preserveCase)) continue;
-      polluted += 1;
-      const { fixed, content: fixedContent } = fixPollutedSources(content, wikiFolder, preserveCase);
-      if (fixed > 0) {
-        await app.vault.process(file, () => fixedContent);
+      await queue.run(file.path, async held => {
+        // Read and compute while the lease is held.  Reading before acquiring
+        // the lease would allow a concurrent writer to be silently clobbered.
+        const content = await held.runRaw(file.path, () => app.vault.read(file));
+        if (!scanPollutedSources(content, wikiFolder, preserveCase)) return;
+        polluted += 1;
+        const { fixed, content: fixedContent } = fixPollutedSources(content, wikiFolder, preserveCase);
+        if (fixed <= 0) return;
+        await held.runRaw(file.path, () => app.vault.process(file, () => fixedContent));
+        const written = await held.runRaw(file.path, () => app.vault.read(file));
+        if (written !== fixedContent) {
+          throw new Error(`Sources normalization write verification failed: ${file.path}`);
+        }
         filesCleaned += 1;
         entriesCleaned += fixed;
-      }
+        notifyVaultWrite(app.vault.onFileWrite, queue, file.path);
+      });
     }
     console.debug(`[QuickFixes] Phase 2 complete: ${wikiFiles.length} scanned, ${polluted} polluted, ${filesCleaned} fixed (${entriesCleaned} entries)`);
   } catch (e) {

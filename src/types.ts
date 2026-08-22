@@ -5,6 +5,9 @@ import type { z } from 'zod';
 import type { RejectionReason } from './core/source-requirements';
 import type { TaskPolicyMap } from './core/task-policy';
 import type { OutputMode } from './llm-sdk/output-mode-prober';
+import type { PathWriteLease } from './wiki/engine-internals/path-write-queue';
+import type { AuthoritativeSourceSnapshot } from './core/physical-source-authority';
+import type { IngestionLeaseContext } from './core/ingestion-coordinator';
 
 /**
  * Issue #244 — Programmatic Mentions writes (v1.23.3 / v1.24.0).
@@ -613,6 +616,16 @@ export interface IngestOptions {
    * (slug, frontmatter inheritance) still use `file`.
    */
   contentOverride?: string;
+  /**
+   * Read-once source body supplied by a physical preflight or the engine's
+   * own vault read. Downstream analysis and quote grounding must consume this
+   * exact snapshot instead of reading the source again.
+   */
+  sourceSnapshot?: AuthoritativeSourceSnapshot;
+  /** Caller-owned cancellation signal, used by queued batch ingestion. */
+  abortSignal?: AbortSignal;
+  /** Internal capability used when a batch already owns the engine lease. */
+  ingestionContext?: IngestionLeaseContext;
 }
 
 // LLM Client interface
@@ -747,13 +760,6 @@ export interface LLMClient {
     seed?: number;
     repetition_penalty?: number; // Issue #128 follow-up: llama.cpp extension
     chat_template_kwargs?: Record<string, unknown>; // Issue #99: template-based reasoning disable
-    // v1.25.0 PR3 follow-up #8 (Bug D, e2e 2026-07-17): cancellation
-    // signal for long-running calls. The PDF converter threads the
-    // engine's AbortSignal through so a status-bar click during PDF
-    // conversion actually aborts the LLM call rather than only
-    // finishing the post-conversion phase. AI SDK v6 accepts this
-    // natively; legacy clients ignore it.
-    abortSignal?: AbortSignal;
     // Issue #305: optional out-channel for response metadata. The SDK-backed
     // clients invoke this once, immediately before returning the text. It is
     // additive on purpose — `createMessage` keeps returning `Promise<string>`,
@@ -881,8 +887,18 @@ export interface EngineContext {
   settings: LLMWikiSettings;
   getClient: () => LLMClient | null;
   createOrUpdateFile: (path: string, content: string) => Promise<void>;
+  /** Internal write used only while a caller already holds the canonical path lease. */
+  createOrUpdateFileUnlocked?: (path: string, content: string) => Promise<void>;
+  /** Serialize a read/modify/write page operation by normalized vault path. */
+  withPathWriteLock: <T>(path: string, operation: () => Promise<T>) => Promise<T>;
+  /** Optional multi-path write gate; paths are acquired in canonical order. */
+  withPathWriteLocks?: <T>(paths: readonly string[], operation: (held: PathWriteLease) => Promise<T>) => Promise<T>;
+  /** Exclusive boundary for verify-then-delete operations. */
+  withMutationBoundary?: <T>(paths: readonly string[], operation: (held: PathWriteLease) => Promise<T>) => Promise<T>;
   tryReadFile: (path: string) => Promise<string | null>;
   deleteFile: (path: string) => Promise<void>;
+  /** Internal delete used only while a mutation boundary already holds the lease. */
+  deleteFileUnlocked?: (path: string) => Promise<void>;
   buildSystemPrompt: (task: string) => Promise<string | undefined>;
   getSectionLabels: () => Record<string, string>;
   getExistingWikiPages: () => Promise<Array<{ path: string; title: string; wikiLink: string; aliases?: string[] }>>;

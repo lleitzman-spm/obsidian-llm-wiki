@@ -99,6 +99,12 @@ describe('appendAliases — dedup', () => {
     expect(written).not.toContain('  - "vigilanz"');
   });
 
+  it('deduplicates existing and new aliases by Windows-equivalent identity', async () => {
+    const ctx = makeContext({ [PAGE]: makePage(['Caf\u00e9']) });
+    await appendAliases(ctx, PAGE, ['Cafe\u0301', 'CAF\u00c9']);
+    expect(ctx.written.get(PAGE)).toBe(makePage(['Caf\u00e9']));
+  });
+
   it('no-op when input is empty array', async () => {
     const ctx = makeContext({ [PAGE]: makePage() });
     const writeSpy = vi.spyOn(ctx, 'createOrUpdateFile');

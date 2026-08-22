@@ -33,11 +33,13 @@ function buildFakeVault(files: FakeFile[]) {
         map.has(p) ? ({ path: p, basename: p.split('/').pop() ?? p }) : null,
       trashFile: async (f: { path: string }) => {
         trashed.push(f.path);
+        map.delete(f.path);
       },
     },
     fileManager: {
       trashFile: async (f: { path: string }) => {
         trashed.push(f.path);
+        map.delete(f.path);
       },
     },
     trashed,
@@ -134,6 +136,8 @@ describe('cleanIncompletePages (#170)', () => {
       callCount++;
       if (callCount === 1) throw new Error('boom');
       vault.trashed.push(f.path);
+      vault.vault.getAbstractFileByPath = (path: string) =>
+        path === f.path ? null : ({ path, basename: path.split('/').pop() ?? path });
     };
 
     const cleaned = await cleanIncompletePages(vault as never, [

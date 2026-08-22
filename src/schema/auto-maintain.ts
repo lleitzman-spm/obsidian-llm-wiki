@@ -14,6 +14,8 @@ import { resolveModelForTask } from '../core/model-resolver';
 import { isLocalNoKeyProvider } from '../core/local-no-key-provider';
 import { resolveProviderApiKey } from '../llm-sdk/provider-api-key-resolver';
 import type { LLMClient } from '../types';
+import { checkPhysicalSource } from '../core/physical-source-authority';
+import { withIngestionLease } from '../core/ingestion-coordinator';
 
 export class AutoMaintainManager {
   private app: App;
@@ -103,11 +105,16 @@ export class AutoMaintainManager {
   }
 
   // Check if a path falls within any watched folder
+  private canonicalWatchPath(path: string): string {
+    return path.normalize('NFC').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  }
+
   private isWatched(path: string): boolean {
     if (this.settings.watchedFolders.length === 0) return false;
+    const candidate = this.canonicalWatchPath(path);
     return this.settings.watchedFolders.some(folder => {
-      const prefix = folder.endsWith('/') ? folder : `${folder}/`;
-      return path.startsWith(prefix);
+      const watched = this.canonicalWatchPath(folder);
+      return watched.length === 0 || candidate === watched || candidate.startsWith(`${watched}/`);
     });
   }
 
@@ -121,21 +128,27 @@ export class AutoMaintainManager {
     console.debug(`[AutoMaintain] event: ${file.path}, TFile: ${file instanceof TFile}`);
 
     if (!(file instanceof TFile)) return;
-    if (!file.path.endsWith('.md')) return;
+    if (!file.path.toLowerCase().endsWith('.md')) return;
+    // PDF markdown sidecars are generated artifacts, never independent
+    // watcher sources.  This remains true even if the filesystem event arrives
+    // after the recent-write suppression window has expired.
+    if (file.path.toLowerCase().endsWith('.pdf.md')) return;
+
+    const canonicalPath = this.canonicalWatchPath(file.path);
 
     if (!this.isWatched(file.path)) {
       console.debug(`[AutoMaintain] SKIP: ${file.path} (not watched). Watched: ${JSON.stringify(this.settings.watchedFolders)}`);
       return;
     }
 
-    if (this.recentWrites.has(file.path)) {
+    if (this.recentWrites.has(canonicalPath)) {
       console.debug(`[AutoMaintain] SKIP: ${file.path} (recent write)`);
       return;
     }
 
     // metadataCache may re-fire for the same file version; dedupe by mtime
     const mtime = file.stat?.mtime || 0;
-    const fileKey = `${file.path}::${mtime}`;
+    const fileKey = `${canonicalPath}::${mtime}`;
     if (this.lastSeenPaths.has(fileKey)) {
       console.debug(`[AutoMaintain] SKIP: ${file.path} (same mtime already seen)`);
       return;
@@ -177,10 +190,11 @@ export class AutoMaintainManager {
   }
 
   markRecentWrite(path: string): void {
-    this.recentWrites.add(path);
+    const canonicalPath = this.canonicalWatchPath(path);
+    this.recentWrites.add(canonicalPath);
     // Auto-expire after 120 seconds (covers slow LLM responses)
     window.setTimeout(() => {
-      this.recentWrites.delete(path);
+      this.recentWrites.delete(canonicalPath);
     }, 120000);
   }
 
@@ -201,7 +215,9 @@ export class AutoMaintainManager {
 
     if (files.length === 0) return;
 
-    const sourceFiles = files.filter(f => this.isWatched(f.path));
+    const sourceFiles = files.filter(f =>
+      this.isWatched(f.path) && !f.path.toLowerCase().endsWith('.pdf.md')
+    );
     if (sourceFiles.length === 0) return;
 
     const texts = TEXTS[this.settings.language];
@@ -225,7 +241,18 @@ export class AutoMaintainManager {
       for (const file of sourceFiles) {
         try {
           this.markRecentWrite(file.path);
-          await this.wikiEngine.ingestSource(file, { batchCtx, trigger: 'auto' });
+          const adapter = this.app?.vault?.adapter;
+          const physicalCheck = adapter
+            ? await checkPhysicalSource(adapter, file.path)
+            : { exists: true as const };
+          if (!physicalCheck.exists) {
+            throw new Error(physicalCheck.error ?? `Source file is no longer present on disk: ${file.path}`);
+          }
+          await this.wikiEngine.ingestSource(file, {
+            batchCtx,
+            trigger: 'auto',
+            ...(physicalCheck.source ? { sourceSnapshot: physicalCheck.source } : {}),
+          });
           successCount++;
         } catch (error) {
           console.error(`Auto-ingest failed for ${file.path}:`, error);
@@ -581,7 +608,7 @@ export class AutoMaintainManager {
     new Notice(generatingMsg, 5000);
 
     try {
-      const result = await this.runOnboardingPhase();
+      const result = await withIngestionLease(this.wikiEngine, () => this.runOnboardingPhaseUnlocked());
       console.debug(`[QuickFixes] Phase 0b: runOnboardingPhase returned. welcomeNotePath=${result.welcomeNotePath ?? 'NONE'}, tier=${result.tier}, shouldCreateWelcomeNote=${result.action.shouldCreateWelcomeNote}, localizeResult.localized=${result.localizeResult?.localized ?? 'n/a'}, localizeResult.error=${result.localizeResult?.error ?? 'n/a'}`);
       if (result.welcomeNotePath) {
         const okMsg = TEXTS[this.settings.language].welcomeNoteRecreated
@@ -607,7 +634,7 @@ export class AutoMaintainManager {
    * (background) and the recreateWelcomeNote command-palette entry
    * (user-initiated). forceRecreate=true bypasses the Tier C short-circuit (#268).
    */
-  private async runOnboardingPhase(forceRecreate = false): Promise<EnsureResult> {
+  private async runOnboardingPhaseUnlocked(forceRecreate = false): Promise<EnsureResult> {
     const vault = this.makeVaultAdapter();
     const llmClient = (this.plugin as unknown as { llmClient: LLMClient | null }).llmClient;
     return ensureWelcomeNote({
@@ -643,23 +670,24 @@ export class AutoMaintainManager {
       `${wikiFolder}/${getWelcomeFileName(wikiLanguage)}.md`,
       `${wikiFolder}/Welcome.md`,  // legacy pre-i18n fallback
     ];
-    for (const p of candidates) {
-      const existing = this.app.vault.getAbstractFileByPath(p);
-      if (existing && existing instanceof TFile) {
-        try {
-          await this.app.fileManager.trashFile(existing);
-        } catch (e) {
-          console.error(`Failed to delete existing Welcome note at ${p}:`, e);
-          new Notice(
-            `${TEXTS[this.settings.language].operationFailed ?? 'Operation failed: '}` +
-              (e instanceof Error ? e.message : String(e)),
-            0
-          );
-          return;
+    let result: EnsureResult;
+    try {
+      result = await withIngestionLease(this.wikiEngine, async () => {
+        for (const p of candidates) {
+          const existing = this.app.vault.getAbstractFileByPath(p);
+          if (existing instanceof TFile) await this.wikiEngine.deleteFile(p);
         }
-      }
+        return this.runOnboardingPhaseUnlocked(true);
+      });
+    } catch (e) {
+      console.error('Failed to recreate Welcome note:', e);
+      new Notice(
+        `${TEXTS[this.settings.language].operationFailed ?? 'Operation failed: '}` +
+          (e instanceof Error ? e.message : String(e)),
+        0,
+      );
+      return;
     }
-    const result = await this.runOnboardingPhase(true);
     if (result.welcomeNotePath) {
       // Show a 5s auto-dismissing confirmation (NOT 0 — that would be
       // sticky). Use NOTICE_NORMAL for transient feedback.
@@ -684,7 +712,10 @@ export class AutoMaintainManager {
   private makeVaultAdapter(): VaultAdapter {
     return {
       exists: async (path: string): Promise<boolean> => {
-        return this.app.vault.getAbstractFileByPath(path) !== null;
+        if (this.app.vault.getAbstractFileByPath(path) !== null) return true;
+        const normalized = path.normalize('NFC').replace(/\\/g, '/');
+        return this.app.vault.getMarkdownFiles()
+          .some(file => file.path.normalize('NFC').replace(/\\/g, '/') === normalized);
       },
       getMarkdownFiles: async (): Promise<string[]> => {
         return this.app.vault.getMarkdownFiles().map(f => f.path);
@@ -694,7 +725,14 @@ export class AutoMaintainManager {
         if (folder && !this.app.vault.getAbstractFileByPath(folder)) {
           await this.app.vault.createFolder(folder);
         }
+        this.markRecentWrite(path);
         await this.app.vault.create(path, content);
+      },
+      withWriteLock: <T>(path: string, operation: () => Promise<T>): Promise<T> => {
+        const lock = (this.wikiEngine as WikiEngine & {
+          withPathWriteLock?: <R>(lockedPath: string, callback: () => Promise<R>) => Promise<R>;
+        }).withPathWriteLock;
+        return lock ? lock(path, operation) : operation();
       },
     };
   }

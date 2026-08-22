@@ -91,11 +91,15 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
   });
 
   it('returns matched path when LLM responds with match=true and a path', async () => {
-    // Pre-fill the target page so appendAliases() can find its frontmatter.
+    // Pre-fill the target page so the deferred alias commit can identify its
+    // target without mutating the vault during resolution.
     const ctx = makeCtx({
       files: { 'wiki/concepts/RelatedIdea.md': '---\ntitle: RelatedIdea\n---\n\n# page' },
       mockVault: {
-        getMarkdownFiles: () => [{ path: 'wiki/concepts/Other.md', basename: 'Other' }],
+        getMarkdownFiles: () => [
+          { path: 'wiki/concepts/Other.md', basename: 'Other' },
+          { path: 'wiki/concepts/RelatedIdea.md', basename: 'RelatedIdea' },
+        ],
       },
       client: {
         createMessage: async () =>
@@ -104,7 +108,11 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     });
     const result = await resolvePagePath(ctx, 'BrandNew', 'concept', 'desc');
     expect(result.path).toBe('wiki/concepts/RelatedIdea.md');
-    expect(ctx.written.get('wiki/concepts/RelatedIdea.md')).toMatch(/"BrandNew"/);
+    expect(result.aliasCommit).toEqual({
+      targetPath: 'wiki/concepts/RelatedIdea.md',
+      alias: 'BrandNew',
+    });
+    expect(ctx.written.get('wiki/concepts/RelatedIdea.md')).not.toMatch(/"BrandNew"/);
   });
 
   it('returns slug path when LLM responds with match=false', async () => {
@@ -122,9 +130,8 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
 
   // Issue #446: two pages carry the designator "E433" as an alias. Before the
   // fix the deterministic gate merged into whichever one getMarkdownFiles
-  // yielded first; now the ambiguity reaches the dedup call, and every exit
-  // that reaches no decision lands on the tag-ranked candidate rather than
-  // creating a third page for a name that is already an alias twice.
+  // yielded first. Now the ambiguity reaches the dedup call and every exit
+  // without a valid decision refuses to write.
   const ambiguousVault = {
     files: {
       'wiki/entities/Polysorbat-80.md': '---\naliases:\n  - E433\ntags:\n  - Lebensmittelzusatzstoff\n---\nbody',
@@ -138,10 +145,10 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     },
   };
 
-  it('falls back to the tag-ranked candidate when no client can decide', async () => {
+  it('refuses to write when an ambiguous identity has no client to decide it', async () => {
     const ctx = makeCtx({ ...ambiguousVault, client: null });
     const result = await resolvePagePath(ctx, 'E433', 'entity', 'desc', ['Chemie']);
-    expect(result.path).toBe('wiki/entities/Polysorbate.md');
+    expect(result.path).toBeNull();
   });
 
   it('resolves an ambiguous designator independently of vault order', async () => {
@@ -153,7 +160,8 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     };
     const forward = await resolvePagePath(makeCtx({ ...ambiguousVault, client: null }), 'E433', 'entity', 'desc');
     const backward = await resolvePagePath(makeCtx({ ...reversed, client: null }), 'E433', 'entity', 'desc');
-    expect(backward.path).toBe(forward.path);
+    expect(forward.path).toBeNull();
+    expect(backward.path).toBeNull();
   });
 
   it('shows the matching pages to the dedup call ahead of the lexical filler', async () => {
@@ -200,7 +208,7 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     // changed and none was added — not that the map is empty.
     const before = new Map(ctx.written);
     const result = await resolvePagePath(ctx, 'no2-', 'entity', 'desc', ['Biochemie']);
-    expect(result.path).toBe('wiki/entities/No2.md');
+    expect(result.path).toBeNull();
     expect(ctx.written.size).toBe(before.size);
     for (const [path, content] of before) {
       expect(ctx.written.get(path)).toBe(content);
@@ -228,10 +236,8 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     expect(seenMode).toBe('index');
   });
 
-  // #407 Stage 1: an unreadable reply is not an answer. The returned path is
-  // the same one `match: false` produces, which is why the distinction has to
-  // be visible in the log — before this, the no-exception failure path left no
-  // trace at all and the duplicate page it caused had no explanation.
+  // #407 Stage 1: an unreadable reply is not an answer and cannot authorize a
+  // write.
   it.each([
     ['empty', ''],
     ['empty', '<think>spent the budget deliberating</think>'],
@@ -251,11 +257,11 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     const result = await resolvePagePath(ctx, 'Unreadable', 'entity', 'desc');
     spy.mockRestore();
 
-    expect(result.path).toBe('wiki/entities/Unreadable.md');
+    expect(result.path).toBeNull();
     const line = errors.find(e => e.includes('Entity resolution for "Unreadable"'));
     expect(line).toBeDefined();
     expect(line).toContain(reason);
-    expect(line).toContain('no match decided');
+    expect(line).toContain('refusing to write');
   });
 
   it('does not report a well-formed match=false as a parse failure', async () => {
@@ -277,7 +283,7 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
     expect(errors.some(e => e.includes('unreadable'))).toBe(false);
   });
 
-  it('returns slug path when LLM throws (defensive fallback)', async () => {
+  it('refuses to write when the semantic resolver throws', async () => {
     const ctx = makeCtx({
       mockVault: {
         getMarkdownFiles: () => [{ path: 'wiki/entities/Other.md', basename: 'Other' }],
@@ -287,7 +293,29 @@ describe('resolvePagePath — LLM semantic dedup fallback', () => {
       },
     });
     const result = await resolvePagePath(ctx, 'WillRetry', 'entity', 'desc');
-    expect(result.path).toBe('wiki/entities/WillRetry.md');
+    expect(result.path).toBeNull();
+  });
+
+  it('refuses a model-selected path that was not in the same-type candidate set', async () => {
+    const ctx = makeCtx({
+      mockVault: {
+        getMarkdownFiles: () => [{ path: 'wiki/entities/Other.md', basename: 'Other' }],
+      },
+      client: {
+        createMessage: async () => JSON.stringify({ match: true, path: 'wiki/concepts/Hallucinated.md' }),
+      },
+    });
+    const result = await resolvePagePath(ctx, 'Unsafe', 'entity', 'desc');
+    expect(result.path).toBeNull();
+  });
+
+  it('refuses to create a third page when an ambiguous identity returns match=false', async () => {
+    const ctx = makeCtx({
+      ...ambiguousVault,
+      client: { createMessage: async () => JSON.stringify({ match: false }) },
+    });
+    const result = await resolvePagePath(ctx, 'E433', 'entity', 'desc');
+    expect(result.path).toBeNull();
   });
 });
 

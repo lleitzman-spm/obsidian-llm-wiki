@@ -2,6 +2,7 @@
 // Extracted from WikiEngine.
 
 import { TFile } from 'obsidian';
+import type { AuthoritativeSourceSnapshot } from '../core/physical-source-authority';
 import {
   EngineContext,
   SourceAnalysis,
@@ -156,14 +157,16 @@ export class SourceAnalyzer {
    * Returns null on blank content (defense-in-depth; the pre-ingest gate
    * normally rejects blank sources first).
    */
-  async analyzeSource(file: TFile, opts?: { contentOverride?: string }): Promise<SourceAnalysis | null> {
+  async analyzeSource(file: TFile, opts?: { contentOverride?: string; sourceSnapshot?: AuthoritativeSourceSnapshot }): Promise<SourceAnalysis | null> {
     console.debug('=== Source analysis started ===');
     console.debug('File:', file.path);
     if (opts?.contentOverride !== undefined) {
       console.debug('Using contentOverride (virtual body), length:', opts.contentOverride.length);
     }
 
-    const content = opts?.contentOverride ?? await this.ctx.app.vault.read(file);
+    const content = opts?.sourceSnapshot?.content
+      ?? opts?.contentOverride
+      ?? await this.ctx.app.vault.read(file);
     console.debug('File content length:', content.length);
 
     // #164 defense-in-depth: a blank source (empty / whitespace / frontmatter-only)

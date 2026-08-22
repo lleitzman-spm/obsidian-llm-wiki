@@ -15,6 +15,7 @@ import {
   buildSystemPrompt,
 } from './system-prompts';
 import { isInFolderScope } from '../core/folder-scope';
+import { getVaultPathWriteQueue } from '../core/path-write-safety';
 
 export class ContradictionManager {
   constructor(private ctx: EngineContext) {}
@@ -36,11 +37,7 @@ export class ContradictionManager {
 
   private async trackContradiction(contradiction: ContradictionInfo): Promise<void> {
     const contradictionsDir = `${this.ctx.settings.wikiFolder}/contradictions`;
-    try {
-      await this.ctx.app.vault.createFolder(contradictionsDir);
-    } catch {
-      // folder already exists
-    }
+    await this.ensureContradictionsDirectory(contradictionsDir);
 
     const date = new Date().toISOString().split('T')[0];
     const claimSlug = slugify(contradiction.claim.substring(0, 50));
@@ -79,6 +76,33 @@ ${contradiction.source_page}
 
     await this.ctx.createOrUpdateFile(filePath, content);
     console.debug('Contradiction tracked:', filePath);
+  }
+
+  private async ensureContradictionsDirectory(path: string): Promise<void> {
+    const engine = this.ctx as EngineContext & {
+      withPathWriteLock?: <T>(path: string, operation: () => Promise<T>) => Promise<T>;
+    };
+    const createFolder = async (): Promise<void> => {
+      if (this.ctx.app.vault.getAbstractFileByPath(path)) return;
+      await this.ctx.app.vault.createFolder(path);
+      if (!this.ctx.app.vault.getAbstractFileByPath(path)) {
+        throw new Error(`Contradictions folder creation could not be verified: ${path}`);
+      }
+    };
+    try {
+      if (engine.withPathWriteLock) {
+        await engine.withPathWriteLock(path, createFolder);
+      } else {
+        const existing = this.ctx.app.vault.getMarkdownFiles().map(file => file.path);
+        const queue = getVaultPathWriteQueue(this.ctx.app.vault, existing);
+        await queue.run(path, held => held.runRaw(path, createFolder));
+      }
+    } catch (error) {
+      // Obsidian reports an already-existing directory as an error in some
+      // adapters.  Re-check under the same safety boundary before accepting
+      // that benign race; unrelated creation failures still propagate.
+      if (!this.ctx.app.vault.getAbstractFileByPath(path)) throw error;
+    }
   }
 
   async getOpenContradictions(): Promise<

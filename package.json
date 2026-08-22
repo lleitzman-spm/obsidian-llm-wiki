@@ -13,7 +13,7 @@
     "build:dev": "node esbuild.config.mjs dev",
     "llm-wiki": "node tools/llm-wiki-cli/run-llm-wiki.mjs",
     "lint": "eslint src/ --max-warnings=0",
-    "lint:tools-bot": "eslint --config eslint.tools-bot.config.mjs tools/ --max-warnings=-1 || true",
+    "lint:tools-bot": "eslint --config eslint.tools-bot.config.mjs tools/ --max-warnings=-1",
     "css-lint": "node scripts/css-lint.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -50,15 +50,6 @@
     "vite": "^8.2.1",
     "vitest": "4.1.10",
     "yaml": "^2.4.2"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ],
-    "overrides": {
-      "fast-uri": "3.1.5",
-      "brace-expansion": "5.0.9"
-    }
   },
   "dependencies": {
     "@ai-sdk/anthropic": "3.0.98",

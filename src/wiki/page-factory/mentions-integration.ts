@@ -18,8 +18,10 @@
 
 import type { EntityInfo, ConceptInfo, MentionWithProvenance, LLMWikiSettings } from '../../types';
 import { TFile } from 'obsidian';
+import type { AuthoritativeSourceSnapshot } from '../../core/physical-source-authority';
 import { getSectionLabels } from '../system-prompts';
 import { injectMentionsSection } from '../../core/mentions-injector';
+import { filterGroundedMentions } from '../../core/quote-grounding';
 import { stripMentionsSection, computeReingestMentions } from '../../core/mentions-parser';
 import { isConversationSource } from './contextualize';
 
@@ -63,6 +65,7 @@ export async function assembleFinalContent(
   info: EntityInfo | ConceptInfo,
   sourceFile: TFile | { path: string; basename: string },
   existingBody: string,
+  sourceContent?: AuthoritativeSourceSnapshot | string,
 ): Promise<string> {
   const labels = getSectionLabels(ctx.settings);
   const isConv = isConversationSource(sourceFile, ctx.settings.wikiFolder);
@@ -89,12 +92,15 @@ export async function assembleFinalContent(
         quote,
         source_path: sourceFile.path,
         source_slug: '',
-        extracted_at: '',
-      }));
+      extracted_at: '',
+    }));
+  const groundedNewMentions = sourceContent === undefined
+    ? newMentions
+    : filterGroundedMentions(newMentions, sourceContent, sourceFile.path) as MentionWithProvenance[];
 
   const { mentions: unioned, preserveRaw } = computeReingestMentions(
     existingBody,
-    newMentions,
+    groundedNewMentions,
     labels.mentions_in_source,
     sourceFile.path,
   );

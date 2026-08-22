@@ -6,10 +6,19 @@ import { parseFrontmatter } from '../../../core/frontmatter';
 import { LINT_PREP_BATCH_READ } from '../../../constants';
 import { LintPhaseContext, ScannerPage } from '../types';
 import { isInFolderScope } from '../../../core/folder-scope';
+import { normalizePath } from 'obsidian';
+import { getVaultPathWriteQueue, notifyVaultWrite } from '../../../core/path-write-safety';
 
 export interface PreparationResult {
   wikiFiles: Array<{ path: string; basename: string }>;
   pageMap: Map<string, ScannerPage>;
+  /**
+   * Source bodies available to quote-grounding. This includes wiki source
+   * pages and raw vault notes explicitly cited by a Mentions entry. Keeping
+   * this separate from pageMap avoids treating every vault note as a wiki
+   * page while still letting the scanner resolve raw-note links.
+   */
+  sourceMap: Map<string, ScannerPage>;
   knownTargets: Set<string>;
   knownTargetsLower: Set<string>;
   doubleNestFixes: number;
@@ -31,6 +40,10 @@ export async function runPreparationPhase(
   const { known: knownTargets, knownLower: knownTargetsLower } = buildKnownTargets(allVaultFiles);
 
   const pageMap = new Map<string, ScannerPage>();
+  const writeQueue = getVaultPathWriteQueue(
+    ctx.app.vault,
+    allVaultFiles.map(file => file.path),
+  );
   ctx.stageNotice?.setMessage(
     getText(ctx.settings.language, 'lintReadingPages').replace('{count}', String(wikiFiles.length))
   );
@@ -51,6 +64,53 @@ export async function runPreparationPhase(
       pageMap.set(r.path, r);
     }
   }
+
+  // Quote grounding needs the body behind both canonical wiki source links
+  // and raw-note links emitted by the page factory. The old preparation phase
+  // only retained wiki pages, so a valid citation such as
+  // `[[10 Sources/approved/note]]` was reported as ungrounded during lint.
+  // Read only explicitly cited raw notes rather than making the whole vault
+  // a fallback source corpus (which would make bare legacy quotes pass on
+  // unrelated notes).
+  const sourceMap = new Map<string, ScannerPage>();
+  for (const [path, page] of pageMap) {
+    if (path.startsWith(`${ctx.settings.wikiFolder}/sources/`)) {
+      sourceMap.set(path, page);
+    }
+  }
+  const rawSourceTargets = new Set<string>();
+  const mentionLinkPattern = /^[-*]\s+"[^"]+"(?:\s*[—-]\s*\[\[([^\]]+)\]\])?\s*$/gm;
+  for (const page of pageMap.values()) {
+    let match: RegExpExecArray | null;
+    while ((match = mentionLinkPattern.exec(page.content)) !== null) {
+      const target = (match[1] ?? '').split('|')[0].trim();
+      if (!target || target.startsWith('sources/') || target.startsWith(`${ctx.settings.wikiFolder}/sources/`)) {
+        continue;
+      }
+      const normalized = normalizePath(target).replace(/\\/g, '/');
+      rawSourceTargets.add(normalized);
+      if (!normalized.toLowerCase().endsWith('.md')) rawSourceTargets.add(`${normalized}.md`);
+    }
+  }
+  const vaultFilesByPath = new Map(
+    allVaultFiles.map(file => [normalizePath(file.path).replace(/\\/g, '/'), file]),
+  );
+  const rawSourceFiles = [...rawSourceTargets]
+    .map(path => vaultFilesByPath.get(path))
+    .filter((file): file is (typeof allVaultFiles)[number] => file !== undefined)
+    .filter(file => !file.path.startsWith(`${ctx.settings.wikiFolder}/`));
+  for (let i = 0; i < rawSourceFiles.length; i += BATCH_READ) {
+    const batch = rawSourceFiles.slice(i, i + BATCH_READ);
+    const batchResults = await Promise.all(batch.map(async file => {
+      const content = await ctx.app.vault.read(file);
+      return {
+        path: normalizePath(file.path).replace(/\\/g, '/'),
+        content,
+        basename: file.basename,
+      };
+    }));
+    for (const source of batchResults) sourceMap.set(source.path, source);
+  }
   ctx.stageNotice?.setMessage(
     getText(ctx.settings.language, 'lintReadingPagesProgress')
       .replace('{current}', String(wikiFiles.length))
@@ -64,27 +124,33 @@ export async function runPreparationPhase(
   for (const [path, info] of pageMap) {
     const abstractFile = ctx.app.vault.getAbstractFileByPath(path);
     if (abstractFile) {
-      await ctx.app.vault.process(abstractFile, (data) => {
+      await runPreparationWrite(ctx, writeQueue, path, async () => {
+        const data = await ctx.app.vault.read(abstractFile as { path: string });
         const { fixed, content } = fixDoubleNestedWikiLinks(data);
-        if (fixed > 0) {
-          doubleNestFixes += fixed;
-          info.content = content;
-          console.debug(`lintWiki: fixed ${fixed} double-nested link(s) in ${path}`);
-        }
-        return data;
+        if (fixed <= 0) return false;
+        await ctx.app.vault.process(abstractFile, () => content);
+        await verifyPreparationWrite(ctx, abstractFile as { path: string }, content);
+        doubleNestFixes += fixed;
+        info.content = content;
+        console.debug(`lintWiki: fixed ${fixed} double-nested link(s) in ${path}`);
+        return true;
       });
     }
   }
   const logPath = `${ctx.settings.wikiFolder}/log.md`;
   const logFile = ctx.app.vault.getAbstractFileByPath(logPath);
   if (logFile) {
-    await ctx.app.vault.process(logFile, (data) => {
+    await runPreparationWrite(ctx, writeQueue, logPath, async () => {
+      const data = await ctx.app.vault.read(logFile as { path: string });
       const { fixed, content } = fixDoubleNestedWikiLinks(data);
       if (fixed > 0) {
+        await ctx.app.vault.process(logFile, () => content);
+        await verifyPreparationWrite(ctx, logFile as { path: string }, content);
         doubleNestFixes += fixed;
         console.debug(`lintWiki: fixed ${fixed} double-nested link(s) in log.md`);
+        return true;
       }
-      return fixed > 0 ? content : data;
+      return false;
     });
   }
   if (doubleNestFixes > 0) {
@@ -99,14 +165,18 @@ export async function runPreparationPhase(
     if (!scanPollutedSources(info.content, ctx.settings.wikiFolder, sourcesPreserveCase)) continue;
     const abstractFile = ctx.app.vault.getAbstractFileByPath(path);
     if (abstractFile) {
-      const { fixed, content } = fixPollutedSources(info.content, ctx.settings.wikiFolder, sourcesPreserveCase);
-      if (fixed > 0) {
+      await runPreparationWrite(ctx, writeQueue, path, async () => {
+        const current = await ctx.app.vault.read(abstractFile as { path: string });
+        const { fixed, content } = fixPollutedSources(current, ctx.settings.wikiFolder, sourcesPreserveCase);
+        if (fixed <= 0) return false;
         await ctx.app.vault.process(abstractFile, () => content);
+        await verifyPreparationWrite(ctx, abstractFile as { path: string }, content);
         sourcesNormalizedFiles += 1;
         sourcesNormalizedEntries += fixed;
         info.content = content;
         console.debug(`lintWiki: normalized ${fixed} sources entry(ies) in ${path}`);
-      }
+        return true;
+      });
     }
   }
   if (sourcesNormalizedFiles > 0) {
@@ -157,12 +227,55 @@ export async function runPreparationPhase(
   return {
     wikiFiles: filteredWikiFiles,
     pageMap,
+    sourceMap,
     knownTargets,
     knownTargetsLower,
     doubleNestFixes,
     sourcesNormalizedFiles,
     sourcesNormalizedEntries,
   };
+}
+
+type PreparationWriteContext = {
+  withPathWriteLock?: <T>(path: string, operation: () => Promise<T>) => Promise<T>;
+  onFileWrite?: (path: string) => void;
+};
+
+async function runPreparationWrite(
+  ctx: LintPhaseContext,
+  queue: ReturnType<typeof getVaultPathWriteQueue>,
+  path: string,
+  operation: () => Promise<boolean>,
+): Promise<void> {
+  const engine = ctx.wikiEngine as unknown as PreparationWriteContext;
+  if (engine.withPathWriteLock) {
+    const wrote = await engine.withPathWriteLock(path, operation);
+    if (wrote) notifyVaultWrite(
+      engine.onFileWrite ?? (ctx.app.vault as unknown as { onFileWrite?: (p: string) => void }).onFileWrite,
+      queue,
+      path,
+    );
+    return;
+  }
+  return queue.run(path, async held => {
+    const wrote = await held.runRaw(path, operation);
+    if (wrote) notifyVaultWrite(
+        engine.onFileWrite ?? (ctx.app.vault as unknown as { onFileWrite?: (p: string) => void }).onFileWrite,
+        queue,
+        path,
+      );
+  });
+}
+
+async function verifyPreparationWrite(
+  ctx: LintPhaseContext,
+  file: { path: string },
+  expected: string,
+): Promise<void> {
+  const actual = await ctx.app.vault.read(file);
+  if (actual !== expected) {
+    throw new Error(`Lint preparation write verification failed: ${file.path}`);
+  }
 }
 
 function buildKnownTargets(

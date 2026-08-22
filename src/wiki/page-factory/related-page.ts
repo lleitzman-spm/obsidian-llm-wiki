@@ -28,11 +28,13 @@ import {
   reassertH1,
 } from '../../core/section-header-canonicalizer';
 import { correctRelatedLinkPrefixes } from '../../core/related-link-corrector';
+import { guardGeneratedWikiLinks } from '../../core/generated-link-guard';
 import { getSectionLabels } from '../system-prompts';
 import { getExistingWikiPages } from '../lint/get-existing-pages';
 import { UNIVERSAL_LINK_CONSTRAINTS } from '../prompts/constraints';
 import { appendToReviewedPage, type MergeContext } from './merge-page';
 import { assembleFinalContent } from './mentions-integration';
+import type { AuthoritativeSourceSnapshot } from '../../core/physical-source-authority';
 
 /**
  * Minimal context contract required by `updateRelatedPage`. Mirrors the real
@@ -49,6 +51,8 @@ export interface RelatedPageContext extends MergeContext {
   getClient(): LLMClient | null;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge' | 'related'): Promise<string>;
   createOrUpdateFile(path: string, content: string): Promise<void>;
+  createOrUpdateFileUnlocked?: (path: string, content: string) => Promise<void>;
+  withPathWriteLock: <T>(path: string, operation: () => Promise<T>) => Promise<T>;
 }
 
 /**
@@ -62,6 +66,8 @@ export async function updateRelatedPage(
   analysis: SourceAnalysis,
   sourceFile: TFile | { path: string; basename: string },
   sourceSlug?: string,
+  pathLockHeld = false,
+  sourceContent?: AuthoritativeSourceSnapshot | string,
 ): Promise<boolean> {
   const existingPages = await getExistingWikiPages(
     ctx.app as never,
@@ -72,6 +78,15 @@ export async function updateRelatedPage(
   if (!page) {
     console.debug('Related page not found:', pageName);
     return false;
+  }
+
+  // The related-page path reads the target before asking the model to rewrite
+  // it. Re-enter under the per-path lock so another source cannot complete a
+  // read/modify/write cycle against the same stale snapshot meanwhile.
+  if (!pathLockHeld) {
+    return ctx.withPathWriteLock(page.path, () =>
+      updateRelatedPage(ctx, pageName, analysis, sourceFile, sourceSlug, true, sourceContent)
+    );
   }
 
   const abstractFile = ctx.app.vault.getAbstractFileByPath(page.path);
@@ -96,14 +111,14 @@ export async function updateRelatedPage(
     analysis.entities.find(e => e.name === pageName) ||
     analysis.concepts.find(c => c.name === pageName);
   if (!newInfo) {
-    await ctx.createOrUpdateFile(page.path, `${frontmatter}\n\n${existingBody}`);
+    await (ctx.createOrUpdateFileUnlocked ?? ctx.createOrUpdateFile)(page.path, `${frontmatter}\n\n${existingBody}`);
     return true;
   }
 
   // Parity with createOrUpdatePage: a `reviewed: true` page must never have its
   // body LLM-rewritten — even when a different source extracts it here.
   if (parseFrontmatter(existingContent)?.reviewed === true) {
-    await appendToReviewedPage(ctx, newInfo, sourceFile, existingContent, page.path);
+    await appendToReviewedPage(ctx, newInfo, sourceFile, existingContent, page.path, undefined, sourceContent);
     return true;
   }
 
@@ -152,15 +167,28 @@ export async function updateRelatedPage(
     // #482 stage 2: resolve the link targets against every page. This path
     // never had a candidate list in its prompt, so until now a related name
     // whose page carries a different title could only become a dead link.
-    { wikiFolder: ctx.settings.wikiFolder, pages: await getExistingWikiPages(ctx.app as never, ctx.settings.wikiFolder) },
+    { wikiFolder: ctx.settings.wikiFolder, pages: existingPages },
   );
+
+  const guardedGeneratedBody = guardGeneratedWikiLinks(correctedBody, {
+    wikiFolder: ctx.settings.wikiFolder,
+    pages: existingPages,
+    additionalPages: [
+      { path: page.path, title: page.title },
+      { path: sourceFile.path, title: sourceFile.basename },
+      ...(sourceSlug ? [{
+        path: `${ctx.settings.wikiFolder}/sources/${sourceSlug}.md`,
+        title: sourceSlug,
+      }] : []),
+    ],
+  });
 
   // Completeness is the schema's call, not the model's: restore any canonical
   // section that carried content before the rewrite and is wholly absent from
   // it. The Mentions section is re-attached by assembleFinalContent below.
   const guardedBody = preserveExistingSections(
     promptBody,
-    correctedBody,
+    guardedGeneratedBody,
     Object.values(labels),
     labels.mentions_in_source,
   );
@@ -178,9 +206,9 @@ export async function updateRelatedPage(
   // page's mentions with this source's, and falls back to preserving an
   // unparseable section verbatim. `existingBody` (not promptBody) is passed so
   // the accumulated mentions are recovered from the unstripped page.
-  await ctx.createOrUpdateFile(
+  await (ctx.createOrUpdateFileUnlocked ?? ctx.createOrUpdateFile)(
     page.path,
-    await assembleFinalContent(ctx, frontmatter, titledBody, newInfo, sourceFile, existingBody),
+    await assembleFinalContent(ctx, frontmatter, titledBody, newInfo, sourceFile, existingBody, sourceContent),
   );
   return true;
 }

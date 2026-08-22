@@ -15,15 +15,50 @@
 // Pure and IO-free so the boundary rule can be unit-tested without an Obsidian
 // vault — the call site only supplies two primitives.
 
+const WINDOWS_RESERVED_SEGMENT = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+
+/**
+ * Normalize a vault-relative path to the identity Windows uses for ordinary
+ * paths. Obsidian exposes `/` paths, but a path can still arrive from a
+ * Windows-backed vault or a test double with `\\` separators. NFC and
+ * case-folding make the comparison stable across filesystems; trimming
+ * trailing dots/spaces mirrors Win32 name equivalence. Absolute/device paths,
+ * ADS, traversal, control characters, and reserved device names are not vault
+ * paths and must never be admitted by a scope predicate.
+ */
+function normalizeVaultPath(path: string, foldCase: boolean): string | null {
+  if (typeof path !== 'string') return null;
+
+  const source = path.normalize('NFC').replace(/\\/g, '/');
+  if (source === '' || source === '/') return '';
+  if (source.startsWith('/') || source.startsWith('//') || /^[A-Za-z]:/.test(source)) return null;
+
+  const segments: string[] = [];
+  for (const rawSegment of source.split('/')) {
+    if (rawSegment === '' || rawSegment === '.') continue;
+    if (rawSegment === '..') return null;
+    // A colon in a relative segment is an alternate-data-stream separator;
+    // it is never a legal Obsidian vault path component on Windows.
+    // eslint-disable-next-line no-control-regex -- reject control characters in path identities
+    if (/[\u0000-\u001f\u007f:]/.test(rawSegment)) return null;
+
+    const segment = rawSegment.replace(/[ .]+$/g, '');
+    if (segment.length === 0 || WINDOWS_RESERVED_SEGMENT.test(segment)) return null;
+    segments.push(foldCase ? segment.toLowerCase() : segment);
+  }
+
+  return segments.join('/');
+}
+
 /**
  * The string prefix every descendant of a folder shares.
  * Returns '' for the vault root, so `startsWith` accepts every path.
  */
 export function folderScopePrefix(folderPath: string, isRoot: boolean): string {
   if (isRoot) return '';
-  const trimmed = folderPath.replace(/\/+$/, '');
-  if (trimmed.length === 0) return '';
-  return `${trimmed}/`;
+  const normalized = normalizeVaultPath(folderPath, false);
+  if (!normalized) return '';
+  return `${normalized}/`;
 }
 
 /**
@@ -35,7 +70,13 @@ export function isInFolderScope(
   folderPath: string,
   isRoot: boolean
 ): boolean {
-  return filePath.startsWith(folderScopePrefix(folderPath, isRoot));
+  const normalizedFile = normalizeVaultPath(filePath, true);
+  if (normalizedFile === null) return false;
+  if (isRoot) return true;
+
+  const normalizedFolder = normalizeVaultPath(folderPath, true);
+  if (!normalizedFolder) return false;
+  return normalizedFile.startsWith(`${normalizedFolder}/`);
 }
 
 /**
@@ -54,9 +95,13 @@ export function isAtOrInFolderScope(
   folderPath: string,
   isRoot: boolean
 ): boolean {
-  const trimmedFolder = folderPath.replace(/\/+$/, '');
-  if (trimmedFolder.length > 0 && filePath === trimmedFolder) return true;
-  return isInFolderScope(filePath, folderPath, isRoot);
+  const normalizedFile = normalizeVaultPath(filePath, true);
+  if (normalizedFile === null) return false;
+  if (isRoot) return true;
+
+  const normalizedFolder = normalizeVaultPath(folderPath, true);
+  if (!normalizedFolder) return false;
+  return normalizedFile === normalizedFolder || normalizedFile.startsWith(`${normalizedFolder}/`);
 }
 
 /**
@@ -70,7 +115,11 @@ export function isExcludedFromSourcePicker(
   wikiFolder: string,
   configDir: string
 ): boolean {
+  const normalizedPath = normalizeVaultPath(path, false);
+  if (normalizedPath === null) return true;
+  const hasHiddenSegment = normalizedPath.split('/').some(segment => segment.startsWith('.'));
   return (
+    hasHiddenSegment ||
     isAtOrInFolderScope(path, wikiFolder, false) ||
     isAtOrInFolderScope(path, configDir, false)
   );

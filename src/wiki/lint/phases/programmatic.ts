@@ -9,6 +9,8 @@ export interface ProgrammaticInput {
   pageMap: Map<string, ScannerPage>;
   knownTargets: Set<string>;
   knownTargetsLower: Set<string>;
+  /** Wiki source pages plus explicitly cited raw-note source snapshots. */
+  sourceMap?: Map<string, ScannerPage>;
   /** v1.23.0 P1-6 — wiki-link graph for hub detection and PPR. */
   graph: Graph;
 }
@@ -67,10 +69,10 @@ export function runProgrammaticPhase(
   );
 
   // 6. Quote grounding (Issue #126) — reuses already-read source pages.
-  const sourceMap = new Map<string, ScannerPage>();
-  for (const [path, page] of input.pageMap) {
-    if (path.includes('/sources/')) {
-      sourceMap.set(path, page);
+  const sourceMap = input.sourceMap ?? new Map<string, ScannerPage>();
+  if (!input.sourceMap) {
+    for (const [path, page] of input.pageMap) {
+      if (path.includes('/sources/')) sourceMap.set(path, page);
     }
   }
   const ungroundedQuotes = scanQuoteGrounding(input.pageMap, sourceMap, ctx.settings.wikiFolder);

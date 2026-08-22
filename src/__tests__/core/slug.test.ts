@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeSlug, filterRedundantAliases, slugify, slugKeys, turkishCaseFold } from '../../core/slug';
+import { computeSlug, filterRedundantAliases, slugify, slugKeys, turkishCaseFold, windowsEquivalentIdentity } from '../../core/slug';
 describe('slugify', () => {
   it('returns "untitled" for empty input', () => {
     expect(slugify('')).toBe('untitled');
@@ -11,6 +11,7 @@ describe('slugify', () => {
     expect(slugify('hello/world')).toBe('helloworld');
     expect(slugify('test:file')).toBe('testfile');
     expect(slugify('a|b')).toBe('ab');
+    expect(slugify('1430 Schley #4')).toBe('1430-schley-4');
   });
 
   it('converts spaces and dots to dashes', () => {
@@ -145,6 +146,25 @@ describe('computeSlug', () => {
     // CJK has no upper/lower case; only the ASCII "Supervised Learning" is lowercased
     expect(computeSlug('机器学习 Supervised Learning')).toBe('机器学习-supervised-learning');
   });
+
+  it('normalizes Unicode spelling before creating a filename', () => {
+    expect(computeSlug('Cafe\u0301')).toBe('café');
+    expect(computeSlug('café')).toBe(computeSlug('Cafe\u0301'));
+  });
+
+  it('keeps Windows ADS punctuation out of generated names', () => {
+    expect(computeSlug('note:private')).toBe('noteprivate');
+    expect(computeSlug('C:ON')).not.toBe('con');
+  });
+
+  it('does not emit Windows device names, including case and trailing-dot variants', () => {
+    for (const name of ['CON', 'con.', 'PRN', 'AUX', 'NUL', 'COM1', 'LPT9', 'CLOCK$']) {
+      const slug = computeSlug(name);
+      expect(slug.toLowerCase()).not.toMatch(/^(con|prn|aux|nul|com[1-9]|lpt[1-9]|clock\$)$/);
+    }
+    expect(computeSlug('CON')).toBe('untitled-con');
+    expect(computeSlug('CON', true)).toBe('untitled-CON');
+  });
 });
 
 describe('filterRedundantAliases', () => {
@@ -229,6 +249,20 @@ describe('filterRedundantAliases', () => {
     // No third argument — should not throw, must still apply filename + batch dedup.
     const result = filterRedundantAliases('wiki/entities/vigilanz.md', ['Vigilanz']);
     expect(result).toEqual([]);
+  });
+
+  it('deduplicates aliases by Windows-equivalent NFC/case identity', () => {
+    const result = filterRedundantAliases(
+      'wiki/entities/caf\u00e9.md',
+      ['Cafe\u0301', 'CAF\u00c9', 'Other Alias'],
+    );
+    expect(result).toEqual(['Other Alias']);
+  });
+
+  it('treats trailing dots/spaces as the same Windows identity', () => {
+    expect(windowsEquivalentIdentity('Foo.')).toBe(windowsEquivalentIdentity('foo '));
+    expect(filterRedundantAliases('wiki/entities/foo.md', ['Foo.'])).toEqual([]);
+    expect(filterRedundantAliases('wiki\\entities\\foo.md', ['FOO'])).toEqual([]);
   });
 });
 

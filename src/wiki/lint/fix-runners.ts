@@ -130,7 +130,11 @@ export async function runAliasCompletion(
             const mergedAliases = Array.isArray(fmAfter?.aliases) ? fmAfter.aliases : [];
             const newAliases = mergedAliases.length - existingAliases.length;
 
-            await ctx.app.vault.adapter.write(page.path, updated);
+            // Route the completed page through WikiEngine's canonical writer.
+            // Direct adapter writes bypass PathWriteQueue leases, path safety,
+            // pollution cleanup, generation completion/readback, cache
+            // invalidation, and watcher notifications.
+            await ctx.wikiEngine.createOrUpdateFile(page.path, updated);
             results.push(`- [[${pageRel}]]: added ${newAliases} aliases (total ${mergedAliases.length})`);
             return { success: true, name: page.basename, count: newAliases };
           }
@@ -398,9 +402,13 @@ export async function runDuplicateMerges(
           .replace('{source}', sourceRel)
           .replace('{target}', targetRel));
         console.debug(`lintFix: merge duplicates ${currentIdx + 1}/${duplicates.length}: ${d.source} → ${d.target}`);
-        const result = await ctx.wikiEngine.mergeDuplicatePages(d.target, d.source);
+        // Keep the merge's destructive boundary under the same cancellation
+        // signal as the batch. The merge drains admitted retarget writes and
+        // performs its final abort check immediately before source deletion.
+        const result = await ctx.wikiEngine.mergeDuplicatePages(d.target, d.source, signal);
         return { d, result };
       }));
+      let abortReason: Error | undefined;
       for (let j = 0; j < batchResults.length; j++) {
         const r = batchResults[j];
         if (r.status === 'fulfilled') {
@@ -413,9 +421,18 @@ export async function runDuplicateMerges(
           const targetRel = d.target.replace(ctx.settings.wikiFolder + '/', '').replace('.md', '');
           const errMsg = r.reason instanceof Error ? r.reason.message : String(r.reason);
           console.error(`Failed to merge duplicates: ${d.source} → ${d.target}`, r.reason);
+          if (r.reason instanceof DOMException && r.reason.name === 'AbortError') {
+            // Promise.allSettled has drained every merge admitted to this
+            // batch. Re-throw cancellation after inspecting all outcomes so
+            // no sibling retarget write is left in flight.
+            abortReason = r.reason;
+            continue;
+          }
           new Notice(t.lintMergeItemFailed.replace('{source}', sourceRel).replace('{target}', targetRel).replace('{error}', errMsg), NOTICE_ERROR);
         }
       }
+      if (abortReason) throw abortReason;
+      checkCancelled(signal);
     }
   } finally {
     fixNotice.hide();
@@ -601,7 +618,11 @@ Task: Return a JSON object with a single field "tags" that is an array of string
         // LLM's retag un-applied. The replace helper also handles the
         // block-style case correctly.
         const updated = replaceFrontmatterArrayField(content, 'tags', safeNewTags);
-        await ctx.app.vault.adapter.write(v.path, updated);
+        // Retagging is a read/modify/write operation. The engine writer owns
+        // the canonical PathWriteQueue lease and performs path validation,
+        // pollution cleanup, completion/readback, cache invalidation, and
+        // watcher notification; never bypass it through the adapter.
+        await ctx.wikiEngine.createOrUpdateFile(v.path, updated);
         return {
           v,
           kind: 'fixed' as const,

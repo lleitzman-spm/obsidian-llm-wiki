@@ -33,15 +33,46 @@ import { resolveModelForTask } from '../../core/model-resolver';
 import { cleanMarkdownResponse } from '../../core/markdown';
 import { canonicalizeSectionHeaders } from '../../core/section-header-canonicalizer';
 import { correctRelatedLinkPrefixes } from '../../core/related-link-corrector';
+import { guardGeneratedWikiLinks, type GeneratedLinkPageRef } from '../../core/generated-link-guard';
 import { parseFrontmatter, enforceFrontmatterConstraints } from '../../core/frontmatter';
+import { getActiveConceptTags, getActiveEntityTags } from '../../core/tag-vocab';
 import { injectMentionsSection } from '../../core/mentions-injector';
+import { filterGroundedMentions, filterLegacyGroundedMentions } from '../../core/quote-grounding';
+import type { AuthoritativeSourceSnapshot } from '../../core/physical-source-authority';
 import { renderTemplate } from '../../core/template-renderer';
 import { applySectionLabels, getSectionLabels } from '../system-prompts';
-import { resolvePagePath, type PathResolutionContext } from './path-resolution';
+import { resolvePagePath, type PathResolutionContext, type ResolvedPathResult } from './path-resolution';
+import { appendAliases } from './aliases';
 import { getExistingWikiPages } from '../lint/get-existing-pages';
 import { mergePage } from './merge-page';
 import { appendToReviewedPage } from './merge-page';
 import { isConversationSource, contextualizeError } from './contextualize';
+
+/**
+ * Return tags that belong exclusively to the opposite page taxonomy.
+ *
+ * `parseFrontmatter` already types `tags` as `string[] | undefined`, but this
+ * guard remains deliberately defensive because generated frontmatter is
+ * untrusted input and the parser has an open-ended passthrough shape.
+ */
+function findOppositeTaxonomyTags(
+  pageType: 'entity' | 'concept',
+  tags: string[] | undefined,
+  settings: LLMWikiSettings,
+): string[] {
+  if (!Array.isArray(tags)) return [];
+
+  const ownTags = pageType === 'entity'
+    ? getActiveEntityTags(settings)
+    : getActiveConceptTags(settings);
+  const oppositeTags = pageType === 'entity'
+    ? getActiveConceptTags(settings)
+    : getActiveEntityTags(settings);
+  const ownTagSet = new Set(ownTags);
+  const oppositeTagSet = new Set(oppositeTags);
+
+  return tags.filter(tag => oppositeTagSet.has(tag) && !ownTagSet.has(tag));
+}
 
 /**
  * Minimal context contract required by createOrUpdatePage / createNewPage.
@@ -51,7 +82,21 @@ export interface CreatePageContext extends PathResolutionContext {
   getClient(): LLMClient | null;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge' | 'entity' | 'concept' | 'index'): Promise<string>;
   createOrUpdateFile(path: string, content: string): Promise<void>;
+  createOrUpdateFileUnlocked?: (path: string, content: string) => Promise<void>;
+  withPathWriteLock: <T>(path: string, operation: () => Promise<T>) => Promise<T>;
   tryReadFile(path: string): Promise<string | null>;
+}
+
+type SourceContent = AuthoritativeSourceSnapshot | string;
+
+function groundMentions(
+  mentions: EntityInfo['mentions_with_provenance'] | string[] | undefined,
+  sourceContent: SourceContent,
+  sourcePath: string,
+): EntityInfo['mentions_with_provenance'] | string[] | undefined {
+  return typeof sourceContent === 'string'
+    ? filterLegacyGroundedMentions(mentions, sourceContent, sourcePath)
+    : filterGroundedMentions(mentions, sourceContent, sourcePath);
 }
 
 /**
@@ -84,6 +129,8 @@ export async function createOrUpdatePage(
   extraPagePaths: string[] = [],
   sourceSlug?: string,
   sourceContext?: SourceContext,
+  sourceContent?: SourceContent,
+  resolutionOverride?: ResolvedPathResult,
 ): Promise<PageCreationResult> {
   if (!info.name || info.name.trim().length === 0) {
     console.warn(`${pageType} name is empty, skipping creation`);
@@ -97,30 +144,61 @@ export async function createOrUpdatePage(
   // Issue #446: `info.type` is the term this page will carry as its own `tags:`
   // (see the generation template), so it is like-for-like with the candidate
   // pages' tags and needs no new read at the note.
-  const result = await resolvePagePath(ctx, info.name, pageType, info.summary, info.type ? [info.type] : undefined);
+  const result = resolutionOverride
+    ? resolutionOverride
+    : await resolvePagePath(ctx, info.name, pageType, info.summary, info.type ? [info.type] : undefined);
   if (result.path === null) {
     // Nothing was written: the resolver reached no decision it could act on.
     return { ...result, created: false };
   }
-  console.debug('Resolved path:', result.path);
-
-  const existingContent = await ctx.tryReadFile(result.path);
-
-  if (!existingContent) {
-    const createdPath = await createNewPage(ctx, info, pageType, sourceFile, extraPagePaths, result.path, sourceSlug);
-    return { path: createdPath, created: true };
+  const resolvedPath = result.path;
+  if (result.aliasCommit && result.aliasCommit.targetPath !== resolvedPath) {
+    throw new Error(
+      `Refusing alias commit for ${result.aliasCommit.targetPath}: resolved write path is ${resolvedPath}`,
+    );
   }
+  console.debug('Resolved path:', resolvedPath);
 
-  const isReviewed = parseFrontmatter(existingContent)?.reviewed === true;
+  const commitResolution = async (pageResult: PageCreationResult): Promise<PageCreationResult> => {
+    if (pageResult.path && result.aliasCommit) {
+      if (pageResult.path !== resolvedPath) {
+        throw new Error(
+          `Refusing alias commit for ${result.aliasCommit.targetPath}: successful write path was ${pageResult.path}`,
+        );
+      }
+      // This function is called from inside updatePage, which itself runs
+      // under the mandatory lock for resolvedPath. The alias therefore merges
+      // against the just-written page rather than a stale preflight snapshot.
+      await appendAliases(ctx, result.aliasCommit.targetPath, [result.aliasCommit.alias]);
+    }
+    return pageResult;
+  };
 
-  if (isReviewed) {
-    console.debug(`${pageType} page has reviewed: true, using minimal append mode:`, result.path);
-    const updatedPath = await appendToReviewedPage(ctx, info, sourceFile, existingContent, result.path, sourceSlug);
-    return { path: updatedPath, created: false };
-  }
+  const updatePage = async (): Promise<PageCreationResult> => {
+    // Read inside the path lock. A concurrent page-generation task may have
+    // created or updated this page while this task was resolving its path.
+    // Reading before the lock would let both tasks merge against the same
+    // stale snapshot and the later write would discard the first merge.
+    const existingContent = await ctx.tryReadFile(resolvedPath);
 
-  const mergedPath = await mergePage(ctx, info, pageType, sourceFile, existingContent, extraPagePaths, result.path, sourceSlug, sourceContext);
-  return { path: mergedPath, created: false };
+    if (!existingContent) {
+      const createdPath = await createNewPage(ctx, info, pageType, sourceFile, extraPagePaths, resolvedPath, sourceSlug, sourceContent);
+      return commitResolution({ path: createdPath, created: true });
+    }
+
+    const isReviewed = parseFrontmatter(existingContent)?.reviewed === true;
+
+    if (isReviewed) {
+      console.debug(`${pageType} page has reviewed: true, using minimal append mode:`, resolvedPath);
+      const updatedPath = await appendToReviewedPage(ctx, info, sourceFile, existingContent, resolvedPath, sourceSlug, sourceContent);
+      return commitResolution({ path: updatedPath, created: false });
+    }
+
+    const mergedPath = await mergePage(ctx, info, pageType, sourceFile, existingContent, extraPagePaths, resolvedPath, sourceSlug, sourceContext, sourceContent);
+    return commitResolution({ path: mergedPath, created: false });
+  };
+
+  return ctx.withPathWriteLock(resolvedPath, updatePage);
 }
 
 /**
@@ -134,10 +212,14 @@ export async function createOrUpdateEntityPage(
   sourceFile: TFile | { path: string; basename: string },
   extraPagePaths: string[] = [],
   sourceSlug?: string,
+  sourceContent?: SourceContent,
+  resolutionOverride?: ResolvedPathResult,
 ): Promise<PageCreationResult> {
   return createOrUpdatePage(
     ctx, entity, 'entity', sourceFile, extraPagePaths, sourceSlug,
     sourceContextFromAnalysis(analysis),
+    sourceContent,
+    resolutionOverride,
   );
 }
 
@@ -152,10 +234,14 @@ export async function createOrUpdateConceptPage(
   sourceFile: TFile | { path: string; basename: string },
   extraPagePaths: string[] = [],
   sourceSlug?: string,
+  sourceContent?: SourceContent,
+  resolutionOverride?: ResolvedPathResult,
 ): Promise<PageCreationResult> {
   return createOrUpdatePage(
     ctx, concept, 'concept', sourceFile, extraPagePaths, sourceSlug,
     sourceContextFromAnalysis(analysis),
+    sourceContent,
+    resolutionOverride,
   );
 }
 
@@ -177,6 +263,7 @@ export async function createNewPage(
   extraPagePaths: string[],
   path: string,
   sourceSlug?: string,
+  sourceContent?: SourceContent,
 ): Promise<string | null> {
   const client = ctx.getClient();
   if (!client) throw new Error('LLM client not initialized');
@@ -222,11 +309,22 @@ export async function createNewPage(
     // no prior file and no real creation date to preserve. Anything `created:`
     // in the model's reply says about the past is invented by construction.
     const enforcedContent = enforceFrontmatterConstraints(cleanedContent, pageType, ctx.settings);
+    const taxonomyMismatches = findOppositeTaxonomyTags(
+      pageType,
+      parseFrontmatter(enforcedContent)?.tags,
+      ctx.settings,
+    );
+    if (taxonomyMismatches.length > 0) {
+      throw new Error(
+        `Taxonomy mismatch: ${pageType} page has opposite-only tag(s): ${taxonomyMismatches.join(', ')}`,
+      );
+    }
     const labels = getSectionLabels(ctx.settings);
     // Re-assert the known section labels before the link corrector runs, so a
     // garbled `## Verwandte …` header still resolves its section for prefix
     // correction.
     const canonicalizedContent = canonicalizeSectionHeaders(enforcedContent, Object.values(labels));
+    const existingPages = await getExistingWikiPages(ctx.app as never, ctx.settings.wikiFolder);
     const correctedContent = correctRelatedLinkPrefixes(
       canonicalizedContent,
       info.related_entities,
@@ -236,8 +334,25 @@ export async function createNewPage(
       ctx.settings.slugCase === 'preserve',
       // #482 stage 2: the prompt no longer carries a page list, so the link
       // targets are resolved here — against every page, not a window.
-      { wikiFolder: ctx.settings.wikiFolder, pages: await getExistingWikiPages(ctx.app as never, ctx.settings.wikiFolder) },
+      { wikiFolder: ctx.settings.wikiFolder, pages: existingPages },
     );
+    const generatedRefs: GeneratedLinkPageRef[] = [
+      { path, title: info.name, aliases: info.aliases },
+      ...extraPagePaths.map(plannedPath => ({
+        path: plannedPath,
+        title: plannedPath.replace(/\.md$/i, '').split('/').pop() ?? plannedPath,
+      })),
+      { path: sourceFile.path, title: sourceFile.basename },
+      ...(sourceSlug ? [{
+        path: `${ctx.settings.wikiFolder}/sources/${sourceSlug}.md`,
+        title: sourceSlug,
+      }] : []),
+    ];
+    const guardedContent = guardGeneratedWikiLinks(correctedContent, {
+      wikiFolder: ctx.settings.wikiFolder,
+      pages: existingPages,
+      additionalPages: generatedRefs,
+    });
     // Issue #244: programmatically inject the Mentions section.
     const isConv = isConversationSource(sourceFile, ctx.settings.wikiFolder);
     const mentionsForInject = isConv
@@ -245,9 +360,12 @@ export async function createNewPage(
       : (info.mentions_with_provenance?.length
         ? info.mentions_with_provenance
         : info.mentions_in_source);
+    const groundedMentions = sourceContent === undefined
+      ? mentionsForInject
+      : groundMentions(mentionsForInject, sourceContent, sourceFile.path);
     const mentionsInjectedContent = injectMentionsSection(
-      correctedContent,
-      mentionsForInject,
+      guardedContent,
+      groundedMentions ?? [],
       sourceFile.path,
       {
         sectionLabel: labels.mentions_in_source,
@@ -295,7 +413,7 @@ export async function createNewPage(
     const sourcedContent = sourceSlug
       ? appendSourceSlugToFrontmatter(mentionsInjectedContent, sourceSlug)
       : mentionsInjectedContent;
-    await ctx.createOrUpdateFile(path, sourcedContent);
+    await (ctx.createOrUpdateFileUnlocked ?? ctx.createOrUpdateFile)(path, sourcedContent);
     return path;
   } catch (error) {
     throw contextualizeError(error, info.name, pageType);

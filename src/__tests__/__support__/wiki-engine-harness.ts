@@ -17,6 +17,8 @@ import { DEFAULT_SETTINGS } from './engine-context';
 type LLMRequest = Parameters<LLMClient['createMessage']>[0];
 
 export interface WikiEngineHarness {
+  /** In-memory Obsidian app used by the engine; exposed for whole-pipeline tests. */
+  app: App;
   engine: WikiEngine;
   /** Every request handed to the LLM stub, in order. Lets a test assert on the
    *  prompt the engine built, not just on what the stub returned. */
@@ -102,6 +104,9 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
         return frontmatter ? { frontmatter } : null;
       },
     },
+    fileManager: {
+      trashFile: async (file: { path: string }) => { files.delete(file.path); },
+    },
   } as unknown as App;
 
   const client: LLMClient = {
@@ -139,7 +144,7 @@ export function createWikiEngineHarness(opts: HarnessOptions = {}): WikiEngineHa
     () => { /* onEnd: nothing to capture */ },
   );
 
-  return { engine, llmRequests, writtenPaths, reports, files, stats, startedFilenames, progressMessages };
+  return { app, engine, llmRequests, writtenPaths, reports, files, stats, startedFilenames, progressMessages };
 }
 
 /** True if any written path is a wiki entity/concept/source page (the #164 symptom). */

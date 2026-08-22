@@ -41,9 +41,12 @@ import {
   reassertH1,
 } from '../../core/section-header-canonicalizer';
 import { correctRelatedLinkPrefixes } from '../../core/related-link-corrector';
+import { guardGeneratedWikiLinks } from '../../core/generated-link-guard';
 import { mergeFrontmatter, parseFrontmatter } from '../../core/frontmatter';
 import { appendContradictedByMarker } from '../../core/contradicted-marker';
 import { injectMentionsSection } from '../../core/mentions-injector';
+import { filterGroundedMentions, filterLegacyGroundedMentions } from '../../core/quote-grounding';
+import type { AuthoritativeSourceSnapshot } from '../../core/physical-source-authority';
 import { renderTemplate } from '../../core/template-renderer';
 import { applySectionLabels, getSectionLabels } from '../system-prompts';
 import { UNIVERSAL_LINK_CONSTRAINTS } from '../prompts/constraints';
@@ -63,6 +66,7 @@ export interface MergeContext {
   getClient(): LLMClient | null;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge'): Promise<string>;
   createOrUpdateFile(path: string, content: string): Promise<void>;
+  createOrUpdateFileUnlocked?: (path: string, content: string) => Promise<void>;
   tryReadFile(path: string): Promise<string | null>;
 }
 
@@ -85,6 +89,7 @@ export async function mergePage(
   path: string,
   sourceSlug?: string,
   sourceContext?: SourceContext,
+  sourceContent?: AuthoritativeSourceSnapshot | string,
 ): Promise<string | null> {
   const client = ctx.getClient();
   if (!client) throw new Error('LLM client not initialized');
@@ -175,9 +180,9 @@ export async function mergePage(
 
     if (shouldSkip) {
       const bodyToWrite = complementaryBody ?? existingBody;
-      await ctx.createOrUpdateFile(
+      await (ctx.createOrUpdateFileUnlocked ?? ctx.createOrUpdateFile)(
         path,
-        await assembleFinalContent(ctx, frontmatter, bodyToWrite, info, sourceFile, existingBody),
+        await assembleFinalContent(ctx, frontmatter, bodyToWrite, info, sourceFile, existingBody, sourceContent),
       );
       return path;
     }
@@ -217,6 +222,7 @@ export async function mergePage(
     // 3. Assemble final content (re-assert related-link types deterministically).
     const labels = getSectionLabels(ctx.settings);
     const canonicalizedBody = canonicalizeSectionHeaders(cleanedBody, Object.values(labels));
+    const existingPages = await getExistingWikiPages(ctx.app as never, ctx.settings.wikiFolder);
     const correctedBody = correctRelatedLinkPrefixes(
       canonicalizedBody,
       info.related_entities,
@@ -226,14 +232,30 @@ export async function mergePage(
       ctx.settings.slugCase === 'preserve',
       // #482 stage 2: the merge prompt no longer carries a page list, so the
       // link targets are resolved here — against every page, not a window.
-      { wikiFolder: ctx.settings.wikiFolder, pages: await getExistingWikiPages(ctx.app as never, ctx.settings.wikiFolder) },
+      { wikiFolder: ctx.settings.wikiFolder, pages: existingPages },
     );
+    const guardedGeneratedBody = guardGeneratedWikiLinks(correctedBody, {
+      wikiFolder: ctx.settings.wikiFolder,
+      pages: existingPages,
+      additionalPages: [
+        { path, title: info.name, aliases: info.aliases },
+        { path: sourceFile.path, title: sourceFile.basename },
+        ...(sourceSlug ? [{
+          path: `${ctx.settings.wikiFolder}/sources/${sourceSlug}.md`,
+          title: sourceSlug,
+        }] : []),
+        ...extraPagePaths.map(plannedPath => ({
+          path: plannedPath,
+          title: plannedPath.replace(/\.md$/i, '').split('/').pop() ?? plannedPath,
+        })),
+      ],
+    });
     // Completeness is the schema's call, not the model's: restore any canonical
     // section that carried content before the rewrite and is wholly absent from
     // it. The Mentions section is re-attached by assembleFinalContent below.
     const guardedBody = preserveExistingSections(
       existingBody,
-      correctedBody,
+      guardedGeneratedBody,
       Object.values(labels),
       labels.mentions_in_source,
     );
@@ -242,7 +264,7 @@ export async function mergePage(
     // between the layers — the model is asked for the whole body and the reply
     // routinely starts at the first `##`. Restore the page's own H1.
     const titledBody = reassertH1(existingBody, guardedBody);
-    await ctx.createOrUpdateFile(
+    await (ctx.createOrUpdateFileUnlocked ?? ctx.createOrUpdateFile)(
       path,
       await assembleFinalContent(
         ctx,
@@ -259,6 +281,7 @@ export async function mergePage(
         info,
         sourceFile,
         existingBody,
+        sourceContent,
       ),
     );
     return path;
@@ -279,6 +302,7 @@ export async function appendToReviewedPage(
   existingContent: string,
   path: string,
   sourceSlug?: string,
+  sourceContent?: AuthoritativeSourceSnapshot | string,
 ): Promise<string | null> {
   const client = ctx.getClient();
   if (!client) throw new Error('LLM client not initialized');
@@ -314,7 +338,21 @@ export async function appendToReviewedPage(
 
     const cleanedContent = cleanMarkdownResponse(newContent);
 
-    if (cleanedContent.trim() === 'NO_NEW_CONTENT') {
+    const existingPages = await getExistingWikiPages(ctx.app as never, ctx.settings.wikiFolder);
+    const guardedContent = guardGeneratedWikiLinks(cleanedContent, {
+      wikiFolder: ctx.settings.wikiFolder,
+      pages: existingPages,
+      additionalPages: [
+        { path, title: info.name, aliases: info.aliases },
+        { path: sourceFile.path, title: sourceFile.basename },
+        ...(sourceSlug ? [{
+          path: `${ctx.settings.wikiFolder}/sources/${sourceSlug}.md`,
+          title: sourceSlug,
+        }] : []),
+      ],
+    });
+
+    if (guardedContent.trim() === 'NO_NEW_CONTENT') {
       console.debug('Reviewed page has no new content, preserving existing:', path);
       return path;
     }
@@ -329,9 +367,14 @@ export async function appendToReviewedPage(
       : (info.mentions_with_provenance?.length
         ? info.mentions_with_provenance
         : info.mentions_in_source);
+    const groundedMentions = sourceContent === undefined
+      ? appendMentionsForInject
+      : typeof sourceContent === 'string'
+        ? filterLegacyGroundedMentions(appendMentionsForInject, sourceContent, sourceFile.path)
+        : filterGroundedMentions(appendMentionsForInject, sourceContent, sourceFile.path);
     const cleanedContentWithMentions = injectMentionsSection(
-      cleanedContent,
-      appendMentionsForInject,
+      guardedContent,
+      groundedMentions ?? [],
       sourceFile.path,
       {
         sectionLabel: labels.mentions_in_source,
@@ -344,7 +387,7 @@ export async function appendToReviewedPage(
       },
     );
     const finalContent = `${frontmatter}\n\n${cleanedContentWithMentions}`;
-    await ctx.createOrUpdateFile(path, finalContent);
+    await (ctx.createOrUpdateFileUnlocked ?? ctx.createOrUpdateFile)(path, finalContent);
     return path;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);

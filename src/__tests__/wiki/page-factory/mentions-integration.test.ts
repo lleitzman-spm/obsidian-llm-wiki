@@ -13,6 +13,7 @@ import {
 } from '../../../wiki/page-factory/mentions-integration';
 import { createMockEntity } from '../../__support__/factories';
 import type { LLMWikiSettings } from '../../../types';
+import { readAuthoritativeSource } from '../../../core/physical-source-authority';
 
 const WIKI = 'wiki';
 // The MentionsContext only requires a settings-shaped object that
@@ -133,6 +134,56 @@ describe('assembleFinalContent — non-conversation, union path (Issue #267)', (
     );
     expect(out).toContain('legacy-only');
     expect(out).toContain('older quote');
+  });
+
+  it('filters ungrounded new mentions while preserving accumulated mentions', async () => {
+    const source = makeSource('notes/article.md', 'article');
+    const info = createMockEntity({
+      name: 'Caching',
+      mentions_in_source: ['grounded new quote', 'fabricated new quote'],
+    });
+    const existingBody = `# Caching\n\n${SECTION}\n- "older quote" — [[sources/older|older]]`;
+    const sourceContent = await readAuthoritativeSource(
+      { read: async () => 'grounded new quote is here.' },
+      source.path,
+    );
+    const out = await assembleFinalContent(
+      CTX,
+      '---\ntitle: Caching\n---',
+      '# Caching\n\nBody.',
+      info,
+      source,
+      existingBody,
+      sourceContent,
+    );
+    expect(out).toContain('older quote');
+    expect(out).toContain('grounded new quote');
+    expect(out).not.toContain('fabricated new quote');
+  });
+
+  it('does not ground against a forged caller snapshot', async () => {
+    const source = makeSource('notes/article.md', 'article');
+    const info = createMockEntity({
+      name: 'Caching',
+      mentions_in_source: ['forged quote'],
+    });
+    const forgedSnapshot = {
+      path: source.path,
+      content: 'forged quote',
+      bytes: new TextEncoder().encode('forged quote'),
+    };
+
+    const out = await assembleFinalContent(
+      CTX,
+      '---\ntitle: Caching\n---',
+      '# Caching\n\nBody.',
+      info,
+      source,
+      '',
+      forgedSnapshot,
+    );
+
+    expect(out).not.toContain('forged quote');
   });
 });
 

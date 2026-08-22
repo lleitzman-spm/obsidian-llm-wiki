@@ -10,9 +10,77 @@ import { TOKENS_SCHEMA_SUGGESTION } from '../constants';
 import { renderTemplate } from '../core/template-renderer';
 import { SchemaSuggestionLLMSchema } from '../llm-sdk/output-schemas';
 import { callLlm } from '../core/llm-dispatch';
+import { normalizeVaultPath, PathWriteQueue, type PathWriteLease } from '../wiki/engine-internals/path-write-queue';
 
 const SCHEMA_FILENAME = 'schema/config.md';
 const SUGGESTIONS_FILENAME = 'schema/suggestions.md';
+
+/**
+ * Schema writes are also initiated by the command/modal layer, which does not
+ * have an EngineContext. Keep one queue per vault App so those callers share
+ * the same canonical path lease instead of racing each other.
+ */
+const schemaWriteQueues = new WeakMap<object, PathWriteQueue>();
+
+function vaultPaths(app: App): string[] {
+  const vault = app.vault as unknown as {
+    getFiles?: () => TFile[];
+    getMarkdownFiles?: () => TFile[];
+  };
+  const files = vault.getFiles?.() ?? vault.getMarkdownFiles?.() ?? [];
+  return files.map(file => file.path);
+}
+
+/** Reject paths that are not safe vault-relative Windows-compatible paths. */
+export function assertSafeVaultPath(path: string): string {
+  const normalized = normalizeVaultPath(path);
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:($|\/)/.test(normalized) || normalized.startsWith('//')) {
+    throw new Error(`Unsafe vault path refused: ${path}`);
+  }
+
+  const segments = normalized.split('/');
+  for (const segment of segments) {
+    // eslint-disable-next-line no-control-regex -- reject Windows control characters in vault paths
+    if (!segment || segment === '.' || segment === '..' || /[\u0000-\u001f\u007f<>:"|?*]/.test(segment)) {
+      throw new Error(`Unsafe vault path refused: ${path}`);
+    }
+    if (/[ .]$/.test(segment)) {
+      throw new Error(`Unsafe vault path refused: ${path}`);
+    }
+    const stem = segment.split('.')[0]?.toUpperCase() ?? '';
+    if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem)) {
+      throw new Error(`Unsafe vault path refused: ${path}`);
+    }
+  }
+  return normalized;
+}
+
+export function getSchemaPathWriteQueue(app: App): PathWriteQueue {
+  const key = app as unknown as object;
+  let queue = schemaWriteQueues.get(key);
+  if (!queue) {
+    queue = new PathWriteQueue({ existingPaths: vaultPaths(app) });
+    schemaWriteQueues.set(key, queue);
+  }
+  return queue;
+}
+
+export async function verifyVaultFile(
+  app: App,
+  path: string,
+  expectedContent: string,
+  operation: string,
+  held: PathWriteLease,
+): Promise<void> {
+  const file = app.vault.getAbstractFileByPath(path);
+  if (!(file instanceof TFile) || file.path !== path) {
+    throw new Error(`${operation} did not preserve vault file identity: ${path}`);
+  }
+  const written = await held.runRaw(path, () => app.vault.read(file));
+  if (written !== expectedContent) {
+    throw new Error(`${operation} did not preserve written content: ${path}`);
+  }
+}
 
 export type SchemaTask = 'analyze' | 'summary' | 'entity' | 'concept' | 'related' | 'conversation' | 'index' | 'lint' | 'merge' | 'full';
 
@@ -255,11 +323,11 @@ export class SchemaManager {
   }
 
   private getSchemaPath(): string {
-    return `${this.settings.wikiFolder}/${SCHEMA_FILENAME}`;
+    return assertSafeVaultPath(`${this.settings.wikiFolder}/${SCHEMA_FILENAME}`);
   }
 
   private getSuggestionsPath(): string {
-    return `${this.settings.wikiFolder}/${SUGGESTIONS_FILENAME}`;
+    return assertSafeVaultPath(`${this.settings.wikiFolder}/${SUGGESTIONS_FILENAME}`);
   }
 
   invalidateCache(): void {
@@ -330,12 +398,15 @@ ${selectedBody}
     }
 
     const path = this.getSchemaPath();
-    const file = this.app.vault.getAbstractFileByPath(path);
+    const queue = getSchemaPathWriteQueue(this.app);
+    const canonicalPath = queue.canonicalPath(path);
+    return queue.run(canonicalPath, async held => {
+      const file = this.app.vault.getAbstractFileByPath(canonicalPath);
 
-    if (!(file instanceof TFile)) return null;
+      if (!(file instanceof TFile)) return null;
 
-    try {
-      const content = await this.app.vault.read(file);
+      try {
+        const content = await held.runRaw(canonicalPath, () => this.app.vault.read(file));
       const parsed = this.parseConfigFile(content);
       // Issue #328 Phase 1: vault-resident schema files created under
       // v1.22.0-v1.25.1 may still carry a baked tag enum at 6 sites
@@ -349,30 +420,31 @@ ${selectedBody}
       this.cacheValid = true;
 
       return { ...parsed, body: sanitizedBody };
-    } catch {
-      console.warn('Failed to read schema file, ignoring');
-      return null;
-    }
+      } catch {
+        console.warn('Failed to read schema file, ignoring');
+        return null;
+      }
+    });
   }
 
   async ensureSchemaExists(): Promise<void> {
-
     const path = this.getSchemaPath();
-    const existing = this.app.vault.getAbstractFileByPath(path);
+    const queue = getSchemaPathWriteQueue(this.app);
+    const canonicalPath = queue.canonicalPath(path);
+    await queue.run(canonicalPath, async held => {
+      const existing = this.app.vault.getAbstractFileByPath(canonicalPath);
+      if (existing instanceof TFile) return;
 
-    if (existing instanceof TFile) return;
+      const schemaFolder = assertSafeVaultPath(`${this.settings.wikiFolder}/schema`);
+      try {
+        await held.runRaw(canonicalPath, () => this.app.vault.createFolder(schemaFolder));
+      } catch {
+        // Already exists
+      }
 
-    // Ensure schema folder exists
-    const schemaFolder = `${this.settings.wikiFolder}/schema`;
-    try {
-      await this.app.vault.createFolder(schemaFolder);
-    } catch {
-      // Already exists
-    }
-
-    const today = new Date().toISOString().slice(0, 10);
-    const body = buildDefaultSchemaBody(this.settings);
-    const content = `---
+      const today = new Date().toISOString().slice(0, 10);
+      const body = buildDefaultSchemaBody(this.settings);
+      const content = `---
 version: 1
 updated: ${today}
 auto_suggestion_count: 0
@@ -380,18 +452,23 @@ auto_suggestion_count: 0
 
 ${body}`;
 
-    await this.app.vault.create(path, content);
-    this.cachedBody = body;
-    this.cacheValid = true;
+      await held.runRaw(canonicalPath, () => this.app.vault.create(canonicalPath, content));
+      await verifyVaultFile(this.app, canonicalPath, content, 'Schema creation', held);
+      this.cachedBody = body;
+      this.cacheValid = true;
 
-    console.debug('Created default schema at:', path);
+      console.debug('Created default schema at:', canonicalPath);
+    });
   }
 
   async regenerateDefaultSchema(): Promise<void> {
     const path = this.getSchemaPath();
-    const today = new Date().toISOString().slice(0, 10);
-    const body = buildDefaultSchemaBody(this.settings);
-    const content = `---
+    const queue = getSchemaPathWriteQueue(this.app);
+    const canonicalPath = queue.canonicalPath(path);
+    await queue.run(canonicalPath, async held => {
+      const today = new Date().toISOString().slice(0, 10);
+      const body = buildDefaultSchemaBody(this.settings);
+      const content = `---
 version: 1
 updated: ${today}
 auto_suggestion_count: 0
@@ -399,26 +476,27 @@ auto_suggestion_count: 0
 
 ${body}`;
 
-    // Ensure parent folders exist (handles empty vault or custom wikiFolder)
-    const schemaFolder = `${this.settings.wikiFolder}/schema`;
-    try {
-      await this.app.vault.createFolder(schemaFolder);
-    } catch {
-      // Already exists or path invalid
-    }
+      // Ensure parent folders exist (handles empty vault or custom wikiFolder)
+      const schemaFolder = assertSafeVaultPath(`${this.settings.wikiFolder}/schema`);
+      try {
+        await held.runRaw(canonicalPath, () => this.app.vault.createFolder(schemaFolder));
+      } catch {
+        // Already exists or path invalid
+      }
 
-    const existing = this.app.vault.getAbstractFileByPath(path);
+      const existing = this.app.vault.getAbstractFileByPath(canonicalPath);
+      if (existing instanceof TFile) {
+        await held.runRaw(canonicalPath, () => this.app.vault.process(existing, () => content));
+      } else {
+        await held.runRaw(canonicalPath, () => this.app.vault.create(canonicalPath, content));
+      }
+      await verifyVaultFile(this.app, canonicalPath, content, 'Schema regeneration', held);
 
-    if (existing instanceof TFile) {
-      await this.app.vault.process(existing, () => content);
-    } else {
-      await this.app.vault.create(path, content);
-    }
+      this.cachedBody = body;
+      this.cacheValid = true;
 
-    this.cachedBody = body;
-    this.cacheValid = true;
-
-    console.debug('Regenerated default schema at:', path);
+      console.debug('Regenerated default schema at:', canonicalPath);
+    });
   }
 
   async suggestSchemaUpdate(context: string): Promise<SchemaSuggestion | null> {
@@ -519,7 +597,8 @@ ${body}`;
 
   private async appendSuggestion(suggestion: SchemaSuggestion): Promise<void> {
     const path = this.getSuggestionsPath();
-    const existing = this.app.vault.getAbstractFileByPath(path);
+    const queue = getSchemaPathWriteQueue(this.app);
+    const canonicalPath = queue.canonicalPath(path);
 
     const entry = `## Suggestion — ${suggestion.timestamp}
 
@@ -531,11 +610,21 @@ ${suggestion.suggestions}
 ---
 `;
 
-    if (existing instanceof TFile) {
-      await this.app.vault.process(existing, (current) => current + '\n' + entry);
-    } else {
-      const header = `# Schema Suggestions\n\n> Suggestions for improving your Wiki Schema. Review and decide whether to apply them to \`schema/config.md\`.\n\n---\n\n`;
-      await this.app.vault.create(path, header + entry);
-    }
+    await queue.run(canonicalPath, async held => {
+      const existing = this.app.vault.getAbstractFileByPath(canonicalPath);
+      if (existing instanceof TFile) {
+        let next = '';
+        await held.runRaw(canonicalPath, () => this.app.vault.process(existing, current => {
+          next = current + '\n' + entry;
+          return next;
+        }));
+        await verifyVaultFile(this.app, canonicalPath, next, 'Suggestion append', held);
+      } else {
+        const header = `# Schema Suggestions\n\n> Suggestions for improving your Wiki Schema. Review and decide whether to apply them to \`schema/config.md\`.\n\n---\n\n`;
+        const next = header + entry;
+        await held.runRaw(canonicalPath, () => this.app.vault.create(canonicalPath, next));
+        await verifyVaultFile(this.app, canonicalPath, next, 'Suggestion creation', held);
+      }
+    });
   }
 }

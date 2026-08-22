@@ -17,6 +17,7 @@
 
 import { App, TFile } from 'obsidian';
 import { backupFilename, rotateBackups } from '../core/backup-rotation';
+import { assertSafeVaultPath, getSchemaPathWriteQueue, verifyVaultFile } from './schema-manager';
 
 export interface ApplySchemaSuggestionParams {
   app: App;
@@ -38,55 +39,73 @@ export async function applySchemaSuggestion(
 ): Promise<ApplySchemaResult> {
   const { app, currentPath, newBody, onCacheInvalidate } = params;
   const now = params.now ?? (() => new Date());
-  const file = app.vault.getAbstractFileByPath(currentPath);
-  if (!(file instanceof TFile)) {
-    return { success: false, reason: 'source-missing' };
-  }
-
-  // 1. Read the original content (preserves frontmatter for the backup)
-  const originalContent = await app.vault.read(file);
-
-  // 2. Create the backup (rename-by-content: read+create is the only
-  //    way to copy in the Obsidian vault adapter — there's no native
-  //    rename that fires FileManager events for both sides).
+  const safeCurrentPath = assertSafeVaultPath(currentPath);
+  const queue = getSchemaPathWriteQueue(app);
+  const canonicalCurrentPath = queue.canonicalPath(safeCurrentPath);
   const iso = now().toISOString();
-  const bakPath = backupFilename(currentPath, iso);
-  await app.vault.create(bakPath, originalContent);
+  const baseBackupPath = assertSafeVaultPath(backupFilename(canonicalCurrentPath, iso));
+  // Include a bounded set of deterministic collision candidates in the same
+  // lease. This keeps two simultaneous applies from overwriting one backup
+  // when tests or a clock provide the same timestamp.
+  const backupCandidates = [baseBackupPath];
+  for (let i = 1; i <= 32; i++) backupCandidates.push(`${baseBackupPath}-${i}`);
 
-  // 3. Prune old backups to enforce MAX_BACKUPS
-  const dir = currentPath.substring(0, currentPath.lastIndexOf('/'));
-  const baseName = currentPath.split('/').pop() ?? currentPath;
+  const dir = canonicalCurrentPath.substring(0, canonicalCurrentPath.lastIndexOf('/'));
+  const baseName = canonicalCurrentPath.split('/').pop() ?? canonicalCurrentPath;
   const bakPrefix = `${dir}/${baseName}.bak.`;
-  const allBackups: string[] = [];
-  // We need to scan ALL files in the vault (including .bak files which
-  // are saved as .md so the editor opens them as Markdown). Obsidian's
-  // getMarkdownFiles() is sometimes filtered (skips files in .obsidian
-  // dir, attachments, etc.) and may not include our .bak.md siblings.
-  // getFiles() returns every file in the vault, which is what we need.
-  // Fall back to getMarkdownFiles for older Obsidian API versions.
   const vaultAny = app.vault as unknown as {
     getFiles?: () => TFile[];
     getMarkdownFiles: () => TFile[];
   };
   const filesToScan: TFile[] = vaultAny.getFiles ? vaultAny.getFiles() : vaultAny.getMarkdownFiles();
-  for (const f of filesToScan) {
-    if (f.path.startsWith(bakPrefix)) allBackups.push(f.path);
-  }
-  allBackups.sort(); // ISO timestamps sort lexically correct
-  const toDelete = rotateBackups(allBackups);
-  for (const p of toDelete) {
-    const f = app.vault.getAbstractFileByPath(p);
-    if (f instanceof TFile) await app.fileManager.trashFile(f);
-  }
+  const existingBackupPaths = filesToScan
+    .map(file => file.path)
+    .filter(path => path.startsWith(bakPrefix))
+    .map(path => assertSafeVaultPath(path));
 
-  // 4. Write the new body, preserving the existing frontmatter
-  const newContent = spliceBody(originalContent, newBody);
-  await app.vault.modify(file, newContent);
+  return queue.run(
+    [canonicalCurrentPath, ...backupCandidates, ...existingBackupPaths],
+    async held => {
+      const file = app.vault.getAbstractFileByPath(canonicalCurrentPath);
+      if (!(file instanceof TFile)) {
+        return { success: false, reason: 'source-missing' };
+      }
 
-  // 5. Notify the cache to drop
-  onCacheInvalidate?.();
+      // All reads and writes happen while the canonical source lease is held;
+      // a concurrent apply therefore backs up the latest completed edit.
+      const originalContent = await held.runRaw(canonicalCurrentPath, () => app.vault.read(file));
+      let bakPath = baseBackupPath;
+      for (const candidate of backupCandidates) {
+        if (!app.vault.getAbstractFileByPath(candidate)) {
+          bakPath = candidate;
+          break;
+        }
+      }
+      await held.runRaw(bakPath, () => app.vault.create(bakPath, originalContent));
+      await verifyVaultFile(app, bakPath, originalContent, 'Schema backup', held);
 
-  return { success: true, backupPath: bakPath };
+      const allBackups: string[] = [];
+      const currentFiles = vaultAny.getFiles ? vaultAny.getFiles() : vaultAny.getMarkdownFiles();
+      for (const candidate of currentFiles) {
+        if (candidate.path.startsWith(bakPrefix)) allBackups.push(candidate.path);
+      }
+      allBackups.sort();
+      const toDelete = rotateBackups(allBackups);
+      for (const path of toDelete) {
+        const oldBackup = app.vault.getAbstractFileByPath(path);
+        if (oldBackup instanceof TFile) {
+          await held.runRaw(path, () => app.fileManager.trashFile(oldBackup));
+        }
+      }
+
+      const newContent = spliceBody(originalContent, newBody);
+      await held.runRaw(canonicalCurrentPath, () => app.vault.modify(file, newContent));
+      await verifyVaultFile(app, canonicalCurrentPath, newContent, 'Schema apply', held);
+      onCacheInvalidate?.();
+
+      return { success: true, backupPath: bakPath };
+    },
+  );
 }
 
 /**

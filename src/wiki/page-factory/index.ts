@@ -32,6 +32,7 @@ import type {
   PageCreationResult,
 } from '../../types';
 import type { EngineContext } from '../../types';
+import type { AuthoritativeSourceSnapshot } from '../../core/physical-source-authority';
 
 import {
   createOrUpdateEntityPage,
@@ -40,7 +41,7 @@ import {
   createOrUpdatePage as _createOrUpdatePage,
   type CreatePageContext,
 } from './create-page';
-import { resolvePagePath, type PathResolutionContext } from './path-resolution';
+import { resolvePagePath, type PathResolutionContext, type ResolvedPathResult } from './path-resolution';
 import { updateRelatedPage, type RelatedPageContext } from './related-page';
 import { mergePage as _mergePage, appendToReviewedPage as _appendToReviewedPage } from './merge-page';
 import { applyComplementaryAppends as _applyComplementaryAppends } from './complementary-appends';
@@ -106,6 +107,8 @@ export class PageFactory {
     sourceFile: PageFactorySourceFile,
     extraPagePaths: string[] = [],
     sourceSlug?: string,
+    sourceContent?: AuthoritativeSourceSnapshot | string,
+    resolutionOverride?: ResolvedPathResult,
   ): Promise<PageCreationResult> {
     return createOrUpdateEntityPage(
       this.createCtx,
@@ -114,6 +117,8 @@ export class PageFactory {
       sourceFile,
       extraPagePaths,
       sourceSlug,
+      sourceContent,
+      resolutionOverride,
     );
   }
 
@@ -127,6 +132,8 @@ export class PageFactory {
     sourceFile: PageFactorySourceFile,
     extraPagePaths: string[] = [],
     sourceSlug?: string,
+    sourceContent?: AuthoritativeSourceSnapshot | string,
+    resolutionOverride?: ResolvedPathResult,
   ): Promise<PageCreationResult> {
     return createOrUpdateConceptPage(
       this.createCtx,
@@ -135,6 +142,8 @@ export class PageFactory {
       sourceFile,
       extraPagePaths,
       sourceSlug,
+      sourceContent,
+      resolutionOverride,
     );
   }
 
@@ -147,6 +156,7 @@ export class PageFactory {
     analysis: SourceAnalysis,
     sourceFile: PageFactorySourceFile,
     sourceSlug?: string,
+    sourceContent?: AuthoritativeSourceSnapshot | string,
   ): Promise<boolean> {
     return updateRelatedPage(
       this.relatedCtx,
@@ -154,6 +164,8 @@ export class PageFactory {
       analysis,
       sourceFile,
       sourceSlug,
+      false,
+      sourceContent,
     );
   }
 
@@ -227,8 +239,9 @@ export class PageFactory {
     name: string,
     pageType: 'entity' | 'concept',
     summary: string,
+    tags?: string[],
   ): ReturnType<typeof resolvePagePath> {
-    return resolvePagePath(this.pathCtx, name, pageType, summary);
+    return resolvePagePath(this.pathCtx, name, pageType, summary, tags);
   }
 
   /** @internal Used by page-factory.test.ts (private-method access). */
@@ -238,8 +251,9 @@ export class PageFactory {
     sourceFile: Parameters<typeof _createOrUpdatePage>[3],
     extraPagePaths: string[] = [],
     sourceSlug?: string,
+    sourceContent?: AuthoritativeSourceSnapshot | string,
   ): Promise<PageCreationResult> {
-    return _createOrUpdatePage(this.createCtx, info, pageType, sourceFile, extraPagePaths, sourceSlug);
+    return _createOrUpdatePage(this.createCtx, info, pageType, sourceFile, extraPagePaths, sourceSlug, undefined, sourceContent);
   }
 
   /** @internal Used by page-factory-complementary-append.test.ts (private-method access). */
@@ -249,8 +263,9 @@ export class PageFactory {
     existingContent: string,
     path: string,
     sourceSlug?: string,
+    sourceContent?: AuthoritativeSourceSnapshot | string,
   ): ReturnType<typeof _appendToReviewedPage> {
-    return _appendToReviewedPage(this.createCtx, info, sourceFile, existingContent, path, sourceSlug);
+    return _appendToReviewedPage(this.createCtx, info, sourceFile, existingContent, path, sourceSlug, sourceContent);
   }
 
   /** @internal Used by page-factory.test.ts (private-method access). */
@@ -258,6 +273,8 @@ export class PageFactory {
     pagePath: string,
     newAliases: string[],
   ): ReturnType<typeof _appendAliases> {
-    return _appendAliases(this.createCtx, pagePath, newAliases);
+    return this.ctx.withPathWriteLock(pagePath, () =>
+      _appendAliases(this.createCtx, pagePath, newAliases)
+    );
   }
 }

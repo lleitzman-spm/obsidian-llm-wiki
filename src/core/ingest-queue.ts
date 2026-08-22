@@ -39,6 +39,9 @@ export interface IngestJob {
   status: IngestJobStatus;
   /** Set when status is 'failed'. */
   error?: string;
+  /** Set when the user cancelled a running job. Keeps cancellation distinct
+   * from a worker failure for operation-history/journal consumers. */
+  cancelled?: boolean;
   /** ms-since-epoch. Set on enqueue. */
   addedAt: number;
   /** ms-since-epoch. Set when the worker calls start(). */
@@ -181,11 +184,9 @@ export class IngestQueue {
   }
 
   /**
-   * Remove a job from the queue. If the job is running, the abort
-   * controller is fired so the worker's in-flight request can be
-   * cancelled. The job does NOT enter a terminal state — the
-   * worker, when it sees the abort signal, is expected to stop
-   * cleanly without writing to the wiki.
+   * Remove a pending job from the queue. If the job is running, fire
+   * its abort controller and retain it as a visible failed/cancelled
+   * terminal row so cancellation is not mistaken for disappearance.
    *
    * No-op if the id is unknown.
    */
@@ -195,7 +196,16 @@ export class IngestQueue {
     const job = this.jobs[idx];
     if (job.status === 'running') {
       job.abortController.abort();
+      job.status = 'failed';
+      job.error = 'Cancelled by user';
+      job.cancelled = true;
+      job.finishedAt = Date.now();
+      this.notify();
+      return;
     }
+    // A cancellation is a terminal, journal-visible outcome. Repeating the
+    // UI action (or a stale worker callback) must not erase that evidence.
+    if (job.status === 'failed' && job.cancelled) return;
     this.jobs.splice(idx, 1);
     this.notify();
   }

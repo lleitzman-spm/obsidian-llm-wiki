@@ -33,6 +33,7 @@ import type { SourceRejection } from '../core/source-requirements';
 import { formatRateLimitNotice } from '../core/rate-limit';
 import { extractSourceTags } from '../core/arrays';
 import { cleanMarkdownResponse } from '../core/markdown';
+import { ensureGeneratedPageLinks, guardGeneratedWikiLinks } from '../core/generated-link-guard';
 import { SchemaManager, SchemaTask } from '../schema/schema-manager';
 import {
   buildSystemPrompt,
@@ -53,6 +54,7 @@ import { UNIVERSAL_LINK_CONSTRAINTS } from './prompts/constraints';
 import { SourceAnalyzer } from './source-analyzer';
 import { TOKENS_PAGE_GENERATION, NOTICE_ABORT, NOTICE_RATE_LIMIT, NOTICE_NORMAL, PAGES_CACHE_TTL_MS, COMPATIBLE_SOURCE_EXTENSIONS } from '../constants';
 import { PageFactory } from './page-factory';
+import type { ResolvedPathResult } from './page-factory/path-resolution';
 import { ConversationIngestor, ConversationOrchestration, formatConversation, ConversationHistory } from './conversation-ingest';
 import type { Graph } from '../core/build-graph';
 import { runBatchedWithRetry } from './engine-internals/page-batch-runner';
@@ -60,6 +62,16 @@ import { GraphCache, type GraphPageLoader } from './engine-internals/graph-cache
 import { IndexGenerator } from './engine-internals/index-generator';
 import { LogWriter } from './engine-internals/log-writer';
 import { dedupPages } from './engine-internals/dedup-pages';
+import { PathWriteQueue } from './engine-internals/path-write-queue';
+import {
+  isActiveIngestionLeaseContext,
+  withIngestionLease,
+} from '../core/ingestion-coordinator';
+import {
+  isAuthoritativeSourceSnapshot,
+  readAuthoritativeSource,
+  type AuthoritativeSourceSnapshot,
+} from '../core/physical-source-authority';
 
 /**
  * Issue #173 Symptom B: drop exact-string duplicates from a page-path list
@@ -145,6 +157,8 @@ export class WikiEngine {
   private pageFactory: PageFactory;
   private conversationIngestor: ConversationIngestor;
   private abortController: AbortController | null = null;
+  private externalIngestAbortSignal: AbortSignal | null = null;
+  private externalIngestAbortHandler: (() => void) | null = null;
   private lintAbortController: AbortController | null = null;
   wasCancelled = false;
   private onIngestionStart: ((filename?: string) => void) | null = null;
@@ -171,6 +185,7 @@ export class WikiEngine {
   private ctx: EngineContext;
   /** SubtleCrypto from `activeWindow.crypto.subtle`. Used by PDF cache. */
   private subtle: SubtleCrypto | undefined;
+  private readonly pathWriteQueue = new PathWriteQueue();
 
   constructor(
     app: App,
@@ -197,7 +212,15 @@ export class WikiEngine {
       settings: this.settings,
       getClient: () => this.getLLMClient(),
       createOrUpdateFile: (p, c) => this.createOrUpdateFile(p, c),
+      createOrUpdateFileUnlocked: (p, c) => this.createOrUpdateFileUnlocked(p, c),
+      withPathWriteLock: <T>(path: string, operation: () => Promise<T>) =>
+        this.pathWriteQueue.run(path, operation),
+      withPathWriteLocks: <T>(paths: readonly string[], operation: (held: import('./engine-internals/path-write-queue').PathWriteLease) => Promise<T>) =>
+        this.pathWriteQueue.withPaths(paths, operation),
+      withMutationBoundary: <T>(paths: readonly string[], operation: (held: import('./engine-internals/path-write-queue').PathWriteLease) => Promise<T>) =>
+        this.pathWriteQueue.withMutationBoundary(paths, operation),
       deleteFile: p => this.deleteFile(p),
+      deleteFileUnlocked: p => this.deleteFileUnlocked(p),
       tryReadFile: p => this.tryReadFile(p),
       buildSystemPrompt: task =>
         buildSystemPrompt(this.settings, t => this.schemaManager.getSchemaContext(t as SchemaTask), task),
@@ -206,7 +229,7 @@ export class WikiEngine {
         getExistingWikiPages(this.app, this.settings.wikiFolder),
       getSchemaContext: t => this.schemaManager.getSchemaContext(t as SchemaTask),
       ...(this.subtle ? { subtle: this.subtle } : {}),
-      onFileWrite: path => this.onFileWrite?.(path),
+      onFileWrite: path => this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path)),
       onProgress: msg => this.notifyProgress(msg),
       onDone: report => this.onDone?.(report),
     };
@@ -301,32 +324,24 @@ export class WikiEngine {
            path.startsWith(`${wikiFolder}/sources/`);
   }
 
-  /**
-   * Issue #170: stamp `generation_complete: true` on a wiki page after a
-   * successful write. The pre-ingest requirement that pages carry this flag
-   * is implicit — if it's missing, the page is treated as legacy (preserved).
-   * This is best-effort: if re-read fails we just leave the file as-is; the
-   * startup self-scan will catch any incomplete pages.
-   */
-  private markPageComplete(path: string): void {
-    void (async () => {
-      try {
-        const current = await this.tryReadFile(path);
-        if (!current) return;
-        const flipped = setGenerationComplete(current, true);
-        if (flipped === current) return;
-        const file = this.app.vault.getAbstractFileByPath(path);
-        if (file instanceof TFile) {
-          await this.app.vault.process(file, () => flipped);
-        }
-      } catch (e) {
-        console.warn(`[wiki-engine] markPageComplete failed for ${path}:`, e);
-      }
-    })();
+  /** Flip an already-written content page to complete and verify the result. */
+  private async markPageComplete(path: string): Promise<void> {
+    const file = this.resolveFileBySafePath(path);
+    if (!(file instanceof TFile)) throw new Error(`Cannot complete missing wiki page: ${path}`);
+    this.checkCancelled();
+    await this.app.vault.process(file, current => setGenerationComplete(current, true));
+    const verified = await this.app.vault.read(file);
+    if (parseFrontmatter(verified)?.generation_complete !== 'true') {
+      throw new Error(`Wiki page completion could not be verified: ${path}`);
+    }
   }
 
   setDoneCallback(cb: ((report: IngestReport) => void) | null): void {
     this.onDone = cb;
+  }
+
+  getDoneCallback(): ((report: IngestReport) => void) | null {
+    return this.onDone;
   }
 
   setIngestionCallbacks(onStart: ((filename?: string) => void) | null, onEnd: (() => void) | null): void {
@@ -351,6 +366,17 @@ export class WikiEngine {
 
   isIngesting(): boolean {
     return this.abortController !== null;
+  }
+
+  private finishIngestion(): void {
+    if (this.abortController === null) return;
+    if (this.externalIngestAbortSignal && this.externalIngestAbortHandler) {
+      this.externalIngestAbortSignal.removeEventListener('abort', this.externalIngestAbortHandler);
+    }
+    this.externalIngestAbortSignal = null;
+    this.externalIngestAbortHandler = null;
+    this.abortController = null;
+    this.onIngestionEnd?.();
   }
 
   startLintOperation(): AbortSignal {
@@ -696,14 +722,7 @@ export class WikiEngine {
         resolveModelForTask: (settings, task) =>
           resolveModelForTask(this.settings, task as 'ingest' | 'lint' | 'query'),
         ...(this.subtle ? { subtle: this.subtle } : {}),
-        // v1.25.0 PR3 follow-up #8 (Bug D): thread the engine's
-        // AbortSignal through to the LLM call. When the user clicks
-        // the status bar during PDF conversion, cancelIngestion()
-        // flips this signal aborted; AI SDK v6 propagates it to the
-        // underlying HTTP request and returns early. Pre-fix the
-        // signal was ignored and the LLM call ran to completion even
-        // after the user clicked cancel.
-        ...(this.abortController ? { abortSignal: this.abortController.signal } : {}),
+        abortSignal: this.abortController?.signal,
       });
     } catch (error) {
       if (error instanceof UnsupportedProviderError) {
@@ -759,7 +778,7 @@ export class WikiEngine {
     // markdown fed to the analysis pipeline.
     //
     // We deliberately write via the vault adapter directly rather than
-    // `createOrUpdateFile` because: (a) the sidecar is a plain copy of
+      // `createOrUpdateFile` because: (a) the sidecar is a plain copy of
     // LLM-converted markdown — no pollution detection needed; (b) writing
     // through createOrUpdateFile would fire onFileWrite + invalidatePageCaches,
     // which could trigger auto-ingest cascades if the source folder is watched.
@@ -767,26 +786,77 @@ export class WikiEngine {
       const dir = file.parent?.path ?? '';
       const rawPath = dir ? `${dir}/${file.basename}.pdf.md` : `${file.basename}.pdf.md`;
       const sidecarPath = normalizePath(rawPath);
-      const existing = this.app.vault.getAbstractFileByPath(sidecarPath);
       // v1.25.11 PATCH #169: sidecar-write stage mirror. Fires only when
       // the user has opted in via writePdfMarkdownToVault. ADD-only
       // emission — the vault write itself is unchanged.
       setPdfStage('pdfStageSidecar');
-      if (existing instanceof TFile) {
-        await this.app.vault.modify(existing, conversionResult.markdown);
-      } else {
-        await this.app.vault.create(sidecarPath, conversionResult.markdown);
-      }
+      this.refreshPathWriteAlias(sidecarPath);
+      await this.pathWriteQueue.run(sidecarPath, async () => {
+        this.checkCancelled();
+        const existing = this.app.vault.getAbstractFileByPath(sidecarPath);
+        if (existing instanceof TFile) {
+          await this.app.vault.modify(existing, conversionResult.markdown);
+        } else {
+          await this.app.vault.create(sidecarPath, conversionResult.markdown);
+        }
+        this.pathWriteQueue.registerExistingPath(sidecarPath);
+        // Route the generated sidecar through the same watcher suppression
+        // callback as canonical engine writes; otherwise a watched source
+        // folder can immediately auto-ingest its own PDF artifact.
+        this.onFileWrite?.(this.pathWriteQueue.canonicalPath(sidecarPath));
+      });
     }
 
     // Re-enter the standard ingest path with the converted markdown as a
     // virtual source body. The pipeline (analyzeSource → summary → entities
     // → concepts → related → index) runs unchanged — contentOverride flows
     // through IngestOptions into analyzeSource/createSummaryPage.
-    return this.ingestSource(file, { ...opts, contentOverride: conversionResult.markdown });
+    // The converted markdown is the source body for the second pipeline pass;
+    // never carry a preflight snapshot of the binary PDF into that pass.
+    const convertedSnapshot = await readAuthoritativeSource(
+      { read: async () => conversionResult.markdown },
+      file.path,
+    );
+    return this.ingestSourceInternal(file, {
+      ...opts,
+      contentOverride: conversionResult.markdown,
+      sourceSnapshot: convertedSnapshot,
+    });
+  }
+
+  /** Keep path leases keyed to the vault's current physical spellings. */
+  private refreshPathWriteAlias(path: string): void {
+    const direct = this.app.vault.getAbstractFileByPath(path);
+    if (direct instanceof TFile) {
+      this.pathWriteQueue.registerExistingPath(direct.path);
+      return;
+    }
+    const separator = path.lastIndexOf('/');
+    if (separator < 0) return;
+    const parent = this.app.vault.getAbstractFileByPath(path.slice(0, separator));
+    if (!(parent instanceof TFolder)) return;
+    const normalized = path.normalize('NFC').toLowerCase();
+    const child = parent.children.find(candidate =>
+      candidate instanceof TFile && candidate.path.normalize('NFC').toLowerCase() === normalized,
+    );
+    if (child instanceof TFile) this.pathWriteQueue.registerExistingPath(child.path);
   }
 
   async ingestSource(file: TFile, opts?: IngestOptions) {
+    if (opts?.ingestionContext) {
+      if (!isActiveIngestionLeaseContext(this, opts.ingestionContext)) {
+        throw new Error('Ingestion lease context is stale, forged, or not active for this engine');
+      }
+      return this.ingestSourceInternal(file, opts);
+    }
+    return withIngestionLease(
+      this,
+      (_signal, _context) => this.ingestSourceInternal(file, opts),
+      opts?.abortSignal,
+    );
+  }
+
+  private async ingestSourceInternal(file: TFile, opts?: IngestOptions) {
     console.debug('=== Ingestion started ===');
     console.debug('Source file:', file.path);
     if (opts?.contentOverride !== undefined) {
@@ -819,7 +889,20 @@ export class WikiEngine {
     if (this.abortController === null) {
       this.wasCancelled = false;
       this.abortController = new AbortController();
+      if (opts?.abortSignal) {
+        this.externalIngestAbortSignal = opts.abortSignal;
+        this.externalIngestAbortHandler = () => this.abortController?.abort();
+        opts.abortSignal.addEventListener('abort', this.externalIngestAbortHandler, { once: true });
+        if (opts.abortSignal.aborted) this.abortController.abort();
+      }
       this.onIngestionStart?.(file.basename);
+    }
+
+    try {
+      this.checkCancelled();
+    } catch (error) {
+      this.finishIngestion();
+      throw error;
     }
 
     // v1.25.0 PR2 redo: PDF ingest path converts the PDF binary to markdown
@@ -838,16 +921,35 @@ export class WikiEngine {
     // #164 pre-ingest requirements gate — runs BEFORE any cancellation/UI setup so
     // a rejected file returns cleanly with nothing to tear down. Empty/type are
     // hard skips; a duplicate auto-skips, except interactive ingest prompts first.
-    const fileContent = opts?.contentOverride ?? await this.app.vault.read(file);
-    const rejection = opts?.forceReingest ? null : await this.checkRequirements(file, fileContent, opts?.batchCtx);
-    if (rejection) {
-      const confirmed = rejection.reason === 'duplicate' && opts?.interactive && this.onConfirmReingest
-        ? await this.onConfirmReingest(file, rejection)
-        : false;
-      if (!confirmed) {
-        this.reportSkip(file, rejection, opts);
-        return;
+    let fileContent: string;
+    let sourceSnapshot: AuthoritativeSourceSnapshot;
+    try {
+      if (opts?.sourceSnapshot !== undefined) {
+        if (!isAuthoritativeSourceSnapshot(opts.sourceSnapshot) || opts.sourceSnapshot.path !== normalizePath(file.path)) {
+          throw new Error(`Refusing source snapshot for a different or untrusted path: ${file.path}`);
+        }
+        sourceSnapshot = opts.sourceSnapshot;
+      } else {
+        sourceSnapshot = await readAuthoritativeSource(
+          { read: async () => opts?.contentOverride ?? await this.app.vault.read(file) },
+          file.path,
+        );
       }
+      fileContent = sourceSnapshot.content;
+      const rejection = opts?.forceReingest ? null : await this.checkRequirements(file, fileContent, opts?.batchCtx);
+      if (rejection) {
+        const confirmed = rejection.reason === 'duplicate' && opts?.interactive && this.onConfirmReingest
+          ? await this.onConfirmReingest(file, rejection)
+          : false;
+        if (!confirmed) {
+          this.reportSkip(file, rejection, opts);
+          this.finishIngestion();
+          return;
+        }
+      }
+    } catch (error) {
+      this.finishIngestion();
+      throw error;
     }
 
     const totalStartTime = Date.now();
@@ -889,8 +991,12 @@ export class WikiEngine {
 
       // Stage 1: Source Analysis (contentOverride flows via opts)
       const analysisStart = Date.now();
+      // The requirements gate and the analyzer must consume the same
+      // authoritative source snapshot. Passing it unconditionally prevents
+      // a vault read after the gate from observing a different file version.
       analysis = await this.sourceAnalyzer.analyzeSource(file, {
-        ...(opts?.contentOverride !== undefined ? { contentOverride: opts.contentOverride } : {}),
+        contentOverride: fileContent,
+        sourceSnapshot,
       });
       if (!analysis) {
         // When the user opted into a custom repetitionPenalty, append the
@@ -914,14 +1020,57 @@ export class WikiEngine {
       const totalSteps = 1 + analysis.entities.length + analysis.concepts.length + analysis.related_pages.length + 2;
       let step = 1;
 
-      const plannedPaths: string[] = [];
       const preserveCase = this.settings.slugCase === 'preserve';
-      for (const entity of analysis.entities) {
-        plannedPaths.push(normalizePath(`${this.settings.wikiFolder}/entities/${slugify(entity.name, preserveCase)}.md`));
-      }
-      for (const concept of analysis.concepts) {
-        plannedPaths.push(normalizePath(`${this.settings.wikiFolder}/concepts/${slugify(concept.name, preserveCase)}.md`));
-      }
+      const concurrency = this.settings.pageGenerationConcurrency ?? 1;
+      const batchDelay = this.settings.batchDelayMs ?? 300;
+      const pageGenTasks = [
+        ...analysis.entities.map((e, i) => ({
+          id: `entity:${e.name}`,
+          payload: { type: 'entity' as const, name: e.name, index: i },
+        })),
+        ...analysis.concepts.map((c, i) => ({
+          id: `concept:${c.name}`,
+          payload: { type: 'concept' as const, name: c.name, index: i },
+        })),
+      ];
+
+      // Resolve every destination before any generated content may link to it.
+      // The old ordering guessed slug paths for the summary and sibling-page
+      // prompts, then let semantic dedup choose different actual paths during
+      // generation. Those guesses became dead links immediately. Preflight
+      // uses the same resolver generation already paid for, records its exact
+      // decisions, and passes them back into the write phase so resolution is
+      // not repeated or allowed to drift between phases.
+      const resolvedPaths = new Map<string, ResolvedPathResult>();
+      await runBatchedWithRetry<typeof pageGenTasks[number]['payload']>({
+        tasks: pageGenTasks,
+        concurrency,
+        batchDelayMs: batchDelay,
+        checkCancelled: () => this.checkCancelled(),
+        apiDelay: (ms: number) => this.apiDelay(ms),
+        execute: async (task) => {
+          const info = task.type === 'entity'
+            ? analysis!.entities[task.index]
+            : analysis!.concepts[task.index];
+          try {
+            const resolved = await this.pageFactory.resolvePagePath(
+              info.name,
+              task.type,
+              info.summary,
+              info.type ? [info.type] : undefined,
+            );
+            if (resolved.path) resolvedPaths.set(`${task.type}:${task.index}`, resolved);
+            return { success: true as const };
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            console.error(`Path preflight for ${task.type} "${info.name}" failed:`, reason);
+            return { success: false as const, failureReason: reason };
+          }
+        },
+      });
+      const plannedPaths = [...resolvedPaths.values()]
+        .map(resolution => resolution.path)
+        .filter((path): path is string => path !== null);
 
       this.onProgress?.(
         getText(this.settings.language, 'ingestCreatingSummary')
@@ -937,10 +1086,11 @@ export class WikiEngine {
 
       // Stage 2: Summary Page Generation (contentOverride flows through opts)
       const summaryStart = Date.now();
-      const summaryPage = await this.createSummaryPage(file, analysis, plannedPaths, sourceSlug, opts?.contentOverride);
+      const summaryPage = await this.createSummaryPage(file, analysis, plannedPaths, sourceSlug, fileContent);
       const summaryTime = Date.now() - summaryStart;
       console.debug(`[Time] Summary page generation: ${summaryTime}ms`);
       analysis.created_pages.push(summaryPage);
+      const successfulPagePaths = new Set<string>();
 
       // Stage 3: Entity/Concept Page Generation
       // v1.25.1 Phase C-PR1: retry + rate-limit template extracted to
@@ -949,25 +1099,11 @@ export class WikiEngine {
       const pageGenStart = Date.now();
       let pageGenCount = 0;
 
-      const concurrency = this.settings.pageGenerationConcurrency ?? 1;
-      const batchDelay = this.settings.batchDelayMs ?? 300;
-
       if (concurrency > 1) {
         console.debug(`[Parallel] concurrency: ${concurrency}, batch delay: ${batchDelay}ms, total tasks: ${analysis.entities.length + analysis.concepts.length}`);
       } else {
         console.debug(`[Serial] generating pages sequentially, total tasks: ${analysis.entities.length + analysis.concepts.length}`);
       }
-
-      const pageGenTasks = [
-        ...analysis.entities.map((e, i) => ({
-          id: `entity:${e.name}`,
-          payload: { type: 'entity' as const, name: e.name, index: i },
-        })),
-        ...analysis.concepts.map((c, i) => ({
-          id: `concept:${c.name}`,
-          payload: { type: 'concept' as const, name: c.name, index: i },
-        })),
-      ];
 
       const pageGenResult = await runBatchedWithRetry<typeof pageGenTasks[number]['payload']>({
         tasks: pageGenTasks,
@@ -994,11 +1130,32 @@ export class WikiEngine {
         execute: async (task) => {
           if (task.type === 'entity') {
             const entity = analysis!.entities[task.index];
+            const resolution = resolvedPaths.get(`entity:${task.index}`);
+            if (!resolution?.path) {
+              return {
+                success: false as const,
+                failureReason: 'Path preflight did not resolve a writable page path',
+              };
+            }
             try {
-              const entityResult = await this.pageFactory.createOrUpdateEntityPage(entity, analysis!, file, [], sourceSlug);
+              const entityResult = await this.pageFactory.createOrUpdateEntityPage(
+                entity,
+                analysis!,
+                file,
+                plannedPaths,
+                sourceSlug,
+                sourceSnapshot,
+                resolution,
+              );
               if (entityResult.path) {
+                successfulPagePaths.add(entityResult.path);
                 (entityResult.created ? analysis!.created_pages : analysis!.updated_pages)
                   .push(entityResult.path);
+              } else {
+                return {
+                  success: false as const,
+                  failureReason: 'Page writer returned no path',
+                };
               }
               return { success: true as const };
             } catch (error) {
@@ -1008,11 +1165,32 @@ export class WikiEngine {
             }
           }
           const concept = analysis!.concepts[task.index];
+          const resolution = resolvedPaths.get(`concept:${task.index}`);
+          if (!resolution?.path) {
+            return {
+              success: false as const,
+              failureReason: 'Path preflight did not resolve a writable page path',
+            };
+          }
           try {
-            const conceptResult = await this.pageFactory.createOrUpdateConceptPage(concept, analysis!, file, [], sourceSlug);
+            const conceptResult = await this.pageFactory.createOrUpdateConceptPage(
+              concept,
+              analysis!,
+              file,
+              plannedPaths,
+              sourceSlug,
+                sourceSnapshot,
+              resolution,
+            );
             if (conceptResult.path) {
+              successfulPagePaths.add(conceptResult.path);
               (conceptResult.created ? analysis!.created_pages : analysis!.updated_pages)
                 .push(conceptResult.path);
+            } else {
+              return {
+                success: false as const,
+                failureReason: 'Page writer returned no path',
+              };
             }
             return { success: true as const };
           } catch (error) {
@@ -1056,6 +1234,7 @@ export class WikiEngine {
         id: `related:${name}`,
         payload: { name, index: idx, stepNum: step + idx + 1 },
       }));
+      const successfulRelatedPageNames = new Set<string>();
 
       const relatedResult = await runBatchedWithRetry<typeof relatedTasks[number]['payload']>({
         tasks: relatedTasks,
@@ -1076,9 +1255,10 @@ export class WikiEngine {
         },
         execute: async (task) => {
           try {
-            const updated = await this.pageFactory.updateRelatedPage(task.name, analysis!, file, sourceSlug);
+            const updated = await this.pageFactory.updateRelatedPage(task.name, analysis!, file, sourceSlug, sourceSnapshot);
             if (updated) {
               analysis!.updated_pages.push(task.name);
+              successfulRelatedPageNames.add(task.name);
             }
             return { success: true as const };
           } catch (error) {
@@ -1110,6 +1290,25 @@ export class WikiEngine {
           NOTICE_RATE_LIMIT
         );
       }
+
+      // Reconcile only pages touched by this run. Entity/concept paths are
+      // already authoritative write results; related-page tasks report names,
+      // so resolve only the names that actually completed to their current
+      // vault paths before the single existing-page index read in the helper.
+      const relatedPages = await getExistingWikiPages(this.app, this.settings.wikiFolder);
+      const successfulRelatedPaths = relatedPages
+        .filter(page => successfulRelatedPageNames.has(page.title))
+        .map(page => page.path);
+      const touchedPaths = dedupPages([
+        summaryPage,
+        ...successfulPagePaths,
+        ...successfulRelatedPaths,
+      ]);
+      await this.finalizeGeneratedPageLinks(
+        summaryPage,
+        [...successfulPagePaths],
+        touchedPaths,
+      );
 
       // Stage 5: Contradiction Recording
       const contradictionStart = Date.now();
@@ -1181,7 +1380,14 @@ export class WikiEngine {
         conceptsCreated,
         failedItems,
         contradictionsFound: analysis.contradictions.length,
-        success: true,
+        // A completed orchestration is not necessarily a successful ingest:
+        // the batch runner deliberately keeps going after an item exhausts
+        // its retry. Do not let the completion callback turn that partial
+        // result into a green report.
+        success: failedItems.length === 0,
+        ...(failedItems.length > 0
+          ? { errorMessage: `Ingestion completed with ${failedItems.length} failed item(s)` }
+          : {}),
         elapsedSeconds: Math.round(totalTime / 1000),
         // v1.22.6 #204: Propagate trigger so completion can route UI.
         trigger: opts?.trigger,
@@ -1232,8 +1438,7 @@ export class WikiEngine {
       });
       throw error;
     } finally {
-      this.abortController = null;
-      this.onIngestionEnd?.();
+      this.finishIngestion();
     }
   }
 
@@ -1251,13 +1456,16 @@ export class WikiEngine {
 
     for (const folder of folders) {
       try {
+        this.checkCancelled();
         await this.app.vault.createFolder(folder);
         console.debug('Creating folder:', folder);
-      } catch {
-        // Folder already exists
+      } catch (error) {
+        if (!this.app.vault.getAbstractFileByPath(folder)) throw error;
+        // Folder already exists.
       }
     }
 
+    this.checkCancelled();
     await this.schemaManager.ensureSchemaExists();
   }
 
@@ -1325,9 +1533,23 @@ export class WikiEngine {
     });
 
     const cleanedContent = cleanMarkdownResponse(pageContent);
+    const existingPages = await getExistingWikiPages(this.app, this.settings.wikiFolder);
+    const generatedPages = [
+      { path, title: analysis.source_title, aliases: analysis.source_note_aliases },
+      { path: file.path, title: file.basename },
+      ...plannedPaths.map(plannedPath => ({
+        path: plannedPath,
+        title: plannedPath.replace(/\.md$/i, '').split('/').pop() ?? plannedPath,
+      })),
+    ];
+    const guardedContent = guardGeneratedWikiLinks(cleanedContent, {
+      wikiFolder: this.settings.wikiFolder,
+      pages: existingPages,
+      additionalPages: generatedPages,
+    });
     // #164: stamp a content fingerprint so future ingests can detect duplicates.
     // Injected programmatically — the LLM can't be trusted to emit it.
-    let finalContent = upsertFrontmatterField(cleanedContent, 'contentHash', hashBody(extractBody(content)));
+    let finalContent = upsertFrontmatterField(guardedContent, 'contentHash', hashBody(extractBody(content)));
 
     // Issue #185: append the source note's curated frontmatter `aliases:`
     // to the generated `sources/<slug>` page. Merged inline (BEFORE the
@@ -1355,7 +1577,77 @@ export class WikiEngine {
     return path;
   }
 
+  /**
+   * Reconcile the source summary after entity/concept writes finish.
+   * Preflight paths remain available to the generation prompts, but only
+   * paths returned by successful page writes may become provenance edges.
+   */
+  private async finalizeGeneratedPageLinks(
+    summaryPath: string,
+    actualPagePaths: string[],
+    touchedPaths: string[] = [summaryPath],
+  ): Promise<void> {
+    const existingPages = await getExistingWikiPages(this.app, this.settings.wikiFolder);
+    // Mentions sections can cite raw source notes outside the generated wiki
+    // folder. Final reconciliation must preserve those exact, existing vault
+    // paths while still stripping invented targets. Otherwise a grounded quote
+    // survives but loses the provenance edge that makes it auditable.
+    const externalVaultFiles = this.app.vault.getMarkdownFiles()
+      .filter(file => !file.path.startsWith(`${this.settings.wikiFolder}/`))
+      .map(file => ({ path: file.path, title: file.basename }));
+    const actualPageRefs = actualPagePaths.map(pagePath => ({
+      path: pagePath,
+      title: pagePath.replace(/\.md$/i, '').split('/').pop() ?? pagePath,
+    }));
+    const uniqueTouchedPaths = dedupPages([summaryPath, ...touchedPaths]);
+
+    await this.pathWriteQueue.withPaths(uniqueTouchedPaths, async held => {
+      for (const touchedPath of uniqueTouchedPaths) {
+        const content = await this.tryReadFile(touchedPath);
+        if (content === null) continue;
+
+        const guardedContent = guardGeneratedWikiLinks(content, {
+          wikiFolder: this.settings.wikiFolder,
+          pages: [...existingPages, ...externalVaultFiles],
+          additionalPages: actualPageRefs,
+        });
+        const reconciledContent = touchedPath === summaryPath
+          ? ensureGeneratedPageLinks(guardedContent, actualPagePaths, this.settings.wikiFolder)
+          : guardedContent;
+        if (reconciledContent !== content) {
+          await held.runRaw(touchedPath, () => this.createOrUpdateFileUnlocked(touchedPath, reconciledContent));
+        }
+      }
+    });
+  }
+
   async createOrUpdateFile(path: string, content: string): Promise<void> {
+    this.checkCancelled();
+    this.refreshPathWriteAlias(path);
+    return this.pathWriteQueue.withPaths(path, held =>
+      held.runRaw(path, () => this.createOrUpdateFileUnlocked(path, content))
+    );
+  }
+
+  /**
+   * Expose the engine's canonical per-path lease to side-effect managers
+   * (welcome/auto-maintain) without exposing the raw queue or unlock helper.
+   */
+  async withPathWriteLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
+    this.refreshPathWriteAlias(path);
+    return this.pathWriteQueue.run(path, operation);
+  }
+
+  /** Write implementation for callers that already hold the canonical path lease. */
+  private async createOrUpdateFileUnlocked(path: string, content: string): Promise<void> {
+    this.checkCancelled();
+    // The first physical write must carry the incomplete marker.  A crash or
+    // cancellation between the write and the verified completion flip then
+    // leaves an auditable page for startup cleanup instead of a false-green
+    // page with partially generated content.
+    if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
+      content = setGenerationComplete(content, false);
+    }
     console.debug('createOrUpdateFile:', path);
 
     // Central pollution detection: strip folder-prefix duplication from wiki-links
@@ -1415,12 +1707,14 @@ export class WikiEngine {
         const file = this.app.vault.getAbstractFileByPath(path);
         if (file instanceof TFile) {
           console.debug(`Attempt ${attempt + 1}: File exists, updating:`, path);
+          this.checkCancelled();
           await this.app.vault.process(file, () => content);
           console.debug('Update success:', path);
           if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
-            this.markPageComplete(path);
+            await this.markPageComplete(path);
           }
-          this.onFileWrite?.(path);
+          this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
+          this.pathWriteQueue.registerExistingPath(file.path);
           this.invalidatePageCaches();
           return;
         }
@@ -1433,12 +1727,14 @@ export class WikiEngine {
           const resolved = this.resolveFileInVault(path);
           if (resolved instanceof TFile) {
             console.debug('createOrUpdateFile: resolved via directory scan:', path);
+            this.checkCancelled();
             await this.app.vault.process(resolved, () => content);
             console.debug('Update success (resolved path):', path);
             if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
-              this.markPageComplete(path);
+              await this.markPageComplete(path);
             }
-            this.onFileWrite?.(path);
+            this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
+            this.pathWriteQueue.registerExistingPath(resolved.path);
             this.invalidatePageCaches();
             return;
           }
@@ -1446,12 +1742,14 @@ export class WikiEngine {
 
         // File genuinely does not appear to exist — attempt to create it.
         console.debug(`Attempt ${attempt + 1}: File not found, creating:`, path);
+        this.checkCancelled();
         await this.app.vault.create(path, content);
         console.debug('Create success:', path);
         if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
-          this.markPageComplete(path);
+          await this.markPageComplete(path);
         }
-        this.onFileWrite?.(path);
+        this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
+        this.pathWriteQueue.registerExistingPath(path);
         this.invalidatePageCaches();
         return;
       } catch (error) {
@@ -1470,9 +1768,12 @@ export class WikiEngine {
             if (resolved) console.debug('Retry found file via full scan:', path);
           }
           if (resolved instanceof TFile) {
+            this.checkCancelled();
             await this.app.vault.process(resolved, () => content);
             console.debug('Update succeeded after file resolution:', path);
-            this.onFileWrite?.(path);
+            await this.markPageComplete(path);
+            this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
+            this.pathWriteQueue.registerExistingPath(resolved.path);
             this.invalidatePageCaches();
             return;
           }
@@ -1497,9 +1798,12 @@ export class WikiEngine {
       if (file) console.debug('createOrUpdateFile: resolved via full scan:', path);
     }
     if (file) {
+      this.checkCancelled();
       await this.app.vault.process(file, () => content);
       console.debug('Final update succeeded:', path);
-      this.onFileWrite?.(path);
+      await this.markPageComplete(path);
+      this.onFileWrite?.(this.pathWriteQueue.canonicalPath(path));
+      this.pathWriteQueue.registerExistingPath(file.path);
       this.invalidatePageCaches();
     } else {
       // Issue #172: localize via getText, never hardcode CJK in source.
@@ -1510,12 +1814,53 @@ export class WikiEngine {
   }
 
   async deleteFile(path: string): Promise<void> {
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (file instanceof TFile) {
-      await this.app.fileManager.trashFile(file);
-      this.invalidatePageCaches();
-      console.debug('deleteFile:', path);
+    this.checkCancelled();
+    this.refreshPathWriteAlias(path);
+    return this.pathWriteQueue.withPaths(path, held =>
+      held.runRaw(path, () => this.deleteFileUnlocked(path))
+    );
+  }
+
+  private async deleteFileUnlocked(path: string): Promise<void> {
+    this.checkCancelled();
+    const file = this.resolveFileBySafePath(path);
+    if (!file) throw new Error(`Cannot delete missing file: ${path}`);
+    await this.app.fileManager.trashFile(file);
+    if (this.resolveFileBySafePath(path)) {
+      throw new Error(`File deletion could not be verified: ${path}`);
     }
+    this.pathWriteQueue.unregisterExistingPath(file.path);
+    this.invalidatePageCaches();
+    console.debug('deleteFile:', path);
+  }
+
+  /** Resolve one path without guessing when Unicode-normalized candidates collide. */
+  private resolveFileBySafePath(path: string): TFile | null {
+    try {
+      const direct = this.app.vault.getAbstractFileByPath(path);
+      if (direct instanceof TFile) return direct;
+    } catch {
+      // Continue through normalization-safe fallbacks.
+    }
+
+    const lastSep = path.lastIndexOf('/');
+    if (lastSep >= 0) {
+      const dir = this.app.vault.getAbstractFileByPath(path.slice(0, lastSep));
+      if (dir instanceof TFolder) {
+        const normalizedName = path.slice(lastSep + 1).normalize();
+        const matches = dir.children.filter(
+          child => child instanceof TFile && child.name.normalize() === normalizedName
+        ) as TFile[];
+        if (matches.length > 1) throw new Error(`Ambiguous normalized vault path: ${path}`);
+        if (matches.length === 1) return matches[0];
+      }
+    }
+
+    const normalizedPath = path.normalize();
+    const matches = this.app.vault.getMarkdownFiles()
+      .filter(file => file.path.normalize() === normalizedPath);
+    if (matches.length > 1) throw new Error(`Ambiguous normalized vault path: ${path}`);
+    return matches[0] ?? null;
   }
 
   /** Resolve a vault path to TFile by listing parent directory children.
@@ -1544,28 +1889,7 @@ export class WikiEngine {
     // Resolve the file using all available strategies.
     // On macOS APFS, filenames are stored in NFD while JavaScript uses NFC,
     // so getAbstractFileByPath may miss files with non-ASCII names.
-    let file: TFile | null = null;
-
-    try {
-      const direct = this.app.vault.getAbstractFileByPath(path);
-      if (direct instanceof TFile) file = direct;
-    } catch {
-      // getAbstractFileByPath can throw on malformed paths; ignore and try fallbacks
-    }
-
-    if (!file) {
-      file = this.resolveFileInVault(path);
-    }
-
-    if (!file) {
-      const normalized = path.normalize();
-      const allFiles = this.app.vault.getMarkdownFiles();
-      const matched = allFiles.find(f => f.path.normalize() === normalized);
-      if (matched) {
-        console.debug('tryReadFile: resolved via full scan:', path);
-        file = matched;
-      }
-    }
+    const file = this.resolveFileBySafePath(path);
 
     if (!file) {
       console.debug('tryReadFile: all lookups failed for:', path);
@@ -1633,7 +1957,7 @@ export class WikiEngine {
   // ---- Conversation ingestion delegation ----
 
   async ingestConversation(history: ConversationHistory): Promise<IngestReport> {
-    return this.conversationIngestor.ingestConversation(history);
+    return withIngestionLease(this, () => this.conversationIngestor.ingestConversation(history));
   }
 
   formatConversation(history: ConversationHistory): string {
@@ -1687,7 +2011,7 @@ export class WikiEngine {
   }
 
   /** Merge a duplicate source page into a target page. */
-  async mergeDuplicatePages(targetPath: string, sourcePath: string): Promise<string> {
-    return mergeDuplicatePages(this.ctx, targetPath, sourcePath);
+  async mergeDuplicatePages(targetPath: string, sourcePath: string, signal?: AbortSignal): Promise<string> {
+    return mergeDuplicatePages(this.ctx, targetPath, sourcePath, signal);
   }
 }

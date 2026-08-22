@@ -19,6 +19,7 @@
 
 import { App, TFile } from 'obsidian';
 import { parseFrontmatter } from './frontmatter';
+import { getVaultPathWriteQueue, notifyVaultWrite } from './path-write-safety';
 
 /** True iff the page's frontmatter explicitly contains `generation_complete: false`.
  *  Note: parseFrontmatter returns all unknown keys as strings (no boolean
@@ -68,10 +69,30 @@ export async function cleanIncompletePages(
   app: App,
   files: TFile[],
 ): Promise<number> {
+  const queue = getVaultPathWriteQueue(
+    app.vault,
+    app.vault.getMarkdownFiles().map(file => file.path),
+  );
   let cleaned = 0;
   for (const f of files) {
     try {
-      await app.fileManager.trashFile(f);
+      await queue.run(f.path, async held => {
+        // A scan can become stale while another writer is active.  Re-check
+        // identity under the same lease before moving anything to .trash.
+        const current = app.vault.getAbstractFileByPath(f.path) as { path?: string } | null;
+        if (!current || current.path !== f.path) {
+          throw new Error(`Incomplete page disappeared before cleanup: ${f.path}`);
+        }
+        await held.runRaw(f.path, () => app.fileManager.trashFile(f));
+        if (app.vault.getAbstractFileByPath(f.path)) {
+          throw new Error(`Incomplete page trash could not be verified: ${f.path}`);
+        }
+        notifyVaultWrite(
+          (app as unknown as { onFileWrite?: (path: string) => void }).onFileWrite,
+          queue,
+          f.path,
+        );
+      });
       cleaned++;
       console.debug(`[incomplete-page-cleaner] trashed ${f.path}`);
     } catch (e) {

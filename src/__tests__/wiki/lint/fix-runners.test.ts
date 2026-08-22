@@ -3,6 +3,7 @@ import { Notice, TFile } from 'obsidian';
 import { runAliasCompletion, runDeadLinkFixes, runEmptyPageFixes, runOrphanFixes, runDuplicateMerges, runRetagViolations } from '../../../wiki/lint/fix-runners';
 import type { LintContext } from '../../../wiki/lint/types';
 import { AliasGenerationLLMSchema, TagFixLLMSchema } from '../../../llm-sdk/output-schemas';
+import { PathWriteQueue } from '../../../wiki/engine-internals/path-write-queue';
 
 // NoticeMock in setup.ts adds a static `instances` array. Cast the imported
 // Notice to access the mock-side field for test introspection.
@@ -28,6 +29,7 @@ const makeCtx = (overrides: Partial<LintContext> = {}): LintContext => {
       fillEmptyPage: vi.fn().mockResolvedValue('expanded'),
       linkOrphanPage: vi.fn().mockResolvedValue(['wiki/OtherPage']),
       mergeDuplicatePages: vi.fn().mockResolvedValue('merged'),
+      createOrUpdateFile: vi.fn().mockResolvedValue(undefined),
     } as unknown as LintContext['wikiEngine'],
     onAnalyzeSchema: vi.fn(),
   };
@@ -167,7 +169,9 @@ describe('fix-runners — AbortSignal propagation', () => {
 // canonical `serializeFrontmatter` writer.
 
 describe('runAliasCompletion — frontmatter write correctness', () => {
-  // Capture what `vault.adapter.write` was called with.
+  // Capture what the canonical WikiEngine writer receives. The adapter write
+  // below is deliberately a sentinel: lint writers must never bypass the
+  // engine's PathWriteQueue and completion/watcher semantics.
   function makeWriteCaptureCtx(): {
     ctx: LintContext;
     writes: Array<{ path: string; data: string }>;
@@ -177,12 +181,15 @@ describe('runAliasCompletion — frontmatter write correctness', () => {
       app: {
         vault: {
           adapter: {
-            write: vi.fn().mockImplementation(async (path: string, data: string) => {
-              writes.push({ path, data });
-            }),
+            write: vi.fn().mockResolvedValue(undefined),
           },
         },
       } as unknown as LintContext['app'],
+      wikiEngine: {
+        createOrUpdateFile: vi.fn().mockImplementation(async (path: string, data: string) => {
+          writes.push({ path, data });
+        }),
+      } as unknown as LintContext['wikiEngine'],
       llmClient: {
         createMessage: vi.fn().mockResolvedValue(
           '{"aliases":["Foo","Bar"]}'
@@ -208,6 +215,7 @@ describe('runAliasCompletion — frontmatter write correctness', () => {
     expect(written).toContain('Existing');
     expect(written).toContain('Foo');
     expect(written).toContain('Bar');
+    expect((ctx.app.vault.adapter as unknown as { write: ReturnType<typeof vi.fn> }).write).not.toHaveBeenCalled();
   });
 
   it('appends aliases when page has empty `aliases: []` (placeholder)', async () => {
@@ -254,6 +262,30 @@ describe('runAliasCompletion — frontmatter write correctness', () => {
     const aliasLineCount = (written.match(/^aliases:/gm) || []).length;
     expect(aliasLineCount).toBe(1);
     expect(written).toContain('Foo');
+  });
+
+  it('refuses an unsafe alias path before the adapter can be touched', async () => {
+    const adapterWrite = vi.fn().mockResolvedValue(undefined);
+    const queue = new PathWriteQueue();
+    const canonicalWrite = vi.fn(async (path: string, data: string) => {
+      await queue.run(path, async () => adapterWrite(path, data));
+    });
+    const ctx = makeCtx({
+      app: { vault: { adapter: { write: adapterWrite } } } as unknown as LintContext['app'],
+      wikiEngine: { createOrUpdateFile: canonicalWrite } as unknown as LintContext['wikiEngine'],
+      llmClient: {
+        createMessage: vi.fn().mockResolvedValue('{"aliases":["Foo"]}'),
+      } as unknown as LintContext['llmClient'],
+    });
+
+    const result = await runAliasCompletion(ctx, undefined, [
+      { path: 'wiki/../outside.md', content: '---\ntype: entity\naliases: []\n---\n\n# Unsafe', basename: 'Unsafe' },
+    ]);
+
+    expect(result.filled).toBe(0);
+    expect(canonicalWrite).toHaveBeenCalled();
+    expect(adapterWrite).not.toHaveBeenCalled();
+    expect(result.results).toEqual([]);
   });
 
   it('logs the page basename + LLM response snippet when generation fails', async () => {
@@ -343,6 +375,9 @@ describe('runRetagViolations (Issue #85 v7)', () => {
           }),
         },
       } as unknown as LintContext['app'],
+      wikiEngine: {
+        createOrUpdateFile: vi.fn().mockResolvedValue(undefined),
+      } as unknown as LintContext['wikiEngine'],
       llmClient: { createMessage: vi.fn().mockResolvedValue(opts.llmResponse ?? '{"tags":["person","organization"]}') } as unknown as LintContext['llmClient'],
       // #328 Phase 1 follow-up: retag now uses buildSystemPrompt('lint')
       // for the system layer injection (PRX-A2). The default leaves the
@@ -373,7 +408,7 @@ describe('runRetagViolations (Issue #85 v7)', () => {
     return runRetagViolations(ctx, undefined, [baseViolation]).then(result => {
       expect(result.fixed).toBe(1);
       expect(result.results[0]).toContain('Alice.md');
-      const writeSpy = (ctx.app.vault.adapter as unknown as { write: ReturnType<typeof vi.fn> }).write;
+      const writeSpy = (ctx.wikiEngine as unknown as { createOrUpdateFile: ReturnType<typeof vi.fn> }).createOrUpdateFile;
       const writtenContent = writeSpy.mock.calls[0][1] as string;
       // v1.24.0: tags are now serialized via the canonical writer.
       // Both block (`tags:\n  - "person"`) and inline (`tags: [person]`)
@@ -383,6 +418,7 @@ describe('runRetagViolations (Issue #85 v7)', () => {
         writtenContent.includes('tags: [person, organization]')
       ).toBe(true);
       expect(writtenContent).toContain('Body of Alice.');
+      expect((ctx.app.vault.adapter as unknown as { write: ReturnType<typeof vi.fn> }).write).not.toHaveBeenCalled();
     });
   });
 
@@ -393,7 +429,7 @@ describe('runRetagViolations (Issue #85 v7)', () => {
     const ctx = makeRetagCtx({
       llmResponse: '{"tags":["person","bogus","Medical_Arzneimittel"]}',
     });
-    const writeSpy = (ctx.app.vault.adapter as unknown as { write: ReturnType<typeof vi.fn> }).write;
+    const writeSpy = (ctx.wikiEngine as unknown as { createOrUpdateFile: ReturnType<typeof vi.fn> }).createOrUpdateFile;
     const result = await runRetagViolations(ctx, undefined, [baseViolation]);
     expect(result.fixed).toBe(1);
     const writtenContent = writeSpy.mock.calls[0][1] as string;
@@ -408,7 +444,7 @@ describe('runRetagViolations (Issue #85 v7)', () => {
 
   it('does not write when LLM returns empty tags (safety)', async () => {
     const ctx = makeRetagCtx({ llmResponse: '{"tags":[]}' });
-    const writeSpy = (ctx.app.vault.adapter as unknown as { write: ReturnType<typeof vi.fn> }).write;
+    const writeSpy = (ctx.wikiEngine as unknown as { createOrUpdateFile: ReturnType<typeof vi.fn> }).createOrUpdateFile;
     const result = await runRetagViolations(ctx, undefined, [baseViolation]);
     expect(result.fixed).toBe(0);
     expect(writeSpy).not.toHaveBeenCalled();
@@ -436,7 +472,7 @@ describe('runRetagViolations (Issue #85 v7)', () => {
       fileContent: '---\ntype: source\ntitle: Smith2024\ntags: [Medical_Arzneimittel]\n---\n\nSmith 2024 body.',
       llmResponse: '{"tags":["article"]}',
     });
-    const writeSpy = (ctx.app.vault.adapter as unknown as { write: ReturnType<typeof vi.fn> }).write;
+    const writeSpy = (ctx.wikiEngine as unknown as { createOrUpdateFile: ReturnType<typeof vi.fn> }).createOrUpdateFile;
     const result = await runRetagViolations(ctx, undefined, [sourceViolation]);
     expect(result.fixed).toBe(1);
     const writtenContent = writeSpy.mock.calls[0][1] as string;
@@ -451,7 +487,7 @@ describe('runRetagViolations (Issue #85 v7)', () => {
       // not source vocab). Both must be filtered.
       llmResponse: '{"tags":["article","bogus","person"]}',
     });
-    const writeSpy = (ctx.app.vault.adapter as unknown as { write: ReturnType<typeof vi.fn> }).write;
+    const writeSpy = (ctx.wikiEngine as unknown as { createOrUpdateFile: ReturnType<typeof vi.fn> }).createOrUpdateFile;
     const result = await runRetagViolations(ctx, undefined, [sourceViolation]);
     expect(result.fixed).toBe(1);
     const writtenContent = writeSpy.mock.calls[0][1] as string;
@@ -705,6 +741,9 @@ describe('runAliasCompletion — typed-output migration (#443 expanded scope)', 
       } as unknown as LintContext['app'],
       llmClient: client,
       settings: { wikiFolder: 'wiki', language: 'en' } as LintContext['settings'],
+      wikiEngine: {
+        createOrUpdateFile: vi.fn().mockResolvedValue(undefined),
+      } as unknown as LintContext['wikiEngine'],
     } as unknown as LintContext;
   }
 

@@ -293,6 +293,28 @@ describe('PR #384 / #383 — delete-empty-stubs.ts (production function)', () =>
 // — the same module-function shape as Phase 3 (`findIncompletePages`).
 
 describe('PR #384 / #383 — normalizeSourcesInFolder (production function)', () => {
+  it('serializes concurrent normalizers on one vault and keeps the second read current', async () => {
+    const processed: string[] = [];
+    const byPath = new Map<string, string>([
+      ['wiki/sources/Race.md', '---\nsources: ["[[Notizen/Race.md]]"]\n---\n# Race\n'],
+    ]);
+    const app = makeVaultNormalizerApp(byPath, processed);
+    const originalProcess = app.vault.process;
+    app.vault.process = async (file, fn) => {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await originalProcess(file, fn);
+    };
+
+    const [first, second] = await Promise.all([
+      normalizeSourcesInFolder(app as unknown as App, 'wiki', false),
+      normalizeSourcesInFolder(app as unknown as App, 'wiki', false),
+    ]);
+
+    expect(processed).toEqual(['wiki/sources/Race.md']);
+    expect(first.filesCleaned + second.filesCleaned).toBe(1);
+    expect(byPath.get('wiki/sources/Race.md')).toContain('[[sources/race]]');
+  });
+
   it('processes only polluted files inside the wiki folder', async () => {
     const processed: string[] = [];
     const byPath = new Map<string, string>([

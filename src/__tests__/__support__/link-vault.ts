@@ -25,14 +25,19 @@ export interface FakeReference {
 export interface FakeLinkVault {
   vault: {
     getMarkdownFiles(): Array<{ path: string }>;
+    read(file: { path: string }): Promise<string>;
     process(file: { path: string }, fn: (data: string) => string): Promise<string>;
   };
   metadataCache: {
     getFileCache(file: { path: string }): { links?: FakeReference[]; embeds?: FakeReference[] } | null;
     getFirstLinkpathDest(linkpath: string, sourcePath: string): { path: string } | null;
+    on(event: 'changed', callback: (file: { path: string }, data: string) => unknown): unknown;
+    offref(ref: unknown): void;
   };
+  withPathWriteLock<T>(path: string, operation: () => Promise<T>): Promise<T>;
   read(path: string): string;
   write(path: string, content: string): void;
+  remove(path: string): void;
   /** Paths whose content was handed to `vault.process`, in call order. */
   processed: string[];
 }
@@ -87,6 +92,8 @@ function scanReferences(content: string): { links: FakeReference[]; embeds: Fake
 export function createFakeLinkVault(initial: Record<string, string>): FakeLinkVault {
   const files = new Map<string, string>(Object.entries(initial));
   const processed: string[] = [];
+  const changedListeners = new Set<(file: { path: string }, data: string) => unknown>();
+  const writeTails = new Map<string, Promise<void>>();
 
   const resolve = (linkpath: string, sourcePath: string): { path: string } | null => {
     const wanted = linkpath.replace(/\.md$/, '');
@@ -112,10 +119,14 @@ export function createFakeLinkVault(initial: Record<string, string>): FakeLinkVa
   return {
     vault: {
       getMarkdownFiles: () => [...files.keys()].map(path => ({ path })),
+      read: async file => files.get(file.path) ?? '',
       process: async (file, fn) => {
         processed.push(file.path);
         const next = fn(files.get(file.path) ?? '');
         files.set(file.path, next);
+        for (const listener of [...changedListeners]) {
+          listener(file, next);
+        }
         return next;
       },
     },
@@ -126,9 +137,31 @@ export function createFakeLinkVault(initial: Record<string, string>): FakeLinkVa
         return scanReferences(content);
       },
       getFirstLinkpathDest: resolve,
+      on: (_event, callback) => {
+        changedListeners.add(callback);
+        return callback;
+      },
+      offref: ref => {
+        if (typeof ref === 'function') {
+          changedListeners.delete(ref as (file: { path: string }, data: string) => unknown);
+        }
+      },
+    },
+    withPathWriteLock: <T>(path: string, operation: () => Promise<T>): Promise<T> => {
+      const key = path.replace(/\\/g, '/');
+      const previous = writeTails.get(key) ?? Promise.resolve();
+      let release!: () => void;
+      const current = new Promise<void>(resolveRelease => { release = resolveRelease; });
+      const tail = previous.then(() => current);
+      writeTails.set(key, tail);
+      return previous.then(operation).finally(() => {
+        release();
+        if (writeTails.get(key) === tail) writeTails.delete(key);
+      });
     },
     read: path => files.get(path) ?? '',
     write: (path, content) => { files.set(path, content); },
+    remove: path => { files.delete(path); },
     processed,
   };
 }

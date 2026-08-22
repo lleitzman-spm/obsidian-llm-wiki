@@ -50,16 +50,20 @@ export class TFolder extends TAbstractFile {
   }
 }
 
+function writeLine(message: string): void {
+  process.stdout.write(`${message}\n`);
+}
+
 /** Obsidian's toast. In the CLI it is a line on stdout. */
 export class Notice {
   private message: string;
   constructor(message: string, _timeout?: number) {
     this.message = message;
-    console.log(`[Notice] ${message}`);
+    writeLine(`[Notice] ${message}`);
   }
   setMessage(message: string): void {
     this.message = message;
-    console.log(`[Notice] ${message}`);
+    writeLine(`[Notice] ${message}`);
   }
   hide(): void { /* nothing to dismiss on a terminal */ }
   getMessage(): string {

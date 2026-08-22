@@ -175,11 +175,10 @@ describe('IngestQueue — remove', () => {
     expect(q.getSnapshot()).toEqual([]);
   });
 
-  it('aborts the running job and removes it from the snapshot', () => {
+  it('aborts the running job and preserves a visible terminal status', () => {
     // When the user clicks cancel on a running job, the ingest
-    // worker must receive an abort signal AND the job must leave
-    // the snapshot. We use a mock AbortController to verify the
-    // signal is fired.
+    // worker must receive an abort signal AND the job must remain
+    // visible as failed. We verify both halves of that contract.
     const q = new IngestQueue();
     const [id] = q.enqueue([mkFile('a.md')]);
     q.start(id);
@@ -188,7 +187,25 @@ describe('IngestQueue — remove', () => {
     const abortSpy = vi.spyOn(controller, 'abort');
     q.remove(id);
     expect(abortSpy).toHaveBeenCalledTimes(1);
-    expect(q.getSnapshot()).toEqual([]);
+    expect(q.getSnapshot()[0]).toMatchObject({
+      id,
+      status: 'failed',
+      error: 'Cancelled by user',
+      cancelled: true,
+    });
+  });
+
+  it('keeps a cancelled terminal row on repeated remove calls', () => {
+    const q = new IngestQueue();
+    const [id] = q.enqueue([mkFile('a.md')]);
+    q.start(id);
+    q.remove(id);
+    const notifications = vi.fn();
+    q.subscribe(notifications);
+    q.remove(id);
+    expect(q.getSnapshot()).toHaveLength(1);
+    expect(q.getSnapshot()[0]).toMatchObject({ id, status: 'failed', cancelled: true });
+    expect(notifications).not.toHaveBeenCalled();
   });
 
   it('is a no-op when the id does not exist (defensive)', () => {

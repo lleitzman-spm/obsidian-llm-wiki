@@ -28,6 +28,7 @@ import { buildWelcomeNote } from './welcome-note-template';
 import { localizeWelcomeNote, type LocalizeResult } from './localize-welcome-note';
 import { getWelcomeFileName } from './i18n';
 import type { LLMClient } from '../types';
+import { getVaultPathWriteQueue, notifyVaultWrite } from './path-write-safety';
 
 /**
  * Minimal vault contract that ensure-welcome-note needs. The real
@@ -42,6 +43,12 @@ export interface VaultAdapter {
   /** Returns vault-relative paths of all .md files. Used for tier probe. */
   getMarkdownFiles(): Promise<string[]>;
   create(path: string, content: string): Promise<void>;
+  /** Optional read-back used to verify the exact body after creation. */
+  read?(path: string): Promise<string>;
+  /** Optional watcher callback for writes performed outside WikiEngine. */
+  onFileWrite?: (path: string) => void;
+  /** Optional canonical read/modify/write lease supplied by the host. */
+  withWriteLock?<T>(path: string, operation: () => Promise<T>): Promise<T>;
 }
 
 export interface EnsureWelcomeNoteArgs {
@@ -158,7 +165,32 @@ export async function ensureWelcomeNote(args: EnsureWelcomeNoteArgs): Promise<En
     };
   }
   // Step 9: write to vault.
-  await vault.create(welcomePath, bodyToWrite);
+  const writeWelcome = async (): Promise<boolean> => {
+    // Re-check while holding the canonical lease: two startup/recreate
+    // callers may both have observed an absent note before translation.
+    if (await vault.exists(welcomePath)) return false;
+    await vault.create(welcomePath, bodyToWrite);
+    if (!await vault.exists(welcomePath)) {
+      throw new Error(`Welcome note creation could not be verified: ${welcomePath}`);
+    }
+    if (vault.read && await vault.read(welcomePath) !== bodyToWrite) {
+      throw new Error(`Welcome note content verification failed: ${welcomePath}`);
+    }
+    return true;
+  };
+  if (vault.withWriteLock) {
+    // Validate the path even when the host supplies the lock.  This keeps the
+    // standalone orchestrator from handing an absolute/traversal path to a
+    // host adapter that forgot to enforce the vault boundary.
+    const queue = getVaultPathWriteQueue(vault, await vault.getMarkdownFiles());
+    queue.canonicalPath(welcomePath);
+    const wrote = await vault.withWriteLock(welcomePath, writeWelcome);
+    if (wrote) notifyVaultWrite(vault.onFileWrite, queue, welcomePath);
+  } else {
+    const queue = getVaultPathWriteQueue(vault, await vault.getMarkdownFiles());
+    const wrote = await queue.run(welcomePath, held => held.runRaw(welcomePath, writeWelcome));
+    if (wrote) notifyVaultWrite(vault.onFileWrite, queue, welcomePath);
+  }
   return {
     tier: action.tier,
     action,

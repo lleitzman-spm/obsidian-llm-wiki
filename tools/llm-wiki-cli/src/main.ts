@@ -33,6 +33,10 @@ import { installObsidianGlobals } from './node-globals';
 const PLUGIN_ID = 'karpathywiki';
 const API_KEY_ENV = 'WIKI_API_KEY';
 
+function writeLine(message: string): void {
+  process.stdout.write(`${message}\n`);
+}
+
 const TOOL_USAGE = `Usage:
   llm-wiki <command> [flags]
 
@@ -405,13 +409,13 @@ function parseCliOptionsInner(argv: string[]): CliOptions {
 
   let thinkingMode: ThinkingModeValue | undefined;
   if (values['thinking-mode'] !== undefined) {
-    const tm = String(values['thinking-mode']) as ThinkingModeValue;
-    if (tm !== 'data-json' && tm !== 'plugin-off' && tm !== 'server-default') {
+    const rawThinkingMode = String(values['thinking-mode']);
+    if (rawThinkingMode !== 'data-json' && rawThinkingMode !== 'plugin-off' && rawThinkingMode !== 'server-default') {
       throw new Error(
-        `--thinking-mode must be one of data-json, plugin-off, server-default; got: ${tm}`,
+        `--thinking-mode must be one of data-json, plugin-off, server-default; got: ${rawThinkingMode}`,
       );
     }
-    thinkingMode = tm;
+    thinkingMode = rawThinkingMode;
   }
 
   let model: string | undefined;
@@ -531,13 +535,13 @@ function withUsageAccounting(client: LLMClient, totals: LLMUsageTotals): LLMClie
  */
 function printTimeByStep(totals: LLMUsageTotals): void {
   if (totals.byTask.size === 0) return;
-  console.log('');
-  console.log('=== Where the time went ===');
-  console.log('  step               calls   out tok    seconds   share');
+  writeLine('');
+  writeLine('=== Where the time went ===');
+  writeLine('  step               calls   out tok    seconds   share');
   const rows = [...totals.byTask.entries()].sort((a, b) => b[1].millis - a[1].millis);
   const wall = rows.reduce((sum, [, usage]) => sum + usage.millis, 0) || 1;
   for (const [name, usage] of rows) {
-    console.log(
+    writeLine(
       `  ${name.padEnd(18)} ${String(usage.calls).padStart(5)}`
       + ` ${String(usage.outputTokens).padStart(9)}`
       + ` ${(usage.millis / 1000).toFixed(1).padStart(10)}`
@@ -555,11 +559,11 @@ function resolveSourceFile(app: ReturnType<typeof createVaultApp>, sourcePath: s
 function printWriteLog(writes: VaultWriteRecord[]): void {
   const pageWrites = writes.filter(write => write.action !== 'mkdir');
   if (pageWrites.length === 0) {
-    console.log('  (no file writes)');
+    writeLine('  (no file writes)');
     return;
   }
   for (const write of pageWrites) {
-    console.log(`  ${write.action.padEnd(6)} ${write.path}`);
+    writeLine(`  ${write.action.padEnd(6)} ${write.path}`);
   }
 }
 
@@ -570,40 +574,40 @@ function printSummary(
   writes: VaultWriteRecord[],
   elapsedMs: number,
 ): void {
-  console.log('');
-  console.log(options.dryRun ? '=== Dry run: writes that were withheld ===' : '=== Writes ===');
+  writeLine('');
+  writeLine(options.dryRun ? '=== Dry run: writes that were withheld ===' : '=== Writes ===');
   printWriteLog(writes);
 
-  console.log('');
-  console.log('=== Summary ===');
+  writeLine('');
+  writeLine('=== Summary ===');
   if (options.extractOnly) {
-    console.log('  extract-only      page generation was skipped');
+    writeLine('  extract-only      page generation was skipped');
   } else if (!report) {
-    console.log('  no ingest report was emitted (the engine returned before onDone)');
+    writeLine('  no ingest report was emitted (the engine returned before onDone)');
   } else {
-    console.log(`  source            ${report.sourceFile}`);
-    console.log(`  success           ${report.success}`);
-    if (report.skipped) console.log(`  skipped           ${JSON.stringify(report.rejectedFiles ?? [])}`);
-    if (report.errorMessage) console.log(`  error             ${report.errorMessage}`);
-    console.log(`  new entity pages  ${report.entitiesCreated}`);
-    console.log(`  new concept pages ${report.conceptsCreated}`);
-    console.log(`  pages created     ${report.createdPages.length}`);
-    console.log(`  pages updated     ${report.updatedPages.length}`);
-    console.log(`  contradictions    ${report.contradictionsFound}`);
-    console.log(`  failed items      ${report.failedItems.length}`);
+    writeLine(`  source            ${report.sourceFile}`);
+    writeLine(`  success           ${report.success}`);
+    if (report.skipped) writeLine(`  skipped           ${JSON.stringify(report.rejectedFiles ?? [])}`);
+    if (report.errorMessage) writeLine(`  error             ${report.errorMessage}`);
+    writeLine(`  new entity pages  ${report.entitiesCreated}`);
+    writeLine(`  new concept pages ${report.conceptsCreated}`);
+    writeLine(`  pages created     ${report.createdPages.length}`);
+    writeLine(`  pages updated     ${report.updatedPages.length}`);
+    writeLine(`  contradictions    ${report.contradictionsFound}`);
+    writeLine(`  failed items      ${report.failedItems.length}`);
   }
-  console.log(`  extraction rounds ${totals.extractionRounds}`);
-  console.log(`  llm calls         ${totals.calls}`);
-  console.log(`  tokens in         ${totals.inputTokens}`);
-  console.log(`  tokens out        ${totals.outputTokens}`);
+  writeLine(`  extraction rounds ${totals.extractionRounds}`);
+  writeLine(`  llm calls         ${totals.calls}`);
+  writeLine(`  tokens in         ${totals.inputTokens}`);
+  writeLine(`  tokens out        ${totals.outputTokens}`);
   printTimeByStep(totals);
-  console.log(`  elapsed           ${(elapsedMs / 1000).toFixed(1)}s`);
+  writeLine(`  elapsed           ${(elapsedMs / 1000).toFixed(1)}s`);
 }
 
 async function runIngest(argv: string[]): Promise<void> {
   const options = parseCliOptions(argv);
   if (options.help) {
-    console.log(INGEST_USAGE);
+    writeLine(INGEST_USAGE);
     return;
   }
 
@@ -652,8 +656,8 @@ async function runIngest(argv: string[]): Promise<void> {
     settings,
     getClient,
     schemaManager,
-    path => console.log(`[write] ${path}`),
-    message => console.log(`[progress] ${message}`),
+    path => writeLine(`[write] ${path}`),
+    message => writeLine(`[progress] ${message}`),
     finished => { report = finished; },
     // Node 18+ exposes `crypto` as a global; the explicit `globalThis` prefix
     // is what trips `obsidianmd/no-global-this` in the review bot. Bare `crypto`
@@ -661,14 +665,14 @@ async function runIngest(argv: string[]): Promise<void> {
     crypto.subtle,
   );
 
-  console.log(`[cli] vault=${options.vault}`);
-  console.log(`[cli] source=${sourceFile.path}`);
-  console.log(`[cli] provider=${settings.provider} model=${settings.model} baseUrl=${settings.baseUrl}`);
+  writeLine(`[cli] vault=${options.vault}`);
+  writeLine(`[cli] source=${sourceFile.path}`);
+  writeLine(`[cli] provider=${settings.provider} model=${settings.model} baseUrl=${settings.baseUrl}`);
   // Every knob that decides how the model answers, printed once per run. A log
   // that does not say what it was configured with cannot be compared against
   // another log later, and two of this session's comparisons died on exactly
   // that — arms that turned out to differ by something no line recorded.
-  console.log(`[cli] dry-run=${options.dryRun} force=${options.force}`
+  writeLine(`[cli] dry-run=${options.dryRun} force=${options.force}`
     + ` model=${settings.model} thinking-mode=${options.thinkingMode ?? 'unset'}`
     + ` temp=${settings.extractionTemperature ?? 'server default'} top-p=${settings.extractionTopP ?? 'server default'}`
     + ` seed=${settings.samplingSeed ?? 'random'} max-tokens=${settings.maxTokensPerCall || 'uncapped'}`
@@ -694,7 +698,7 @@ export async function main(argv: string[]): Promise<void> {
   const d = dispatchCli(argv);
   switch (d.kind) {
     case 'tool-help':
-      console.log(TOOL_USAGE);
+      writeLine(TOOL_USAGE);
       return;
     case 'ingest':
       return runIngest(d.rest);
@@ -725,17 +729,17 @@ export async function main(argv: string[]): Promise<void> {
 async function runExtractionOnly(engine: WikiEngine, sourceFile: TFile): Promise<void> {
   const analysis = await engine.runExtractionOnly(sourceFile);
 
-  console.log('');
-  console.log('=== Extraction ===');
+  writeLine('');
+  writeLine('=== Extraction ===');
   if (!analysis) {
-    console.log('  the analyzer returned nothing (blank source, or round 1 was unusable)');
+    writeLine('  the analyzer returned nothing (blank source, or round 1 was unusable)');
     return;
   }
-  console.log(`  title             ${analysis.source_title}`);
-  console.log(`  entities          ${analysis.entities.length}`);
-  console.log(`  concepts          ${analysis.concepts.length}`);
-  console.log(`  key points        ${analysis.key_points.length}`);
-  console.log(`  contradictions    ${analysis.contradictions.length}`);
-  console.log(`  entity names      ${analysis.entities.map(e => e.name).join(', ')}`);
-  console.log(`  concept names     ${analysis.concepts.map(c => c.name).join(', ')}`);
+  writeLine(`  title             ${analysis.source_title}`);
+  writeLine(`  entities          ${analysis.entities.length}`);
+  writeLine(`  concepts          ${analysis.concepts.length}`);
+  writeLine(`  key points        ${analysis.key_points.length}`);
+  writeLine(`  contradictions    ${analysis.contradictions.length}`);
+  writeLine(`  entity names      ${analysis.entities.map(e => e.name).join(', ')}`);
+  writeLine(`  concept names     ${analysis.concepts.map(c => c.name).join(', ')}`);
 }

@@ -60,6 +60,9 @@ function makeCtx(opts: {
     async createOrUpdateFile(p: string, c: string): Promise<void> {
       written.set(p, c);
     },
+    async withPathWriteLock<T>(_path: string, operation: () => Promise<T>): Promise<T> {
+      return operation();
+    },
     getClient: () => opts.llmResponse === null
       ? null
       : { createMessage: async () => opts.llmResponse ?? 'new body' },

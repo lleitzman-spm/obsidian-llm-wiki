@@ -12,7 +12,7 @@
 //   - Replaces the existing `aliases:` block if present, otherwise injects a
 //     fresh block before the closing `---`.
 
-import { filterRedundantAliases } from '../../core/slug';
+import { filterRedundantAliases, windowsEquivalentIdentity } from '../../core/slug';
 import { parseFrontmatter } from '../../core/frontmatter';
 
 /**
@@ -23,6 +23,7 @@ import { parseFrontmatter } from '../../core/frontmatter';
 export interface AliasesContext {
   tryReadFile: (path: string) => Promise<string | null>;
   createOrUpdateFile: (path: string, content: string) => Promise<void>;
+  createOrUpdateFileUnlocked?: (path: string, content: string) => Promise<void>;
 }
 
 /**
@@ -52,7 +53,17 @@ export async function appendAliases(
 
   const fm = parseFrontmatter(content);
   const existingAliases = Array.isArray(fm?.aliases) ? fm.aliases : [];
-  const toAdd = candidates.filter(a => !existingAliases.includes(a));
+  const existingKeys = new Set(
+    existingAliases
+      .filter((alias): alias is string => typeof alias === 'string')
+      .map(alias => windowsEquivalentIdentity(alias.trim())),
+  );
+  const toAdd = candidates.filter(alias => {
+    const key = windowsEquivalentIdentity(alias.trim());
+    if (existingKeys.has(key)) return false;
+    existingKeys.add(key);
+    return true;
+  });
   if (toAdd.length === 0) return;
 
   const merged = [...existingAliases, ...toAdd];
@@ -76,6 +87,6 @@ export async function appendAliases(
   }
 
   const newContent = `---${newFm}\n---${body}`;
-  await ctx.createOrUpdateFile(pagePath, newContent);
+  await (ctx.createOrUpdateFileUnlocked ?? ctx.createOrUpdateFile)(pagePath, newContent);
   console.debug(`appendAliases: added ${toAdd.join(', ')} to ${pagePath}`);
 }

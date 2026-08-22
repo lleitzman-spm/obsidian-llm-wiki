@@ -1,9 +1,7 @@
 // Reports the warnings the Obsidian review bot will surface on `tools/` —
 // the local Gate 1 (`pnpm lint` = `eslint src/`) is blind to `tools/` while
-// the bot scans the whole repo `.ts` tree. This is an **informational** scan:
-// it does not gate anything (`pnpm lint:tools-bot` always exits 0 via
-// `|| true` in the package script). Run it during development / pre-release
-// to see what the bot will flag BEFORE submitting.
+// the bot scans the whole repo `.ts` tree. Structural warnings are accepted,
+// but errors fail `pnpm lint:tools-bot`, making this a local release gate.
 //
 // Background: the v1.26.1 release shipped a blocking `unsafe-call` Error in
 // `tools/llm-wiki-cli/src/obsidian.ts` that local lint could not see (root

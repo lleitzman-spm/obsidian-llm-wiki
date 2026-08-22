@@ -16,16 +16,40 @@ export function slugify(text: string, preserveCase = false): string {
 // case-insensitively comparable regardless of the user's slugCase setting.
 import { MIN_ALIAS_LENGTH } from '../constants';
 
+/**
+ * Return a comparison key for a value that may become a Windows filename.
+ * Windows path identity is case-insensitive and NFC-equivalent; trailing
+ * dots/spaces are ignored by Win32, and slash spellings are interchangeable
+ * when a caller supplies a path-like alias. Keep the original display value
+ * for frontmatter, but use this key whenever aliases are deduplicated.
+ */
+export function windowsEquivalentIdentity(value: string): string {
+  return value
+    .normalize('NFC')
+    .replace(/\\/g, '/')
+    .split('/')
+    .map(segment => segment.replace(/[ .]+$/g, ''))
+    .join('/')
+    .toLowerCase();
+}
+
+const WINDOWS_RESERVED_BASENAME = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])$/i;
+
 export function computeSlug(text: string, preserveCase = false): string {
   if (!text || text.trim().length === 0) return 'untitled';
 
-  const trimmed = text.trim();
+  // NFC keeps composed and decomposed spellings as one physical filename
+  // (macOS commonly supplies NFD while Windows supplies NFC).
+  const trimmed = text.normalize('NFC').trim();
 
   // Step 1: Remove ASCII control characters and filesystem-unsafe symbols
   const afterRemoveInvalid = trimmed
     // eslint-disable-next-line no-control-regex -- deliberate control-char strip for filename safety
     .replace(/[\x00-\x1f]/g, '')
-    .replace(/[/\\:*?"<>|,()'!?、，。；：！？（）【】《》]/g, '');
+    // `#` is an Obsidian heading delimiter inside wikilinks, so allowing it
+    // in a filename creates a page that generated `[[path#fragment]]` links
+    // cannot address as a file.
+    .replace(/[/\\:*?"<>|#,()'!?、，。；：！？（）【】《》]/g, '');
 
   if (afterRemoveInvalid.length === 0) return 'untitled-' + Date.now();
 
@@ -40,7 +64,11 @@ export function computeSlug(text: string, preserveCase = false): string {
 
   if (finalSlug.length === 0) return 'untitled-' + Date.now();
 
-  return preserveCase ? finalSlug : finalSlug.toLowerCase();
+  const result = preserveCase ? finalSlug : finalSlug.toLowerCase();
+  // Win32 reserves these basenames even when no extension is present. Prefix
+  // rather than suffix so the result remains a readable, deterministic slug
+  // and cannot become reserved again after trailing punctuation is stripped.
+  return WINDOWS_RESERVED_BASENAME.test(result) ? `untitled-${result}` : result;
 }
 
 // v1.25.10 PATCH Issue #366 — Turkish-aware case fold for *comparison*
@@ -128,15 +156,15 @@ export function filterRedundantAliases(
   candidateAliases: string[],
   existingAliasesAcrossPages?: readonly string[],
 ): string[] {
-  const fileName = pagePath.split('/').pop() || '';
-  const fileKey = fileName.replace(/\.md$/i, '').trim().toLowerCase();
+  const fileName = pagePath.replace(/\\/g, '/').split('/').pop() || '';
+  const fileKey = windowsEquivalentIdentity(fileName.replace(/\.md$/i, '').trim());
   const crossPageKeys = new Set<string>();
   if (existingAliasesAcrossPages) {
     for (const raw of existingAliasesAcrossPages) {
       if (typeof raw !== 'string') continue;
       const trimmed = raw.trim();
       if (trimmed.length >= MIN_ALIAS_LENGTH) {
-        crossPageKeys.add(trimmed.toLowerCase());
+        crossPageKeys.add(windowsEquivalentIdentity(trimmed));
       }
     }
   }
@@ -145,7 +173,7 @@ export function filterRedundantAliases(
     if (typeof alias !== 'string') return false;
     const trimmed = alias.trim();
     if (trimmed.length < MIN_ALIAS_LENGTH) return false;
-    const key = trimmed.toLowerCase();
+    const key = windowsEquivalentIdentity(trimmed);
     if (key === fileKey) return false; // already resolves to this file — redundant
     if (crossPageKeys.has(key)) return false; // already used on another page — wikilink ambiguity
     if (seen.has(key)) return false; // duplicate within the batch (case-insensitive)

@@ -62,6 +62,19 @@ describe('isInFolderScope', () => {
   it('is unaffected by the folder name appearing later in the path', () => {
     expect(isInFolderScope('Archiv/Notizen/a.md', 'Notizen', false)).toBe(false);
   });
+
+  it('treats Windows separators, case, NFC, and trailing dot/space spelling as the same path', () => {
+    expect(isInFolderScope('WIKI.\\Notes\\Cafe\u0301.md ', 'wiki', false)).toBe(true);
+    expect(isInFolderScope('wiki\\Notes\\café.md', 'WIKI. ', false)).toBe(true);
+  });
+
+  it('does not let rooted, device, ADS, traversal, or reserved-name paths enter a relative scope', () => {
+    expect(isInFolderScope('C:\\vault\\wiki\\a.md', 'wiki', false)).toBe(false);
+    expect(isInFolderScope('\\\\?\\C:\\vault\\wiki\\a.md', 'wiki', false)).toBe(false);
+    expect(isInFolderScope('wiki\\a.md:secret', 'wiki', false)).toBe(false);
+    expect(isInFolderScope('wiki\\..\\wiki\\a.md', 'wiki', false)).toBe(false);
+    expect(isInFolderScope('wiki\\CON\\a.md', 'wiki', false)).toBe(false);
+  });
 });
 
 describe('isAtOrInFolderScope', () => {
@@ -82,6 +95,12 @@ describe('isAtOrInFolderScope', () => {
   it('normalises a trailing slash on the folder path', () => {
     expect(isAtOrInFolderScope('Notizen', 'Notizen/', false)).toBe(true);
     expect(isAtOrInFolderScope('Notizen/a.md', 'Notizen/', false)).toBe(true);
+  });
+
+  it('uses Windows path identity for folder equality, including Unicode and trailing spelling', () => {
+    expect(isAtOrInFolderScope('Cafe\u0301', 'café. ', false)).toBe(true);
+    expect(isAtOrInFolderScope('WIKI\\Notes', 'wiki', false)).toBe(true);
+    expect(isAtOrInFolderScope('C:\\vault\\wiki', 'wiki', false)).toBe(false);
   });
 });
 
@@ -108,15 +127,20 @@ describe('isExcludedFromSourcePicker', () => {
     expect(isExcludedFromSourcePicker('.obsidian/plugins/foo/bar', 'wiki', '.obsidian')).toBe(true);
   });
 
-  // Same root cause as #383 — unanchored prefix leak. PR #384's
-  // `FolderSuggestModal` line `folder.path.startsWith(configDir)` let
-  // `.obsidian-backup/...` enter the picker; the centralised rule here
-  // uses isAtOrInFolderScope and is anchored.
-  it('does not leak a folder sharing the config name prefix', () => {
-    expect(isExcludedFromSourcePicker('.obsidian-backup/x.md', 'wiki', '.obsidian')).toBe(false);
+  it('excludes hidden folders without excluding ordinary dotted names', () => {
+    expect(isExcludedFromSourcePicker('.obsidian-backup/x.md', 'wiki', '.obsidian')).toBe(true);
+    expect(isExcludedFromSourcePicker('notes/.trash/x.md', 'wiki', '.obsidian')).toBe(true);
+    expect(isExcludedFromSourcePicker('notes/.draft/x.md', 'wiki', '.obsidian')).toBe(true);
+    expect(isExcludedFromSourcePicker('notes/archive.hidden/x.md', 'wiki', '.obsidian')).toBe(false);
   });
 
   it('keeps the vault root selectable', () => {
     expect(isExcludedFromSourcePicker('/', 'wiki', '.obsidian')).toBe(false);
+  });
+
+  it('excludes invalid Windows identities and device paths from source pickers', () => {
+    expect(isExcludedFromSourcePicker('C:\\vault\\Notes', 'wiki', '.obsidian')).toBe(true);
+    expect(isExcludedFromSourcePicker('Notes\\draft.md:secret', 'wiki', '.obsidian')).toBe(true);
+    expect(isExcludedFromSourcePicker('Notes\\CON\\draft.md', 'wiki', '.obsidian')).toBe(true);
   });
 });
