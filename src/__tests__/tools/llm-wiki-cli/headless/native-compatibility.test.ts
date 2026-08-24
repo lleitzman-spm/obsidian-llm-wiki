@@ -25,6 +25,46 @@ describe('native compatibility adapters', () => {
     expect(nativeSourceSlug('raw/Course X/About this course.md', { preserveCase: true })).toMatch(/^About-this-course_[0-9a-f]{6}$/u);
   });
 
+  it('refuses the legacy wall-clock slug fallback at the native boundary', () => {
+    let error: unknown;
+    try {
+      nativeSourceSlug('raw/hostile/!!!.md');
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({
+      name: 'NativeCompatibilityError',
+      code: 'non-deterministic-path',
+    });
+  });
+
+  it('keeps arbitrary hostile source paths either safe and repeatable or explicitly refused', () => {
+    const hostilePaths = [
+      'raw/hostile/!!!.md',
+      'raw/hostile/???...md',
+      'raw/hostile/\u0000.md',
+      'raw/hostile/../escape.md',
+      'raw//hostile.md',
+      'raw/hostile/\u202Ereceipt.md',
+      'raw/hostile/[[]].md',
+      'raw/hostile/CON.md',
+      'raw/hostile/normal name.md',
+      'raw/hostile/日本語.md',
+    ];
+
+    for (const sourcePath of hostilePaths) {
+      try {
+        const first = nativeSourceSlug(sourcePath);
+        const second = nativeSourceSlug(sourcePath);
+        expect(second, sourcePath).toBe(first);
+        expect(first, sourcePath).toMatch(/^[^/\\\r\n]+_[0-9a-f]{6}$/u);
+        expect(first, sourcePath).not.toMatch(/^untitled-\d+_[0-9a-f]{6}$/u);
+      } catch (error) {
+        expect(error, sourcePath).toMatchObject({ name: 'NativeCompatibilityError' });
+      }
+    }
+  });
+
   it('renders the native source-page postprocessing tail without inventing model bytes', () => {
     const sourcePath = 'raw/lease/Lease SOP.md';
     const result = planNativeSourcePage({

@@ -47,6 +47,16 @@ export function nativeSourceSlug(sourcePath: string, options: NativeSourceSlugOp
     preserveCase: options.preserveCase ?? false,
     maxLen: options.maxLen,
   });
+  // `computeSlug` uses `untitled-${Date.now()}` when a basename contains no
+  // slug-safe characters.  That legacy UI fallback is deliberately refused
+  // here: native preview and commit must derive the same path from the same
+  // source bytes, independent of wall-clock state.
+  if (/^untitled-\d+_[0-9a-f]{6}$/u.test(slug)) {
+    throw new NativeCompatibilityError(
+      'non-deterministic-path',
+      `Native source slug depends on wall-clock state: ${JSON.stringify(sourcePath)}`,
+    );
+  }
   if (!/^[^/\\]+_[0-9a-f]{6}$/u.test(slug)) {
     throw new NativeCompatibilityError('invalid-path', `Native source slug is not safe: ${slug}`);
   }
