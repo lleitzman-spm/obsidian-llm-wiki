@@ -8,9 +8,10 @@ import type { AdaptiveConcurrencyController } from '../scheduler';
 import type { TransactionFaultHooks, TransactionPlan, TransactionReceipt } from '../transaction';
 import type { FinalizationResult } from '../finalization';
 import type { SemanticComparisonResult } from '../comparison';
-import type { IndependentRunVerificationResult } from '../crypto';
+import type { VerifiedNativeCanaryArtifacts } from '../verification';
 import type { SourceInventory } from '../preflight/source-inventory';
 import type { LLMClient } from '../../../../../src/types';
+import type { IsolatedInjectedRunner } from '../isolation';
 
 export const NATIVE_CANARY_VERSION = 'native-vs-candidate-canary/v1' as const;
 export const LIVE_IDLE_OBSERVATION_VERSION = 'spm-brain/live-idle-observation/v1' as const;
@@ -95,6 +96,25 @@ export interface NativeCanaryProvider {
   readonly mapClient: NativeMapClient;
 }
 
+/** Runtime/compile-time brand for a runner bound by the isolation factory. */
+export const NATIVE_CANARY_ISOLATED_RUNNER_BRAND: unique symbol = Symbol('spm-native-canary-isolated-runner');
+
+export interface NativeCanaryIsolatedRunner extends IsolatedInjectedRunner {
+  readonly [NATIVE_CANARY_ISOLATED_RUNNER_BRAND]: 'native-canary-isolated-runner/v1';
+}
+
+/**
+ * The host-side writer identity carried into the coordinator and isolated
+ * native runner.  The candidate path itself never crosses the subprocess
+ * boundary; the runner receives the hash in the isolation protocol.
+ */
+export interface NativeCanaryWriterBinding {
+  readonly ownerId: string;
+  readonly runId: string;
+  readonly fence: number;
+  readonly candidateRootSha256: string;
+}
+
 export interface NativeReferenceRunner {
   readonly run: (input: NativeReferenceInput) => Promise<NativeReferenceResult>;
 }
@@ -119,11 +139,19 @@ export interface NativeCanaryInput {
   readonly provider: NativeCanaryProvider;
   readonly signer: Signer;
   readonly trustedRegistry: KeyRegistry;
+  /** The launch writer authority sealed by the host before any copy/write. */
+  readonly writerBinding?: NativeCanaryWriterBinding;
+  /** Re-check the launch writer authority immediately before candidate mutation. */
+  readonly assertWriterCurrent?: () => Promise<void>;
   readonly nativeReference?: NativeReferenceRunner;
   readonly scheduler?: AdaptiveConcurrencyController;
   readonly schedulerCapacity?: number | (() => number | Promise<number>);
   readonly workerIds?: readonly string[];
   readonly global: NativeCanaryGlobalInput;
+  /** Source/page-bound provider responses for existing native routes. */
+  readonly existingPageContents?: ReadonlyMap<string, string>;
+  /** Provider responses for new native pages, keyed by canonical page/path. */
+  readonly generatedPageContents?: ReadonlyMap<string, string>;
   readonly now?: () => number;
   readonly transactionFaults?: TransactionFaultHooks;
 }
@@ -147,8 +175,12 @@ export interface NativeCanaryResult {
   readonly reduction: NativeReductionPlan;
   readonly transactionPlan: TransactionPlan;
   readonly transaction: TransactionReceipt;
+  /** The actual candidate transaction writer lease, bound to the result. */
+  readonly writerBinding: NativeCanaryWriterBinding;
+  /** The host launch binding, when the activated host supplied one. */
+  readonly hostWriterBinding?: NativeCanaryWriterBinding;
   readonly comparison: SemanticComparisonResult;
   readonly finalization: FinalizationResult;
-  readonly independentVerification: IndependentRunVerificationResult;
+  readonly independentVerification: VerifiedNativeCanaryArtifacts;
   readonly artifactDirectory: string;
 }

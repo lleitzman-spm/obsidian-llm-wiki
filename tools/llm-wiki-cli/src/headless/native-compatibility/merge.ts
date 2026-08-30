@@ -4,6 +4,18 @@ import {
   parseFrontmatter,
   serializeFrontmatter,
 } from '../../../../../src/core/frontmatter';
+import { cleanMarkdownResponse } from '../../../../../src/core/markdown';
+import {
+  canonicalizeSectionHeaders,
+  preserveExistingSections,
+  reassertH1,
+} from '../../../../../src/core/section-header-canonicalizer';
+import { correctRelatedLinkPrefixes } from '../../../../../src/core/related-link-corrector';
+import { computeReingestMentions, stripMentionsSection } from '../../../../../src/core/mentions-parser';
+import { injectMentionsSection } from '../../../../../src/core/mentions-injector';
+import { isConversationSource } from '../../../../../src/wiki/page-factory/contextualize';
+import { getSectionLabels } from '../../../../../src/wiki/system-prompts';
+import type { EntityInfo, ConceptInfo, LLMWikiSettings, MentionWithProvenance } from '../../../../../src/types';
 import { nativeSourceLink, nativeSourceSlug, normalizeNativeVaultPath, normalizeNativeWikiFolder } from './slug';
 import type {
   NativeCompatibilityReason,
@@ -55,11 +67,123 @@ function action(current: string, next: string): 'replace' | 'unchanged' {
   return current === next ? 'unchanged' : 'replace';
 }
 
+function frontmatterBlock(content: string): string {
+  if (!content.startsWith('---\n')) return '';
+  const end = content.indexOf('\n---', 4);
+  return end < 0 ? '' : content.slice(0, end + 4);
+}
+
+function sourceBasename(sourcePath: string, explicit?: string): string {
+  return explicit ?? sourcePath.replaceAll('\\', '/').split('/').pop() ?? sourcePath;
+}
+
+function mentionInputs(
+  mentions: readonly MentionWithProvenance[] | readonly string[] | undefined,
+): { structured: MentionWithProvenance[]; legacy: string[] } {
+  if (!mentions) return { structured: [], legacy: [] };
+  const values = [...mentions];
+  if (values.every(value => typeof value === 'string')) {
+    return { structured: [], legacy: values as string[] };
+  }
+  return { structured: values as MentionWithProvenance[], legacy: [] };
+}
+
 /**
- * Plan the deterministic portion of a native merge.  Native `mergePage`,
- * reviewed append, and complementary append all make an LLM decision about
- * body bytes; those modes therefore return a candidate plus a refusal reason.
- * Only the no-new-info/frontmatter-only path is safe to apply here.
+ * Assemble the body exactly as the native merge paths do after their provider
+ * call.  This helper intentionally accepts only a bound provider response;
+ * it never invents a body, triage decision, or metadata from a page label.
+ */
+function assembleNativeMergeBody(input: NativeMergeInput, frontmatter: string, existingBody: string, generatedBody: string): string {
+  const settings = input.settings as LLMWikiSettings;
+  const normalizedSourcePath = normalizeNativeVaultPath(input.sourcePath, 'sourcePath');
+  const sourceFile = { path: normalizedSourcePath, basename: sourceBasename(normalizedSourcePath, input.sourceFileBasename) };
+  const mentions = mentionInputs(input.mentions);
+  const normalizedStructuredMentions = mentions.structured.map(mention => ({
+    ...mention,
+    source_path: mention.source_path
+      ? normalizeNativeVaultPath(mention.source_path, 'mention.source_path')
+      : normalizedSourcePath,
+    source_slug: mention.source_slug?.replaceAll('\\', '/'),
+  }));
+  const info = {
+    name: input.pagePath.split('/').pop()?.replace(/\.md$/iu, '') ?? input.pagePath,
+    summary: '',
+    related_entities: [...(input.relatedEntities ?? [])],
+    related_concepts: [...(input.relatedConcepts ?? [])],
+    mentions_in_source: mentions.legacy,
+    mentions_with_provenance: normalizedStructuredMentions,
+  } as unknown as EntityInfo | ConceptInfo;
+
+  if (input.mode === 'reviewed-append') {
+    const cleaned = cleanMarkdownResponse(generatedBody);
+    if (cleaned.trim() === 'NO_NEW_CONTENT') return `${frontmatter}\n\n${existingBody}`;
+    const labels = getSectionLabels(settings);
+    const isConv = isConversationSource(sourceFile, settings.wikiFolder);
+    const appendMentions = isConv ? [] : (normalizedStructuredMentions.length > 0 ? normalizedStructuredMentions : mentions.legacy);
+    const body = injectMentionsSection(cleaned, appendMentions, sourceFile.path, {
+      sectionLabel: labels.mentions_in_source,
+      conversationMode: isConv,
+      conversationLabel: `Conversation: ${sourceFile.basename}`,
+      pageIsReviewed: true,
+    });
+    return `${frontmatter}\n\n${body}`;
+  }
+
+  const labels = getSectionLabels(settings);
+  const cleaned = cleanMarkdownResponse(generatedBody);
+  if (cleaned.trim() === 'NO_NEW_CONTENT') return `${frontmatter}\n\n${existingBody}`;
+  let body = cleaned;
+  if (input.mode === 'llm-merge') {
+    const canonicalized = canonicalizeSectionHeaders(body, Object.values(labels));
+    const corrected = correctRelatedLinkPrefixes(
+      canonicalized,
+      input.relatedEntities ? [...input.relatedEntities] : undefined,
+      input.relatedConcepts ? [...input.relatedConcepts] : undefined,
+      labels.related_entities,
+      labels.related_concepts,
+      settings.slugCase === 'preserve',
+      input.existingPages ? { wikiFolder: settings.wikiFolder, pages: [...input.existingPages] } : undefined,
+    );
+    body = reassertH1(
+      existingBody,
+      preserveExistingSections(existingBody, corrected, Object.values(labels), labels.mentions_in_source),
+    );
+  }
+
+  const isConv = isConversationSource(sourceFile, settings.wikiFolder);
+  if (isConv) {
+    body = injectMentionsSection(body, [], sourceFile.path, {
+      sectionLabel: labels.mentions_in_source,
+      conversationMode: true,
+      conversationLabel: `Conversation: ${sourceFile.basename}`,
+    });
+    return `${frontmatter}\n\n${body}`;
+  }
+
+  const newMentions: MentionWithProvenance[] = normalizedStructuredMentions.length > 0
+    ? normalizedStructuredMentions
+    : mentions.legacy.map(quote => ({ quote, source_path: sourceFile.path, source_slug: '', extracted_at: '' }));
+  const reingested = computeReingestMentions(existingBody, newMentions, labels.mentions_in_source, sourceFile.path);
+  if (reingested.preserveRaw !== null) {
+    const stripped = stripMentionsSection(body, labels.mentions_in_source);
+    const preserved = stripped ? `${stripped}\n\n${reingested.preserveRaw}` : reingested.preserveRaw;
+    return `${frontmatter}\n\n${preserved}`;
+  }
+  body = injectMentionsSection(body, reingested.mentions, sourceFile.path, {
+    sectionLabel: labels.mentions_in_source,
+    conversationMode: false,
+    conversationLabel: `Conversation: ${sourceFile.basename}`,
+  });
+  return `${frontmatter}\n\n${body}`;
+}
+
+/**
+ * Plan the deterministic portion of a native merge. Native `mergePage` and
+ * reviewed append remain provider-owned for body bytes, but an explicitly
+ * bound provider response can cross this seam for native post-processing.
+ * Complementary append remains refused because its per-section triage and
+ * anchor sequence are not represented here. The frontmatter-only path needs
+ * no provider response.
  */
 export function planNativeMerge(input: NativeMergeInput): NativeMergePlan {
   const pagePath = normalizeNativeVaultPath(input.pagePath, 'pagePath');
@@ -81,14 +205,36 @@ export function planNativeMerge(input: NativeMergeInput): NativeMergePlan {
   const merged = reasons.length === 0
     ? nativeMergeFrontmatter(input.existingContent, sourceRef, input.date)
     : { frontmatter: '', body: input.existingContent, wasMerged: false };
-  const frontmatterOnly = merged.wasMerged ? `${merged.frontmatter}\n\n${merged.body}` : input.existingContent;
+  let plannedContent = merged.wasMerged ? `${merged.frontmatter}\n\n${merged.body}` : input.existingContent;
   const bodyChanged = input.proposedBody !== undefined && input.proposedBody !== merged.body;
 
-  if (input.mode !== 'frontmatter-only') {
+  if (input.mode !== 'frontmatter-only' && input.generatedContent === undefined) {
     reasons.push(reason(
       'native-llm-seam-required',
-      `Native ${input.mode} requires PageFactory triage/body generation and cannot be applied by a deterministic planner`,
+      `Native ${input.mode} requires a provider response bound to the existing-page seam`,
     ));
+  }
+  if (input.mode === 'complementary-append') {
+    reasons.push(reason(
+      'native-llm-seam-required',
+      'Native complementary append requires the per-section triage and anchor sequence',
+    ));
+  }
+  if (
+    input.mode === 'llm-merge'
+    && (input.relatedEntities?.length || input.relatedConcepts?.length)
+    && input.existingPages === undefined
+  ) {
+    reasons.push(reason(
+      'native-llm-seam-required',
+      'Native body merge requires the sealed existing-page catalog for related-link correction',
+    ));
+  }
+  if (input.mode !== 'frontmatter-only' && input.pageType === undefined) {
+    reasons.push(reason('native-llm-seam-required', `Native ${input.mode} requires the existing page type`));
+  }
+  if (input.mode !== 'frontmatter-only' && input.settings === undefined) {
+    reasons.push(reason('native-llm-seam-required', `Native ${input.mode} requires sealed native settings`));
   }
   if (!merged.wasMerged && reasons.length === 0) {
     reasons.push(reason('missing-page-body', 'Native merge frontmatter was not parseable; preserving bytes is not a proven merge'));
@@ -97,18 +243,44 @@ export function planNativeMerge(input: NativeMergeInput): NativeMergePlan {
     reasons.push(reason('native-llm-seam-required', 'A proposed body is not trusted without the native merge/append path'));
   }
 
+  if (
+    input.mode !== 'frontmatter-only'
+    && input.generatedContent !== undefined
+    && input.pageType !== undefined
+    && input.settings !== undefined
+    && merged.wasMerged
+    && reasons.length === 0
+  ) {
+    try {
+      // Native mergePage / appendToReviewedPage return before writing when the
+      // provider says NO_NEW_CONTENT; the pre-merge frontmatter is not leaked.
+      plannedContent = cleanMarkdownResponse(input.generatedContent).trim() === 'NO_NEW_CONTENT'
+        ? input.existingContent
+        : assembleNativeMergeBody(input, merged.frontmatter, merged.body, input.generatedContent);
+    } catch (error) {
+      reasons.push(reason(
+        'native-llm-seam-required',
+        `Native ${input.mode} post-processing failed: ${error instanceof Error ? error.message : String(error)}`,
+      ));
+    }
+  }
+
   const canApply = reasons.length === 0;
+  const refusedNoWrite = input.mode === 'complementary-append' && !canApply;
+  if (refusedNoWrite) plannedContent = input.existingContent;
+  const frontmatterChanged = merged.wasMerged && frontmatterBlock(plannedContent) !== frontmatterBlock(input.existingContent);
+  const finalBodyChanged = merged.wasMerged && extractBody(plannedContent) !== merged.body;
   return Object.freeze({
     status: canApply ? 'ready' : 'requires-native-comparison',
     canApply,
     reasons,
     path: pagePath,
-    action: canApply ? action(input.existingContent, frontmatterOnly) : 'replace',
-    content: frontmatterOnly,
+    action: canApply ? action(input.existingContent, plannedContent) : refusedNoWrite ? 'unchanged' : 'replace',
+    content: plannedContent,
     currentContent: input.existingContent,
     mode: input.mode,
     sourceSlug: expectedSlug,
-    frontmatterChanged: frontmatterOnly !== input.existingContent && merged.wasMerged,
-    bodyChanged,
+    frontmatterChanged,
+    bodyChanged: finalBodyChanged,
   });
 }

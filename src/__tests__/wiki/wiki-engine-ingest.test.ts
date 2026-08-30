@@ -143,6 +143,38 @@ describe('WikiEngine.ingestSource — requirements gate (#164)', () => {
     expect(h.engine.isIngesting()).toBe(false);
   });
 
+  it('rejects lint while ingest is active without replacing the ingest controller', async () => {
+    const h = createWikiEngineHarness({
+      files: { 'sources/first.md': 'first source body' },
+      llmDelayMs: 25,
+      llmResponses: [JSON.stringify({ source_title: 'First', summary: 'summary', entities: [], concepts: [] })],
+    });
+
+    const ingest = h.engine.ingestSource(sourceFile('sources/first.md'));
+    expect(h.engine.isIngesting()).toBe(true);
+    expect(() => h.engine.startLintOperation()).toThrow('Cannot start lint while ingestion is in progress');
+    await ingest;
+    expect(h.engine.isIngesting()).toBe(false);
+  });
+
+  it('rejects a second lint start without replacing the active lint controller', () => {
+    const h = createWikiEngineHarness();
+    const firstSignal = h.engine.startLintOperation();
+    expect(firstSignal.aborted).toBe(false);
+    expect(() => h.engine.startLintOperation()).toThrow('Lint already in progress');
+    h.engine.endLintOperation();
+    expect(h.engine.isLintRunning()).toBe(false);
+  });
+
+  it('rejects ingest while lint is active', async () => {
+    const h = createWikiEngineHarness({ files: { 'sources/blocked.md': 'blocked source body' } });
+    h.engine.startLintOperation();
+    await expect(h.engine.ingestSource(sourceFile('sources/blocked.md')))
+      .rejects.toThrow('Cannot start ingestion while lint is in progress');
+    h.engine.endLintOperation();
+    expect(h.engine.isIngesting()).toBe(false);
+  });
+
   it('forwards cancellation to the active analysis call and stops promptly', async () => {
     const h = createWikiEngineHarness({
       files: { 'sources/slow.md': 'slow source body' },

@@ -23,7 +23,6 @@ import { Notice } from 'obsidian';
 import { LintFixCallbacks, LintCounts, LintReportModal, FixReportPhase } from '../../ui/modals';
 import { TEXTS } from '../../texts';
 import { getText } from '../../core/i18n';
-import { nestReportUnderParent } from '../../core/report';
 import { isPageEmpty } from './utils';
 import { runAliasCompletion, runDeadLinkFixes, runEmptyPageFixes, runOrphanFixes, runDuplicateMerges, runRetagViolations, makeMirroredNotice } from './fix-runners';
 import { buildLintAnalysisContext } from './lint-analysis-context';
@@ -49,14 +48,14 @@ export type { LintContext } from './types';
  * prompt's own template). We strip them here so the same builder output
  * feeds both the LLM prompt and the user-facing report.
  */
-function extractProgReport(fullReport: string): string {
+export function extractProgReport(fullReport: string): string {
   // The full report has structure: `# title\n\n> summary\n\n<body>`.
-  // The body starts after the first `\n\n` following the `>` summary line.
+  // The body starts immediately after the first `\n\n` following the `>`
+  // summary line. Do not search for a second separator: that would skip the
+  // first finding heading and leave its rows unlabeled in retained reports.
   const summaryEnd = fullReport.indexOf('\n\n', fullReport.indexOf('> '));
   if (summaryEnd < 0) return fullReport;
-  const after = fullReport.indexOf('\n\n', summaryEnd + 2);
-  if (after < 0) return '';
-  return fullReport.slice(after + 2);
+  return fullReport.slice(summaryEnd + 2);
 }
 
 export async function runLintWiki(
@@ -699,14 +698,9 @@ export async function runLintWiki(
     }
 
     stageNotice.hide();
-    // Persist the full lint report to log.md before showing the modal.
-    // Issue: fullReport starts with "# Wiki Lint Report" (H1) and the log entry
-    // wraps it in "## [timestamp] Wiki Lint Report" (H2). Embedding H1 inside
-    // H2 is invalid markdown and renders oddly. Fix: strip the H1 and promote
-    // all other headings down one level (H2 → H3, H3 → H4) so the report
-    // nests correctly under the log heading.
-    const logReport = nestReportUnderParent(fullReport);
-    await ctx.wikiEngine.logLintFix(t.lintReportTitle, logReport);
+    // Retain the complete report as an immutable artifact and append only a
+    // bounded searchable index entry to log.md before showing the modal.
+    await ctx.wikiEngine.logLintReport(t.lintReportTitle, fullReport);
     // v1.22.6 #204: Context-aware completion dispatch.
     //   - Manual lint → LintReportModal (existing UX).
     //   - Auto lint + autoSmartFix → Notice + run fixAll (v1.22.2 path).

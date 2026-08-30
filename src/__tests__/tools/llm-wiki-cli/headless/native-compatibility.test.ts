@@ -143,6 +143,107 @@ describe('native compatibility adapters', () => {
     expect(merge.status).toBe('requires-native-comparison');
     expect(merge.canApply).toBe(false);
     expect(merge.reasons.some(reason => reason.code === 'native-llm-seam-required')).toBe(true);
+
+    const complementary = planNativeMerge({
+      pagePath: 'wiki/entities/Person.md',
+      sourcePath,
+      existingContent: existing,
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'complementary-append',
+      generatedContent: '## Description\nAppended.',
+      pageType: 'entity',
+      settings: DEFAULT_SETTINGS,
+    });
+    expect(complementary.canApply).toBe(false);
+    expect(complementary.action).toBe('unchanged');
+    expect(complementary.content).toBe(existing);
+  });
+
+  it('runs the bound native body-merge tail without dropping curated sections or provenance', () => {
+    const sourcePath = 'raw/lease/Lease SOP.md';
+    const existing = '---\ntype: entity\ncreated: 2024-01-01\nupdated: 2026-08-19\nsources:\n  - "[[sources/old_abc123]]"\ntags:\n  - person\naliases:\n  - Lease policy\ncustom: keep\n---\n\n# Lease Policy\n\n## Basic Information\nCurated description.\n\n## Evidence\nOld evidence.\n';
+    const result = planNativeMerge({
+      pagePath: 'wiki/entities/Lease-Policy.md',
+      sourcePath,
+      existingContent: existing,
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'llm-merge',
+      pageType: 'entity',
+      settings: DEFAULT_SETTINGS,
+      generatedContent: '# Wrong title\n\n## Description\nMerged description.\n',
+      relatedEntities: [],
+      relatedConcepts: [],
+      mentions: [{ quote: 'A lease rule', source_path: sourcePath, source_slug: nativeSourceSlug(sourcePath), extracted_at: '2026-08-20T00:00:00.000Z' }],
+      existingPages: [],
+    });
+    expect(result.canApply).toBe(true);
+    expect(result.content).toContain('# Lease Policy');
+    expect(result.content).toContain('Curated description.');
+    expect(result.content).toContain('Merged description.');
+    expect(result.content).toContain('custom: keep');
+    expect(result.content).toContain('Lease policy');
+    expect(result.content).toContain(`sources/${nativeSourceSlug(sourcePath)}`);
+    expect(result.content).toContain('A lease rule');
+    expect(result.content).not.toContain('# Wrong title');
+  });
+
+  it('runs the bound reviewed append tail and keeps a no-new-content response unchanged', () => {
+    const sourcePath = 'raw/lease/Lease SOP.md';
+    const existing = '---\ntype: entity\ncreated: 2024-01-01\nreviewed: true\n---\n\n# Lease Policy\n\n## Curated\nLocked.\n';
+    const appended = planNativeMerge({
+      pagePath: 'wiki/entities/Lease-Policy.md',
+      sourcePath,
+      existingContent: existing,
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'reviewed-append',
+      pageType: 'entity',
+      settings: DEFAULT_SETTINGS,
+      generatedContent: '## New Information (2026-08-20)\nNew rule.\n',
+      mentions: ['A lease rule'],
+    });
+    expect(appended.canApply).toBe(true);
+    expect(appended.content).toContain('reviewed: true');
+    expect(appended.content).toContain('New rule.');
+    expect(appended.content).toContain(`sources/${nativeSourceSlug(sourcePath)}`);
+
+    const noNew = planNativeMerge({
+      pagePath: 'wiki/entities/Lease-Policy.md',
+      sourcePath,
+      existingContent: existing,
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'reviewed-append',
+      pageType: 'entity',
+      settings: DEFAULT_SETTINGS,
+      generatedContent: 'NO_NEW_CONTENT',
+    });
+    expect(noNew.canApply).toBe(true);
+    expect(noNew.action).toBe('unchanged');
+    expect(noNew.content).toBe(existing);
+  });
+
+  it('normalizes Windows source paths through body and mention provenance output', () => {
+    const sourcePath = 'raw\\lease\\Lease SOP.md';
+    const result = planNativeMerge({
+      pagePath: 'wiki/entities/Lease-Policy.md',
+      sourcePath,
+      existingContent: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Lease Policy\n',
+      wikiFolder: 'wiki',
+      date: '2026-08-20',
+      mode: 'llm-merge',
+      pageType: 'entity',
+      settings: DEFAULT_SETTINGS,
+      generatedContent: '## Description\nWindows-safe merge.\n',
+      mentions: [{ quote: 'Windows quote', source_path: sourcePath, source_slug: nativeSourceSlug(sourcePath), extracted_at: '2026-08-20T00:00:00.000Z' }],
+      existingPages: [],
+    });
+    expect(result.canApply).toBe(true);
+    expect(result.content).toContain('[[sources/lease-sop_');
+    expect(result.content).toContain('[[raw/lease/Lease SOP|Lease SOP]]');
+    expect(result.content).not.toContain('raw\\lease\\Lease SOP');
   });
 
   it('plans the native index with fingerprinted source basenames and native summaries', () => {

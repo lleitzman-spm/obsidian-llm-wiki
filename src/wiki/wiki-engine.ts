@@ -2,7 +2,7 @@
 // Orchestrates sub-modules: SourceAnalyzer, PageFactory, ConversationIngestor,
 // LintFixer, ContradictionManager, and system-prompts.
 
-import { App, TFile, TFolder, Notice, normalizePath } from 'obsidian';
+import { App, TFile, TFolder, Notice, Platform, normalizePath } from 'obsidian';
 import {
   LLMWikiSettings,
   LLMClient,
@@ -60,6 +60,101 @@ import { GraphCache, type GraphPageLoader } from './engine-internals/graph-cache
 import { IndexGenerator } from './engine-internals/index-generator';
 import { LogWriter } from './engine-internals/log-writer';
 import { dedupPages } from './engine-internals/dedup-pages';
+
+type NativePathSafetyMetadata = {
+  isSymbolicLink: () => boolean;
+  isReparsePoint?: () => boolean;
+  reparsePoint?: boolean;
+};
+
+type NativePathSafetyTools = {
+  lstat: (path: string) => Promise<NativePathSafetyMetadata>;
+  realpath: (path: string) => Promise<string>;
+  join: (...paths: string[]) => string;
+  parse: (path: string) => { root: string };
+  resolve: (path: string) => string;
+};
+
+type DesktopNodeRequire = <T>(specifier: string) => T;
+
+function requireDesktopNodeModule<T>(specifier: string): T {
+  if (!Platform.isDesktop) {
+    throw new Error('Lint report retention requires desktop path-safety support');
+  }
+  // Obsidian desktop bundles this plugin as CommonJS inside Electron. Use
+  // that runtime's guarded require rather than a dynamic ESM import: Electron
+  // does not reliably resolve external node: builtins through import().
+  // eslint-disable-next-line no-undef -- CommonJS require is available only in the guarded desktop runtime
+  const nodeRequire = require as unknown as DesktopNodeRequire;
+  return nodeRequire<T>(specifier);
+}
+
+async function loadNativePathSafetyTools(): Promise<NativePathSafetyTools> {
+  if (!Platform.isDesktop) {
+    throw new Error('Lint report retention requires desktop path-safety support');
+  }
+  const fs = requireDesktopNodeModule<typeof import('node:fs/promises')>('node:fs/promises');
+  const path = requireDesktopNodeModule<typeof import('node:path')>('node:path');
+  return {
+    lstat: (value: string) => fs.lstat(value),
+    realpath: (value: string) => fs.realpath(value),
+    join: (...values: string[]) => path.join(...values),
+    parse: (value: string) => path.parse(value),
+    resolve: (value: string) => path.resolve(value),
+  };
+}
+
+function isReparsePoint(metadata: NativePathSafetyMetadata): boolean {
+  return metadata.isSymbolicLink() || metadata.isReparsePoint?.() === true || metadata.reparsePoint === true;
+}
+
+function normalizedNativePath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+/**
+ * Resolve an adapter path and reject any existing component that is a
+ * symlink/junction/reparse point. Obsidian's getFullPath is lexical only, so
+ * this no-follow lstat + realpath check is the production path-safety seam.
+ * Missing leaves are allowed because report artifacts/logs are create targets;
+ * all existing ancestors are checked before returning the lexical target.
+ */
+async function resolveArchivePathSafely(
+  adapter: { getFullPath: (normalizedPath: string) => string },
+  normalizedPath: string,
+): Promise<string> {
+  const tools = await loadNativePathSafetyTools();
+  const absolute = tools.resolve(adapter.getFullPath(normalizedPath));
+  const root = tools.parse(absolute).root;
+  const components = absolute.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = tools.join(current, component);
+    let metadata: NativePathSafetyMetadata;
+    try {
+      metadata = await tools.lstat(current);
+    } catch (error) {
+      const code = typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+      if (code === 'ENOENT') break;
+      throw new Error(`Unable to inspect lint report path component: ${current}`);
+    }
+    if (isReparsePoint(metadata)) {
+      throw new Error(`Lint report path contains a symlink/junction/reparse point: ${current}`);
+    }
+    let resolved: string;
+    try {
+      resolved = await tools.realpath(current);
+    } catch {
+      throw new Error(`Unable to resolve lint report path component: ${current}`);
+    }
+    if (normalizedNativePath(resolved) !== normalizedNativePath(current)) {
+      throw new Error(`Lint report path resolves through a symlink/junction/reparse point: ${current}`);
+    }
+  }
+  return absolute;
+}
 
 /**
  * Issue #173 Symptom B: drop exact-string duplicates from a page-path list
@@ -182,7 +277,8 @@ export class WikiEngine {
     onFileWrite?: (path: string) => void,
     onProgress?: (message: string) => void,
     onDone?: (report: IngestReport) => void,
-    subtle?: SubtleCrypto
+    subtle?: SubtleCrypto,
+    pluginVersion?: string
   ) {
     this.app = app;
     this.settings = settings;
@@ -261,8 +357,34 @@ export class WikiEngine {
     this.logWriter = new LogWriter({
       wikiFolder: this.settings.wikiFolder,
       wikiLanguage: this.settings.wikiLanguage ?? '',
+      pluginVersion,
       readFile: (path: string) => this.tryReadFile(path),
       writeFile: (path: string, content: string) => this.createOrUpdateFile(path, content),
+      ensureArchiveFolder: async (path: string) => {
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (!existing) {
+          await this.app.vault.createFolder(path);
+        } else if (!(existing instanceof TFolder)) {
+          throw new Error(`Lint report archive path is not a folder: ${path}`);
+        }
+      },
+      createArchiveFile: async (path: string, content: string) => {
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (existing) throw new Error(`Lint report archive file already exists: ${path}`);
+        await this.app.vault.create(path, content);
+      },
+      resolveArchivePath: async (path: string) => {
+        const adapter = this.app.vault.adapter as typeof this.app.vault.adapter & {
+          getFullPath?: (normalizedPath: string) => string;
+        };
+        if (typeof adapter.getFullPath !== 'function') {
+          throw new Error('Lint report retention requires an adapter canonical path resolver');
+        }
+        // Obsidian adapters commonly implement getFullPath as an instance
+        // method. Retention receives a callback, so preserve the adapter
+        // receiver before handing it to the path-safety resolver.
+        return resolveArchivePathSafely({ getFullPath: adapter.getFullPath.bind(adapter) }, path);
+      },
     });
   }
 
@@ -356,8 +478,19 @@ export class WikiEngine {
   }
 
   startLintOperation(): AbortSignal {
+    if (this.abortController !== null) {
+      throw new Error('Cannot start lint while ingestion is in progress');
+    }
+    if (this.lintAbortController !== null) {
+      throw new Error('Lint already in progress');
+    }
     this.lintAbortController = new AbortController();
-    this.onLintStart?.();
+    try {
+      this.onLintStart?.();
+    } catch (error) {
+      this.lintAbortController = null;
+      throw error;
+    }
     return this.lintAbortController.signal;
   }
 
@@ -842,6 +975,9 @@ export class WikiEngine {
     // `onIngestionStart` is idempotent at the main.ts callback level (it
     // simply sets status bar text), so we still re-emit it for visual
     // refresh — that doesn't grow any state.
+    if (this.lintAbortController !== null) {
+      throw new Error('Cannot start ingestion while lint is in progress');
+    }
     const ownsActiveOperation = opts?.operationToken !== undefined
       && opts.operationToken === this.activeIngestToken;
     if (this.abortController !== null && !ownsActiveOperation) {
@@ -1815,6 +1951,11 @@ export class WikiEngine {
   /** Append a lint-fix entry to the operation log. */
   async logLintFix(operation: string, details: string): Promise<void> {
     return this.logWriter.appendLintFix(operation, details);
+  }
+
+  /** Persist a complete lint report and append its bounded-log index entry. */
+  async logLintReport(operation: string, report: string): Promise<void> {
+    await this.logWriter.appendLintReport(operation, report);
   }
 
   /** Merge a duplicate source page into a target page. */

@@ -8,6 +8,11 @@ import {
 } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { sha256Hex, snapshotTreeHash, type SnapshotHashEntry } from '../preflight/hashing';
+import {
+  assertRootBindingUnchanged,
+  captureRootBinding,
+  withExclusiveRootLock,
+} from '../preflight/path-safety';
 import { assertSafeCopyRoots, type RootProbe } from '../preflight/roots';
 
 /** A manifest deliberately contains bytes, not mtimes or platform-specific metadata. */
@@ -425,35 +430,49 @@ export async function copySnapshot(options: CopySnapshotOptions): Promise<{ sour
     syncRoots: options.syncRoots,
     probe,
   });
-  const source = await captureSnapshot({ ...options, root: roots.liveRoot.resolved, probe });
   const destination = roots.copyRoots[0].resolved;
-  await ensurePlainDirectory(destination, probe);
-  await assertDestinationEmpty(destination, probe);
-  for (const entry of source.entries) {
-    const destinationPath = nodePath.join(destination, ...entry.path.split('/'));
-    await ensurePlainDirectory(nodePath.dirname(destinationPath), probe);
-    const content = await readStableBytes(
-      nodePath.join(source.root, ...entry.path.split('/')),
-      probe,
-      undefined,
-      'Source entry',
-    );
-    if (content.byteLength !== entry.byteLength || sha256Hex(content) !== entry.byteSha256) {
-      throw new Error(`Source drifted during copy: ${entry.path}`);
+  const destinationParent = nodePath.dirname(destination);
+  await ensurePlainDirectory(destinationParent, probe);
+  // A fresh destination has no directory identity to bind before the lock is
+  // acquired. Bind its parent instead so a concurrent ancestor replacement
+  // cannot redirect the later mkdir/copy into a different tree unnoticed.
+  const destinationParentBinding = await captureRootBinding(destinationParent, probe, 'Copy destination parent');
+  return withExclusiveRootLock(destination, async () => {
+    await assertRootBindingUnchanged(destinationParentBinding, probe, 'Copy destination parent');
+    await ensurePlainDirectory(destination, probe);
+    const sourceBinding = await captureRootBinding(roots.liveRoot.resolved, probe, 'Source root');
+    const destinationBinding = await captureRootBinding(destination, probe, 'Copy destination');
+    await assertDestinationEmpty(destination, probe);
+    const source = await captureSnapshot({ ...options, root: roots.liveRoot.resolved, probe });
+    for (const entry of source.entries) {
+      const destinationPath = nodePath.join(destination, ...entry.path.split('/'));
+      await ensurePlainDirectory(nodePath.dirname(destinationPath), probe);
+      const content = await readStableBytes(
+        nodePath.join(source.root, ...entry.path.split('/')),
+        probe,
+        undefined,
+        'Source entry',
+      );
+      if (content.byteLength !== entry.byteLength || sha256Hex(content) !== entry.byteSha256) {
+        throw new Error(`Source drifted during copy: ${entry.path}`);
+      }
+      await writeStableDestinationFile(destinationPath, content, destination, probe);
     }
-    await writeStableDestinationFile(destinationPath, content, destination, probe);
-  }
-  // The per-file identity checks above catch replacement of an existing file;
-  // this second source manifest also catches additions/removals that happened
-  // after the initial directory walk. A path-based copy cannot be made fully
-  // race-free on every Node platform, so any observed drift remains fatal.
-  const sourceAfter = await captureSnapshot({ root: source.root, exclusions: source.exclusions, probe });
-  const sourceDrift = compareSnapshots(source, sourceAfter);
-  if (!sourceDrift.exact) throw new Error(`Source drifted during copy: ${JSON.stringify(sourceDrift)}`);
-  const copied = await captureSnapshot({ root: destination, exclusions: source.exclusions, probe });
-  const drift = compareSnapshots(source, copied);
-  if (!drift.exact) throw new Error(`Copied snapshot mismatch: ${JSON.stringify(drift)}`);
-  return { source, destination: copied };
+    // The per-file identity checks above catch replacement of an existing file;
+    // this second source manifest also catches additions/removals that happened
+    // after the initial directory walk. Root CAS plus the lock catch a whole
+    // root replacement that happens to contain identical bytes.
+    const sourceAfter = await captureSnapshot({ root: source.root, exclusions: source.exclusions, probe });
+    const sourceDrift = compareSnapshots(source, sourceAfter);
+    if (!sourceDrift.exact) throw new Error(`Source drifted during copy: ${JSON.stringify(sourceDrift)}`);
+    const copied = await captureSnapshot({ root: destination, exclusions: source.exclusions, probe });
+    const drift = compareSnapshots(source, copied);
+    if (!drift.exact) throw new Error(`Copied snapshot mismatch: ${JSON.stringify(drift)}`);
+    await assertRootBindingUnchanged(sourceBinding, probe, 'Source root');
+    await assertRootBindingUnchanged(destinationParentBinding, probe, 'Copy destination parent');
+    await assertRootBindingUnchanged(destinationBinding, probe, 'Copy destination');
+    return { source, destination: copied };
+  });
 }
 
 export function compareSnapshots(expected: CopySnapshotManifest, actual: CopySnapshotManifest): SnapshotDrift {

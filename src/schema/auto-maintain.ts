@@ -1,7 +1,7 @@
 import { NOTICE_SHORT, NOTICE_WATCHER } from '../constants';
 // Auto Maintain Manager - File watcher, periodic lint, startup quick fixes
 
-import { App, TAbstractFile, TFile, Notice, Plugin } from 'obsidian';
+import { App, TAbstractFile, TFile, Notice, Plugin, EventRef, Events } from 'obsidian';
 import { LLMWikiSettings } from '../types';
 import { WikiEngine } from '../wiki/wiki-engine';
 import { TEXTS } from '../texts';
@@ -23,8 +23,11 @@ export class AutoMaintainManager {
 
   // Watcher state
   private debounceTimer: number | null = null;
+  private readonly watcherEventRefs: Array<{ source: Events; ref: EventRef }> = [];
+  private watcherGeneration = 0;
   private pendingFiles: Map<string, TFile> = new Map();
   private recentWrites: Set<string> = new Set();
+  private readonly trackedTimeouts = new Set<number>();
   private firstChangeTimestamp = 0;
   private readonly MAX_DEBOUNCE_MS = 60000; // Hard cap to prevent indefinite delay
 
@@ -32,6 +35,14 @@ export class AutoMaintainManager {
   private lintIntervalId: number | null = null;
   private lastLintTimestamp = 0;
   private lintCallback: (() => Promise<void>) | null = null;
+  private lintRunning = false;
+
+  // Startup checks can outlive the synchronous onload call. Keep their
+  // settling timer and cancellation callback owned by this manager so a
+  // settings reload/unload cannot resume work against stale plugin state.
+  private startupTimer: number | null = null;
+  private startupCancel: (() => void) | null = null;
+  private lifecycleGeneration = 0;
 
   // Whether watchers are currently active
   private watching = false;
@@ -61,30 +72,23 @@ export class AutoMaintainManager {
   // workspace.onLayoutReady prevents startup noise from existing files.
   startWatching(): void {
     if (this.watching) return;
+    const generation = this.watcherGeneration;
 
     this.app.workspace.onLayoutReady(() => {
-      if (this.watching) return;
+      if (this.watching || generation !== this.watcherGeneration) return;
 
-      this.plugin.registerEvent(
-        this.app.vault.on('create', (file: TAbstractFile) => {
-          this.onFileChanged(file);
-        })
-      );
-      this.plugin.registerEvent(
-        this.app.vault.on('rename', (file: TAbstractFile, _oldPath: string) => {
-          this.onFileChanged(file);
-        })
-      );
-      this.plugin.registerEvent(
-        this.app.vault.on('modify', (file: TAbstractFile) => {
-          this.onFileChanged(file);
-        })
-      );
-      this.plugin.registerEvent(
-        this.app.metadataCache.on('resolved', ((file: TFile) => {
-          this.onFileChanged(file);
-        }) as unknown as () => void)
-      );
+      this.registerWatcherEvent(this.app.vault, this.app.vault.on('create', (file: TAbstractFile) => {
+        this.onFileChanged(file);
+      }));
+      this.registerWatcherEvent(this.app.vault, this.app.vault.on('rename', (file: TAbstractFile, _oldPath: string) => {
+        this.onFileChanged(file);
+      }));
+      this.registerWatcherEvent(this.app.vault, this.app.vault.on('modify', (file: TAbstractFile) => {
+        this.onFileChanged(file);
+      }));
+      this.registerWatcherEvent(this.app.metadataCache, this.app.metadataCache.on('resolved', ((file: TFile) => {
+        this.onFileChanged(file);
+      }) as unknown as () => void));
 
       this.watching = true;
       console.debug('AutoMaintain: File watcher started (create+rename+modify+resolved)');
@@ -94,12 +98,23 @@ export class AutoMaintainManager {
   }
 
   stopWatching(): void {
-    // registerEvent handles cleanup via plugin lifecycle;
-    // we just clear our own state
+    this.watcherGeneration++;
+    for (const { source, ref } of this.watcherEventRefs) {
+      source.offref(ref);
+    }
+    this.watcherEventRefs.length = 0;
     this.clearDebounce();
     this.pendingFiles.clear();
+    this.lastSeenPaths.clear();
     this.watching = false;
     console.debug('AutoMaintain: File watcher stopped');
+  }
+
+  private registerWatcherEvent(source: Events, ref: EventRef): void {
+    // Keep Plugin.registerEvent for unload safety, but also retain the ref so
+    // settings reloads can detach the old handlers immediately.
+    this.plugin.registerEvent(ref);
+    this.watcherEventRefs.push({ source, ref });
   }
 
   // Check if a path falls within any watched folder
@@ -141,7 +156,7 @@ export class AutoMaintainManager {
       return;
     }
     this.lastSeenPaths.add(fileKey);
-    window.setTimeout(() => { this.lastSeenPaths.delete(fileKey); }, 600000);
+    this.setTrackedTimeout(() => { this.lastSeenPaths.delete(fileKey); }, 600000);
 
     console.debug(`[AutoMaintain] DETECTED: ${file.path}, pending: ${this.pendingFiles.size + 1}`);
 
@@ -169,7 +184,7 @@ export class AutoMaintainManager {
       // Max wait exceeded, process immediately
       void this.processBatch();
     } else {
-      this.debounceTimer = window.setTimeout(
+      this.debounceTimer = this.setTrackedTimeout(
         () => { void this.processBatch(); },
         delay
       );
@@ -179,7 +194,7 @@ export class AutoMaintainManager {
   markRecentWrite(path: string): void {
     this.recentWrites.add(path);
     // Auto-expire after 120 seconds (covers slow LLM responses)
-    window.setTimeout(() => {
+    this.setTrackedTimeout(() => {
       this.recentWrites.delete(path);
     }, 120000);
   }
@@ -203,6 +218,16 @@ export class AutoMaintainManager {
 
     const sourceFiles = files.filter(f => this.isWatched(f.path));
     if (sourceFiles.length === 0) return;
+
+    // Lint and ingest share the vault write path. Preserve the batch while a
+    // lint or another ingest is active, then retry instead of losing files or
+    // starting a conflicting operation.
+    if (this.wikiEngine.isLintRunning?.() || this.wikiEngine.isIngesting?.()) {
+      for (const file of sourceFiles) this.pendingFiles.set(file.path, file);
+      this.debounceTimer = this.setTrackedTimeout(() => { void this.processBatch(); }, 250);
+      console.debug('AutoMaintain: ingest batch deferred while another operation is active');
+      return;
+    }
 
     const texts = TEXTS[this.settings.language];
 
@@ -244,10 +269,25 @@ export class AutoMaintainManager {
 
   private clearDebounce(): void {
     if (this.debounceTimer !== null) {
-      window.clearTimeout(this.debounceTimer);
+      this.clearTrackedTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
     this.firstChangeTimestamp = 0;
+  }
+
+  private setTrackedTimeout(callback: () => void, delay: number): number {
+    let timer = 0;
+    timer = window.setTimeout(() => {
+      this.trackedTimeouts.delete(timer);
+      callback();
+    }, delay);
+    this.trackedTimeouts.add(timer);
+    return timer;
+  }
+
+  private clearTrackedTimeout(timer: number): void {
+    window.clearTimeout(timer);
+    this.trackedTimeouts.delete(timer);
   }
 
   // === Periodic Lint ===
@@ -262,58 +302,70 @@ export class AutoMaintainManager {
         ? 7 * 24 * 60 * 60 * 1000
         : 30 * 24 * 60 * 60 * 1000;
 
-    this.lintIntervalId = this.plugin.registerInterval(
-      window.setInterval(() => {
-        void (async () => {
-          console.debug('AutoMaintain: Periodic lint tick...');
-          try {
-            await this.runLint();
-          } catch (error) {
-            console.error('Scheduled lint failed:', error);
-          }
-        })();
-      }, intervalMs)
-    );
+    const intervalId = window.setInterval(() => {
+      void (async () => {
+        console.debug('AutoMaintain: Periodic lint tick...');
+        try {
+          await this.runLint();
+        } catch (error) {
+          console.error('Scheduled lint failed:', error);
+        }
+      })();
+    }, intervalMs);
+    this.plugin.registerInterval(intervalId);
+    this.lintIntervalId = intervalId;
 
     this.lintScheduled = true;
     console.debug(`AutoMaintain: Periodic lint scheduled (${this.settings.periodicLint})`);
   }
 
   clearPeriodicLint(): void {
-    // registerInterval handles cleanup; we just track state
+    if (this.lintIntervalId !== null) {
+      window.clearInterval(this.lintIntervalId);
+      this.lintIntervalId = null;
+    }
     this.lintScheduled = false;
     console.debug('AutoMaintain: Periodic lint cleared');
   }
 
   private async runLint(): Promise<void> {
-    // Check if any source files have changed since last lint
-    const hasChanges = this.hasSourceFilesChanged();
-    if (!hasChanges && this.lastLintTimestamp > 0) {
-      console.debug('AutoMaintain: No source changes since last lint, skipping');
+    if (this.lintRunning || this.wikiEngine.isLintRunning?.() || this.wikiEngine.isIngesting?.()) {
+      console.debug('AutoMaintain: lint skipped because another lint/ingest is active');
       return;
     }
+    this.lintRunning = true;
+    try {
+      // Check if any source files have changed since last lint
+      const hasChanges = this.hasSourceFilesChanged();
+      if (!hasChanges && this.lastLintTimestamp > 0) {
+        console.debug('AutoMaintain: No source changes since last lint, skipping');
+        return;
+      }
 
-    const texts = TEXTS[this.settings.language];
-    new Notice(texts.scheduledLintRunning, NOTICE_SHORT);
-    this.lastLintTimestamp = Date.now();
+      const texts = TEXTS[this.settings.language];
+      new Notice(texts.scheduledLintRunning, NOTICE_SHORT);
+      this.lastLintTimestamp = Date.now();
 
-    if (this.lintCallback) {
-      await this.lintCallback();
-    } else {
-      // Fallback: lightweight page count if no callback provided
-      const pages = await this.wikiEngine.getExistingWikiPages();
-      const entities = pages.filter(p => p.path.includes('/entities/')).length;
-      const concepts = pages.filter(p => p.path.includes('/concepts/')).length;
-      const sources = pages.filter(p => p.path.includes('/sources/')).length;
+      if (this.lintCallback) {
+        await this.lintCallback();
+      } else {
+        // Fallback: lightweight page count if no callback provided
+        const pages = await this.wikiEngine.getExistingWikiPages();
+        const entities = pages.filter(p => p.path.includes('/entities/')).length;
+        const concepts = pages.filter(p => p.path.includes('/concepts/')).length;
+        const sources = pages.filter(p => p.path.includes('/sources/')).length;
 
-      new Notice(
-        texts.wikiLintStats
-          .replace('{pages}', String(pages.length))
-          .replace('{entities}', String(entities))
-          .replace('{concepts}', String(concepts))
-          .replace('{sources}', String(sources)),
-        5000
-      );
+        new Notice(
+          texts.wikiLintStats
+            .replace('{pages}', String(pages.length))
+            .replace('{entities}', String(entities))
+            .replace('{concepts}', String(concepts))
+            .replace('{sources}', String(sources)),
+          5000
+        );
+      }
+    } finally {
+      this.lintRunning = false;
     }
   }
 
@@ -337,8 +389,11 @@ export class AutoMaintainManager {
   // All operations are read-only unless a file actually needs fixing.
 
   async runStartupCheck(): Promise<void> {
-    // Wait for vault to settle after startup
-    await new Promise(resolve => window.setTimeout(resolve, 3000));
+    const generation = this.lifecycleGeneration;
+    // Wait for vault to settle after startup. This timer is explicitly owned
+    // so onunload/saveSettings can cancel it instead of resuming stale work.
+    const settled = await this.waitForStartupSettle(generation);
+    if (!settled || generation !== this.lifecycleGeneration) return;
 
     const texts = TEXTS[this.settings.language];
     console.debug('[QuickFixes] ===== Startup quick fixes START =====');
@@ -366,7 +421,7 @@ export class AutoMaintainManager {
         // Fire-and-forget. The user gets a separate Notice when
         // the async creation completes; the startup-check summary
         // below is not blocked.
-        void this.createWelcomeNoteAsync(decision);
+        void this.createWelcomeNoteAsync(decision, generation);
       }
     } catch (e) {
       console.warn('[QuickFixes] Phase 0 failed:', e);
@@ -403,6 +458,7 @@ export class AutoMaintainManager {
     const sourcesPreserveCase = this.settings.slugCase === 'preserve';
     const { filesCleaned: sourcesFilesCleaned, entriesCleaned: sourcesEntriesCleaned } =
       await normalizeSourcesInFolder(this.app, wikiFolder, sourcesPreserveCase);
+    if (generation !== this.lifecycleGeneration) return;
 
     // ---- Phase 3: Incomplete-page cleanup (Issue #170) ----
     // Scan wiki/{entities,concepts,sources} for pages whose `generation_complete`
@@ -413,6 +469,7 @@ export class AutoMaintainManager {
     let incompleteFilesArchived = 0;
     try {
       const incomplete = await findIncompletePages(this.app, wikiFolder);
+      if (generation !== this.lifecycleGeneration) return;
       incompleteFilesScanned = incomplete.length;
       if (incomplete.length > 0) {
         incompleteFilesArchived = await cleanIncompletePages(this.app, incomplete);
@@ -426,6 +483,7 @@ export class AutoMaintainManager {
 
     // ---- Phase 4: Health summary (existing) ----
     const pages = await this.wikiEngine.getExistingWikiPages();
+    if (generation !== this.lifecycleGeneration) return;
     const entities = pages.filter(p => p.path.includes('/entities/')).length;
     const concepts = pages.filter(p => p.path.includes('/concepts/')).length;
     const sources = pages.filter(p => p.path.includes('/sources/')).length;
@@ -442,6 +500,7 @@ export class AutoMaintainManager {
     try {
       const logPath = `${wikiFolder}/log.md`;
       const existingLog = await this.wikiEngine.tryReadFile(logPath);
+      if (generation !== this.lifecycleGeneration) return;
       const lang = this.settings.language;
       if (existingLog && needsLogHeaderMigration(existingLog, lang)) {
         const migrated = migrateLogHeader(existingLog, lang);
@@ -520,6 +579,25 @@ export class AutoMaintainManager {
 
   // === Phase 0: Onboarding Welcome Note (v1.23.0) ===
 
+  private waitForStartupSettle(generation: number): Promise<boolean> {
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = (ready: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (this.startupTimer !== null) {
+          this.clearTrackedTimeout(this.startupTimer);
+          this.startupTimer = null;
+        }
+        if (this.startupCancel === cancel) this.startupCancel = null;
+        resolve(ready && generation === this.lifecycleGeneration);
+      };
+      const cancel = () => finish(false);
+      this.startupCancel = cancel;
+      this.startupTimer = this.setTrackedTimeout(() => finish(true), 3000);
+    });
+  }
+
   /**
    * Phase 0a of runStartupCheck. **SYNC — returns a decision without
    * any I/O or LLM call.** The caller uses this to decide whether
@@ -571,7 +649,8 @@ export class AutoMaintainManager {
    * the user sees the outcome without having to wait for the
    * summary Notice.
    */
-  private async createWelcomeNoteAsync(decision: { tier: string }): Promise<void> {
+  private async createWelcomeNoteAsync(decision: { tier: string }, generation: number): Promise<void> {
+    if (generation !== this.lifecycleGeneration) return;
     console.debug(`[QuickFixes] Phase 0b: starting async Welcome creation (tier=${decision.tier})`);
     // Fire a "generating" Notice so the user knows the work is in
     // progress (vs. silently failing). Use NOTICE_NORMAL (5s) so it
@@ -582,6 +661,7 @@ export class AutoMaintainManager {
 
     try {
       const result = await this.runOnboardingPhase();
+      if (generation !== this.lifecycleGeneration) return;
       console.debug(`[QuickFixes] Phase 0b: runOnboardingPhase returned. welcomeNotePath=${result.welcomeNotePath ?? 'NONE'}, tier=${result.tier}, shouldCreateWelcomeNote=${result.action.shouldCreateWelcomeNote}, localizeResult.localized=${result.localizeResult?.localized ?? 'n/a'}, localizeResult.error=${result.localizeResult?.error ?? 'n/a'}`);
       if (result.welcomeNotePath) {
         const okMsg = TEXTS[this.settings.language].welcomeNoteRecreated
@@ -747,9 +827,22 @@ export class AutoMaintainManager {
   // === Full Stop ===
 
   stop(): void {
+    this.lifecycleGeneration++;
+    this.startupCancel?.();
+    this.startupCancel = null;
+    if (this.startupTimer !== null) {
+      this.clearTrackedTimeout(this.startupTimer);
+      this.startupTimer = null;
+    }
     this.stopWatching();
     this.clearPeriodicLint();
     this.clearDebounce();
     this.pendingFiles.clear();
+    this.recentWrites.clear();
+    this.lastSeenPaths.clear();
+    for (const timer of this.trackedTimeouts) window.clearTimeout(timer);
+    this.trackedTimeouts.clear();
+    if (this.wikiEngine.isIngesting?.()) this.wikiEngine.cancelIngestion?.();
+    if (this.wikiEngine.isLintRunning?.()) this.wikiEngine.cancelLint?.();
   }
 }

@@ -21,6 +21,15 @@ function makePageMap(entries: Record<string, string>): Map<string, ScannerPage> 
   return m;
 }
 
+function generatedSourcePage(
+  rawPath: string,
+  body: string,
+  type = 'source',
+  generatedPath = 'wiki/sources/article.md',
+): [string, string] {
+  return [generatedPath, `---\ntype: ${type}\nsource_file: "[[${rawPath}]]"\n---\n\n# Article\n\n${body}`];
+}
+
 describe('scanQuoteGrounding', () => {
   it('returns empty when there are no wiki pages', () => {
     const result = scanQuoteGrounding(new Map(), new Map(), 'wiki');
@@ -39,10 +48,12 @@ describe('scanQuoteGrounding', () => {
 
   it('passes a quote that exists verbatim in the linked source', () => {
     const pages = makePageMap({
-      'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "the quick brown fox" — [[sources/article]]`,
+      'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "The quick brown fox" — [[sources/article]]`,
+      [generatedSourcePage('notes/article.md', 'generated summary only')[0]]: generatedSourcePage('notes/article.md', 'generated summary only')[1],
     });
     const sources = makeSourceMap({
-      'wiki/sources/article.md': `# Article\n\nThe quick brown fox jumps over the lazy dog.`,
+      'wiki/sources/article.md': generatedSourcePage('notes/article.md', 'generated summary only')[1],
+      'notes/article.md': `---\nkind: note\n---\n\nThe quick brown fox jumps over the lazy dog.`,
     });
     expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
   });
@@ -50,9 +61,11 @@ describe('scanQuoteGrounding', () => {
   it('flags a quote that does not exist in the linked source', () => {
     const pages = makePageMap({
       'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "this sentence is fabricated" — [[sources/article]]`,
+      [generatedSourcePage('notes/article.md', 'generated summary only')[0]]: generatedSourcePage('notes/article.md', 'generated summary only')[1],
     });
     const sources = makeSourceMap({
-      'wiki/sources/article.md': `# Article\n\nThe quick brown fox jumps over the lazy dog.`,
+      'wiki/sources/article.md': generatedSourcePage('notes/article.md', 'generated summary only')[1],
+      'notes/article.md': `# Article\n\nThe quick brown fox jumps over the lazy dog.`,
     });
     const result = scanQuoteGrounding(pages, sources, 'wiki');
     expect(result).toHaveLength(1);
@@ -112,12 +125,12 @@ describe('scanQuoteGrounding', () => {
     });
   });
 
-  it('normalizes quotes for case and punctuation (Tier 2)', () => {
+  it('normalizes quotes for case and punctuation on direct raw-note links (Tier 2)', () => {
     const pages = makePageMap({
-      'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "The Quick Brown Fox!" — [[sources/article]]`,
+      'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "The Quick Brown Fox!" — [[notes/article]]`,
     });
     const sources = makeSourceMap({
-      'wiki/sources/article.md': `# Article\n\nthe quick brown fox jumps over the lazy dog`,
+      'notes/article.md': `# Article\n\nthe quick brown fox jumps over the lazy dog`,
     });
     expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
   });
@@ -189,5 +202,195 @@ describe('scanQuoteGrounding', () => {
       'notes/source.md': `# Source\n\npresent`,
     });
     expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
+  });
+
+  it.each(['', '   '])('flags an empty or whitespace-only linked quote (%j)', (rawQuote) => {
+    const pages = makePageMap({
+      'wiki/entities/Foo.md': `# Foo\n\n## Mentions in Source\n- "${rawQuote}" — [[notes/article]]`,
+    });
+    const sources = makeSourceMap({
+      'notes/article.md': '# Article\n\nA real source sentence.',
+    });
+    const result = scanQuoteGrounding(pages, sources, 'wiki');
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      pagePath: 'wiki/entities/Foo.md',
+      quote: '',
+      hasSourceLink: true,
+    });
+  });
+
+  it('grounds a sources link only through its generated source page and raw source_file note', () => {
+    const [generatedPath, generated] = generatedSourcePage(
+      'notes/article.md',
+      'The projection summary repeats the quote but is not authoritative.',
+    );
+    const pages = makePageMap({
+      'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "raw quote" — [[sources/article]]',
+      [generatedPath]: generated,
+    });
+    const sources = makeSourceMap({
+      [generatedPath]: generated,
+      'notes/article.md': '# Raw note\n\nraw quote',
+    });
+    expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
+  });
+
+  it('matches contiguous multiline raw body text and does not use generated projection text', () => {
+    const [generatedPath, generated] = generatedSourcePage('notes/article.md', 'line one\nline two');
+    const pages = makePageMap({
+      'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "line one\nline two" — [[sources/article]]',
+      [generatedPath]: generated,
+    });
+    const sources = makeSourceMap({
+      [generatedPath]: generated,
+      'notes/article.md': '---\nkind: note\n---\n\nline one\nline two',
+    });
+    expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
+  });
+
+  it('accepts an omission marker only when that marker is literal raw text', () => {
+    const [generatedPath, generated] = generatedSourcePage('notes/article.md', 'projection');
+    const pages = makePageMap({
+      'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "before [...] after" — [[sources/article]]',
+      [generatedPath]: generated,
+    });
+    const sources = makeSourceMap({
+      [generatedPath]: generated,
+      'notes/article.md': 'before [...] after',
+    });
+    expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
+  });
+
+  it('supports legacy grouped blockquote mentions with multiline quotes', () => {
+    const [generatedPath, generated] = generatedSourcePage('notes/article.md', 'projection');
+    const pages = makePageMap({
+      'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n> **Source: [[sources/article|Article]]**\n> - "line one\n> line two"',
+      [generatedPath]: generated,
+    });
+    const sources = makeSourceMap({
+      [generatedPath]: generated,
+      'notes/article.md': 'line one\nline two',
+    });
+    expect(scanQuoteGrounding(pages, sources, 'wiki')).toEqual([]);
+  });
+
+  it.each([
+    ['missing generated page', () => ({
+      pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]' }),
+      sources: makeSourceMap({ 'notes/article.md': 'quote' }),
+    })],
+    ['generated page has wrong type', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'quote', 'entity');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'quote' }),
+      };
+    }],
+    ['generated page omits source_file', () => {
+      const path = 'wiki/sources/article.md';
+      const content = '---\ntype: source\n---\n\nprojection quote';
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'quote' }),
+      };
+    }],
+    ['source_file is not one complete wikilink', () => {
+      const path = 'wiki/sources/article.md';
+      const content = '---\ntype: source\nsource_file: notes/article.md\n---\n\nprojection quote';
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'quote' }),
+      };
+    }],
+    ['source_file has multiple links', () => {
+      const path = 'wiki/sources/article.md';
+      const content = '---\ntype: source\nsource_file: "[[notes/a.md]] and [[notes/b.md]]"\n---\n\nprojection quote';
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/a.md': 'quote', 'notes/b.md': 'quote' }),
+      };
+    }],
+    ['source_file raw note is missing', () => {
+      const [path, content] = generatedSourcePage('notes/missing.md', 'projection quote');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content }),
+      };
+    }],
+    ['source_file resolves ambiguously by path casing', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'projection quote');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'quote', 'notes/ARTICLE.md': 'quote' }),
+      };
+    }],
+    ['source_file points at a generated page', () => {
+      const path = 'wiki/sources/article.md';
+      const content = '---\ntype: source\nsource_file: "[[wiki/sources/other]]"\n---\n\nprojection quote';
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'wiki/sources/other.md': 'quote' }),
+      };
+    }],
+    ['basename fallback is refused', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'quote', 'source', 'wiki/sources/article_version.md');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'quote' }),
+      };
+    }],
+    ['version fallback is refused', () => {
+      const [path, content] = generatedSourcePage('notes/article_v2.md', 'quote', 'source', 'wiki/sources/article_v2.md');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article_v2.md': 'quote' }),
+      };
+    }],
+    ['projection-only quote is not raw grounding', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'quote');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'different raw text' }),
+      };
+    }],
+    ['case normalization is not generated-source grounding', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'projection');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "QUOTE" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'quote' }),
+      };
+    }],
+    ['punctuation normalization is not raw grounding', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'projection');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote!" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'quote' }),
+      };
+    }],
+    ['quote in raw frontmatter is not body grounding', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'projection');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': '---\nquote: quote\n---\n\nother body' }),
+      };
+    }],
+    ['ellipsis omission is not inferred', () => {
+      const [path, content] = generatedSourcePage('notes/article.md', 'projection');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "before [...] after" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/article.md': 'before and after' }),
+      };
+    }],
+    ['bound raw note wins over another raw note', () => {
+      const [path, content] = generatedSourcePage('notes/bound.md', 'projection');
+      return {
+        pages: makePageMap({ 'wiki/entities/Foo.md': '# Foo\n\n## Mentions in Source\n- "quote from another note" — [[sources/article]]', [path]: content }),
+        sources: makeSourceMap({ [path]: content, 'notes/bound.md': 'bound note', 'notes/other.md': 'quote from another note' }),
+      };
+    }],
+  ])('%s refuses unsafe projection grounding', (_name, build) => {
+    const fixture = (build as () => { pages: Map<string, ScannerPage>; sources: Map<string, ScannerPage> })();
+    expect(scanQuoteGrounding(fixture.pages, fixture.sources, 'wiki')).toHaveLength(1);
   });
 });

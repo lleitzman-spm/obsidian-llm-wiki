@@ -76,6 +76,10 @@ export const queryLintCommands = {
 
   async lintWiki(this: QueryLintHost, trigger: 'auto' | 'manual' = 'manual'): Promise<void> {
     if (!this.requireLLMReady()) return;
+    // The engine owns the operation controllers, but this early guard keeps
+    // command re-entry and auto-tick overlap side-effect free. In particular,
+    // never replace the active AbortController with a second lint operation.
+    if (this.wikiEngine.isIngesting?.() || this.wikiEngine.isLintRunning?.()) return;
     const signal = this.wikiEngine.startLintOperation();
     try {
       await runLintWiki({

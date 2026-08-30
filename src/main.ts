@@ -112,7 +112,8 @@ export class LLMWikiPlugin extends Plugin {
         this.showProgressFor(ProgressScope.IngestAutoWatch, msg);
       },
       (report: IngestReport) => this.onIngestDoneDispatch(report),
-      (typeof activeWindow !== 'undefined' ? activeWindow.crypto : undefined)?.subtle
+      (typeof activeWindow !== 'undefined' ? activeWindow.crypto : undefined)?.subtle,
+      this.manifest.version
     );
 
     // #164: when an interactive ingest hits a duplicate, ask the user whether to

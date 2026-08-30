@@ -41,6 +41,35 @@ interface AliasTargetIndex {
 }
 
 /**
+ * Extract the page target from a wikilink while preserving literal `#`
+ * characters in known page paths.
+ *
+ * Obsidian uses `#` for heading fragments, but it is also a valid character
+ * in a page filename. Prefer the complete path when it is a known target;
+ * otherwise retain the historical fragment behavior and use the portion
+ * before the first `#`. This is deliberately lookup-based: no rename or
+ * slug semantics are inferred for an unknown target.
+ */
+function resolveWikiLinkTarget(
+  rawTarget: string,
+  knownTargets: Set<string>,
+  knownTargetsLower: Set<string>,
+): string | undefined {
+  const pipeIndex = rawTarget.indexOf('|');
+  const path = (pipeIndex >= 0 ? rawTarget.slice(0, pipeIndex) : rawTarget).trim();
+  if (!path) return undefined;
+
+  if (knownTargets.has(path) || knownTargetsLower.has(path.toLowerCase())) {
+    return path;
+  }
+
+  const fragmentIndex = path.indexOf('#');
+  if (fragmentIndex < 0) return path;
+  const pageTarget = path.slice(0, fragmentIndex).trim();
+  return pageTarget || undefined;
+}
+
+/**
  * Build the alias index used by the programmatic dead-link scanner.
  *
  * `buildKnownTargets` deliberately indexes filesystem names only. Generated
@@ -216,11 +245,12 @@ export function scanDeadLinks(
   // pages intentionally stays (different source pages should each list the
   // missing targets they reference, so users can see which sources are affected).
   const seen = new Set<string>();
-  const linkRegex = /\[\[([^\]|#]+)(?:[|#][^\]]+)?\]\]/g;
+  const linkRegex = /\[\[([^\]]+)\]\]/g;
   for (const { path, content } of pageMap.values()) {
     let match: RegExpExecArray | null;
     while ((match = linkRegex.exec(content)) !== null) {
-      const target = match[1].trim();
+      const target = resolveWikiLinkTarget(match[1], knownTargets, knownTargetsLower);
+      if (!target) continue;
       const targetLower = target.toLowerCase();
       if (!knownTargets.has(target) && !knownTargetsLower.has(targetLower)) {
         // Slug-normalized fallback: "entities/Claude Code" matches "entities/Claude-Code"
@@ -252,12 +282,16 @@ export function scanOrphans(
   wikiFolder: string
 ): string[] {
   const incomingLinks = new Map<string, string[]>();
-  const linkRegex = /\[\[([^\]|#]+)(?:[|#][^\]]+)?\]\]/g;
+  const { known, knownLower } = buildKnownTargets(
+    [...pageMap.values()].map(({ basename, path }) => ({ basename, path }))
+  );
+  const linkRegex = /\[\[([^\]]+)\]\]/g;
   for (const { path, content } of pageMap.values()) {
     const sourceRel = path.replace(wikiFolder + '/', '').replace('.md', '');
     let match: RegExpExecArray | null;
     while ((match = linkRegex.exec(content)) !== null) {
-      const target = match[1].trim();
+      const target = resolveWikiLinkTarget(match[1], known, knownLower);
+      if (!target) continue;
       if (!incomingLinks.has(target)) incomingLinks.set(target, []);
       incomingLinks.get(target)!.push(sourceRel);
     }
@@ -293,8 +327,8 @@ export interface QuoteGroundingIssue {
 
 /**
  * Split a link target into its path-without-`.md` and a flag indicating
- * whether the original ended in `.md`. Used by the Mentions scanner to
- * support both `[[path/to/note]]` and `[[path/to/note.md]]` forms.
+ * whether the original ended in `.md`. Used by the direct raw-note path
+ * compatibility branch below.
  */
 function splitMdExtension(target: string): { basePath: string; hasMd: boolean } {
   if (target.endsWith('.md')) {
@@ -312,18 +346,128 @@ function extractMentionsSection(content: string, mentionsLabel: string): string 
 }
 
 function extractSourceBody(content: string): string {
-  // Strip YAML frontmatter.
-  return content.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  // Strip YAML frontmatter while preserving the raw body byte-for-byte.
+  // Both LF and CRLF vault files are valid input.
+  return content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
+}
+
+/**
+ * Projection/model output sometimes uses an omission marker in place of
+ * source text. Such a marker is evidence only when the exact marker is
+ * literally present in the raw source body; normalized matching must never
+ * turn it into a passing quote.
+ */
+function containsOmissionMarker(quote: string): boolean {
+  return /(?:\.\.\.|…|\[\s*(?:omitted|truncated|redacted)[^\]]*\]|\b(?:omitted|truncated|redacted)\b)/iu.test(quote);
+}
+
+function quoteMatchesBody(
+  quote: string,
+  body: string,
+  allowNormalizedMatch: boolean,
+): boolean {
+  if (containsOmissionMarker(quote)) return body.includes(quote);
+  return allowNormalizedMatch ? isQuoteGrounded(quote, body) : body.includes(quote);
+}
+
+function normalizePath(path: string): string {
+  return path.replaceAll('\\', '/');
+}
+
+function generatedSourcePagePath(target: string, wikiFolder: string): string | undefined {
+  const normalizedTarget = normalizePath(target.trim());
+  const folderPrefix = `${normalizePath(wikiFolder).replace(/\/$/, '')}/sources/`;
+  let slug: string | undefined;
+  if (normalizedTarget.startsWith('sources/')) {
+    slug = normalizedTarget.slice('sources/'.length);
+  } else if (normalizedTarget.startsWith(folderPrefix)) {
+    slug = normalizedTarget.slice(folderPrefix.length);
+  } else {
+    return undefined;
+  }
+  if (!slug) return undefined;
+  return `${folderPrefix}${slug.replace(/\.md$/i, '')}.md`;
+}
+
+function uniqueByPath(pages: ScannerPage[]): ScannerPage[] {
+  const byPath = new Map<string, ScannerPage>();
+  for (const page of pages) byPath.set(normalizePath(page.path), page);
+  return [...byPath.values()];
+}
+
+/**
+ * Resolve a generated source page and its raw source note fail-closed.
+ *
+ * A `sources/...` citation is a projection reference, not a raw-note path:
+ * it must identify exactly one generated page with `type: source`, and that
+ * page must identify exactly one raw note through `source_file`. No basename,
+ * version, or "any source" fallback is allowed here.
+ */
+function resolveGeneratedSource(
+  target: string,
+  wikiFolder: string,
+  pageMap: Map<string, ScannerPage>,
+  sourceMap: Map<string, ScannerPage>,
+): { generatedPath: string; rawSource?: ScannerPage } {
+  const generatedPath = generatedSourcePagePath(target, wikiFolder);
+  if (!generatedPath) return { generatedPath: target };
+
+  const targetKey = normalizePath(generatedPath).toLowerCase();
+  const generatedPages = uniqueByPath(
+    [...pageMap.values(), ...sourceMap.values()].filter(page =>
+      normalizePath(page.path).toLowerCase() === targetKey
+    )
+  );
+  if (generatedPages.length !== 1) return { generatedPath };
+
+  const generated = generatedPages[0];
+  const frontmatter = parseFrontmatter(generated.content);
+  if (frontmatter?.type !== 'source' || typeof frontmatter.source_file !== 'string') {
+    return { generatedPath };
+  }
+
+  const sourceFileValue = frontmatter.source_file.trim();
+  const sourceLinks = [...sourceFileValue.matchAll(/\[\[([^\]]+)\]\]/g)];
+  if (sourceLinks.length > 1) return { generatedPath };
+
+  // Generated source pages use exactly one complete wikilink. A scalar or a
+  // value with surrounding text is not an auditable raw-note binding.
+  const rawTarget = sourceLinks.length === 1 && sourceLinks[0][0] === sourceFileValue
+    ? sourceLinks[0][1].split('|')[0].trim()
+    : '';
+  if (!rawTarget) return { generatedPath };
+
+  const { basePath, hasMd } = splitMdExtension(normalizePath(rawTarget));
+  const candidates = new Set<string>([
+    normalizePath(rawTarget),
+    hasMd ? basePath : `${basePath}.md`,
+  ]);
+  const rawMatches = uniqueByPath(
+    [...sourceMap.values()].filter(page => {
+      const path = normalizePath(page.path);
+      return [...candidates].some(candidate => path.toLowerCase() === candidate.toLowerCase());
+    })
+  );
+  if (rawMatches.length !== 1) return { generatedPath };
+
+  const rawPrefix = `${normalizePath(wikiFolder).replace(/\/$/, '')}/sources/`.toLowerCase();
+  if (normalizePath(rawMatches[0].path).toLowerCase().startsWith(rawPrefix)) {
+    return { generatedPath };
+  }
+  return { generatedPath, rawSource: rawMatches[0] };
 }
 
 /**
  * Issue #126: programmatic quote-grounding audit. Verifies that every quote
- * listed under a page's `## Mentions in Source` section can be found in the
- * linked (or, for legacy bare quotes, any) source file.
+ * listed under a page's `## Mentions in Source` section can be found in its
+ * source. `[[sources/...]]` is resolved through one generated `type: source`
+ * page and one uniquely resolved `source_file` raw note. Legacy direct raw
+ * note links and bare quotes retain their historical behavior.
  *
- * Two tolerance tiers:
- *   1. Exact substring match against the source body.
- *   2. Normalized match (case-folded, punctuation stripped, whitespace collapsed).
+ * Generated source links use only a contiguous raw-body match after
+ * frontmatter. Direct raw-note links and legacy bare quotes retain the
+ * historical normalized compatibility match, except omission markers, which
+ * require an exact literal match.
  *
  * Mentions may have either of these forms:
  *   - "quote text" — [[sources/slug]]     (current format)
@@ -346,7 +490,7 @@ export function scanQuoteGrounding(
   // E2/E3: pre-build source-body lookup + pre-normalize once for legacy fallback.
   // Avoids re-stripping frontmatter per quote and re-normalizing per source per quote.
   const sourceBodyMap = new Map<string, string>();
-  const normalizedSourceBodies: string[] = [];
+  const legacySourceBodies: Array<{ body: string; normalized: string }> = [];
   const wikiSourcePrefix = `${wikiFolder}/sources/`.toLowerCase();
   for (const [p, s] of sourceMap) {
     const body = extractSourceBody(s.content);
@@ -355,7 +499,7 @@ export function scanQuoteGrounding(
     // widen the legacy bare-quote fallback. That fallback predates raw-note
     // provenance and is intentionally limited to generated wiki sources.
     if (p.toLowerCase().startsWith(wikiSourcePrefix)) {
-      normalizedSourceBodies.push(normalizeQuote(body));
+      legacySourceBodies.push({ body, normalized: normalizeQuote(body) });
     }
   }
 
@@ -365,33 +509,40 @@ export function scanQuoteGrounding(
     const mentionsBlock = extractMentionsSection(page.content, mentionsLabel);
     if (!mentionsBlock) continue;
 
-    // Match lines like: - "quote text" — [[sources/slug]]
-    // or legacy:        - "quote text"
-    const lineRegex = /^[-*]\s+"([^"]+)"(?:\s*[—-]\s*\[\[([^\]]+)\]\])?\s*$/gm;
+    // Match formatter bullets, including blockquote-prefixed legacy bullets
+    // and quote text that spans multiple physical lines. The closing quote
+    // must be followed by either a citation or the end of its bullet line.
+    const lineRegex = /^(?:>\s*)?[-*]\s+"([\s\S]*?)"\s*(?:[—-]\s*\[\[([^\]]+)\]\])?[ \t]*$/gm;
     let match: RegExpExecArray | null;
     while ((match = lineRegex.exec(mentionsBlock)) !== null) {
-      const quote = match[1].trim();
-      const linkTarget = match[2]?.trim();
+      const isBlockquote = match[0].trimStart().startsWith('>');
+      const quote = (isBlockquote ? match[1].replace(/\r?\n>\s?/g, '\n') : match[1]).trim();
+      // Keep this as a string so grouped-header lookup cannot leak an
+      // optional `string | undefined` into the citation branch below.
+      let linkTarget = match[2]?.trim() ?? '';
+
+      // Older generated pages grouped blockquote bullets beneath a source
+      // header instead of repeating the citation on every bullet. Preserve
+      // that shape while still routing a grouped `sources/...` link through
+      // the strict generated-page contract.
+      if (!linkTarget && isBlockquote) {
+        const headers = [...mentionsBlock
+          .slice(0, match.index)
+          .matchAll(/^>\s*\**[^"\n]*\[\[([^\]]+)\]\]\s*\**\s*$/gm)];
+        const lastHeader = headers.at(-1);
+        if (lastHeader?.[1]) linkTarget = lastHeader[1].trim();
+      }
 
       if (linkTarget) {
         // Strip any display-name suffix: [[path|name]] → path
         const bareTarget = linkTarget.split('|')[0].trim();
-        // Current format: exact source link. Three supported target forms:
-        //   1. wiki/sources/<slug>     → resolvedPath = `wiki/sources/<slug>.md`
-        //      (legacy: `sources/<slug>` form was prepended with wikiFolder;
-        //      preserve this for the existing call sites and tests).
-        //   2. <raw-note-path>          → look up by raw vault path
-        //      (Issue #244 — Mentions citations link to the original source
-        //      note, which lives outside the wiki/ folder).
         let source: ScannerPage | undefined;
         let resolvedPath: string;
-
-        const sourcesPrefix = wikiFolder + '/sources/';
-        if (bareTarget.startsWith('sources/') || bareTarget.startsWith(sourcesPrefix)) {
-          // Legacy wiki-internal sources/ path. Always prepend wikiFolder.
-          const slug = bareTarget.replace(/^sources\//, '').replace(/^wiki\/sources\//, '');
-          resolvedPath = `${wikiFolder}/sources/${slug}.md`;
-          source = sourceMap.get(resolvedPath);
+        const generatedPath = generatedSourcePagePath(bareTarget, wikiFolder);
+        if (generatedPath) {
+          const resolved = resolveGeneratedSource(bareTarget, wikiFolder, pageMap, sourceMap);
+          resolvedPath = resolved.generatedPath;
+          source = resolved.rawSource;
         } else {
           // Raw-note path. Try as-is, with and without .md.
           const { basePath, hasMd } = splitMdExtension(bareTarget);
@@ -411,7 +562,12 @@ export function scanQuoteGrounding(
         }
 
         const body = source ? sourceBodyMap.get(source.path) ?? '' : '';
-        const grounded = body ? isQuoteGrounded(quote, body) : false;
+        // Generated source pages are projection metadata only; never ground a
+        // quote against their summary body. Their raw note is the sole source
+        // of truth and requires a contiguous match after frontmatter.
+        // `String.prototype.includes('')` is true. An empty or whitespace-only
+        // citation is never grounded, even when a linked body exists.
+        const grounded = quote.length > 0 && body.length > 0 && quoteMatchesBody(quote, body, !generatedPath);
         if (!grounded) {
           issues.push({
             pagePath: path,
@@ -425,7 +581,9 @@ export function scanQuoteGrounding(
         // E3: pre-normalized once, so this is O(Q) not O(Q*S).
         const normalizedQuote = normalizeQuote(quote);
         const grounded = normalizedQuote.length > 0 &&
-          normalizedSourceBodies.some(nb => nb.includes(normalizedQuote));
+          legacySourceBodies.some(source => containsOmissionMarker(quote)
+            ? source.body.includes(quote)
+            : source.normalized.includes(normalizedQuote));
         if (!grounded) {
           issues.push({
             pagePath: path,

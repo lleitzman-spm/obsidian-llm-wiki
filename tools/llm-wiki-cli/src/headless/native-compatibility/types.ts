@@ -109,6 +109,22 @@ export interface NativeMergeInput {
   readonly mode: NativeMergeMode;
   /** Optional model body for comparison only; it is not trusted as native output. */
   readonly proposedBody?: string;
+  /**
+   * A provider response already bound to the native existing-page route.
+   * The response is still passed through the native deterministic tail; it
+   * is never treated as a complete page or as trusted frontmatter.
+   */
+  readonly generatedContent?: string;
+  /** Native page type used by the body-merge post-processing seam. */
+  readonly pageType?: 'entity' | 'concept';
+  /** Native settings required for localized labels and link correction. */
+  readonly settings?: import('../../../../../src/types').LLMWikiSettings;
+  readonly sourceFileBasename?: string;
+  readonly relatedEntities?: readonly string[];
+  readonly relatedConcepts?: readonly string[];
+  readonly mentions?: readonly import('../../../../../src/types').MentionWithProvenance[] | readonly string[];
+  /** Existing page catalog captured by the host for native link correction. */
+  readonly existingPages?: readonly import('../../../../../src/core/related-link-corrector').ExistingPageRef[];
   readonly sourceSlug?: string;
   readonly slug?: NativeSourceSlugOptions;
 }

@@ -79,6 +79,30 @@ function makePage(path: string, title: string, body: string, aliases: string[] =
   };
 }
 
+function makeMetadataPage(
+  path: string,
+  title: string,
+  body: string,
+  metadata: {
+    type: 'entity' | 'concept' | 'source';
+    aliases?: string[];
+    sources?: string[];
+    tags?: string[];
+    contentHash?: string;
+  },
+): { path: string; content: string; title: string } {
+  const lines = [
+    '---',
+    `type: ${metadata.type}`,
+    ...(metadata.aliases ? [`aliases: ${JSON.stringify(metadata.aliases)}`] : []),
+    ...(metadata.sources ? [`sources: ${JSON.stringify(metadata.sources)}`] : []),
+    ...(metadata.tags ? [`tags: ${JSON.stringify(metadata.tags)}`] : []),
+    ...(metadata.contentHash ? [`contentHash: ${metadata.contentHash}`] : []),
+    '---',
+  ];
+  return { path, title, content: `${lines.join('\n')}\n${body}` };
+}
+
 /**
  * Filter candidates to the (pathA, pathB) pair under test, ignoring
  * pair-order. Returns the matched candidate or null.
@@ -175,6 +199,188 @@ describe('generateDuplicateCandidates — threshold overrides', () => {
     const withoutOptions = await generateDuplicateCandidates([a, b]);
     expect(withOptions).toEqual(withoutOptions);
   });
+
+  it('does not treat a narrow title as a duplicate of a broader title on title overlap alone', async () => {
+    const narrow = makePage(
+      'wiki/concepts/standing-approval-for-preventive-maintenance-programmes.md',
+      'Standing Approval for Preventive Maintenance Programmes',
+      'A governance workflow records approval boundaries for recurring work. See [[maintenance-hub]].',
+    );
+    const broad = makePage(
+      'wiki/concepts/preventative-maintenance.md',
+      'Preventative Maintenance',
+      'A facilities guide describes inspection intervals for equipment and seasonal servicing. See [[maintenance-hub]].',
+    );
+
+    const candidates = await generateDuplicateCandidates([narrow, broad]);
+
+    expect(findCandidate(candidates, narrow.path, broad.path)).toBeNull();
+  });
+});
+
+describe('generateDuplicateCandidates — semantic audit guards', () => {
+  it('refuses source versions when bodies or declared content hashes differ', async () => {
+    const versionA = makeMetadataPage(
+      'wiki/sources/policy.md',
+      'Policy Bulletin',
+      'Version one defines the original approval timeline.',
+      { type: 'source', contentHash: 'declared-version-a' },
+    );
+    const versionB = makeMetadataPage(
+      'wiki/sources/policy-revised.md',
+      'Policy Bulletin',
+      'Version two changes the approval timeline and expiration rule.',
+      { type: 'source', contentHash: 'declared-version-b' },
+    );
+    expect(findCandidate(
+      await generateDuplicateCandidates([versionA, versionB]),
+      versionA.path,
+      versionB.path,
+    )).toBeNull();
+
+    const sameBodyA = makeMetadataPage(
+      'wiki/sources/policy-copy-a.md',
+      'Policy Copy',
+      'The same source body is copied here.',
+      { type: 'source', contentHash: 'declared-hash-a' },
+    );
+    const sameBodyB = makeMetadataPage(
+      'wiki/sources/policy-copy-b.md',
+      'Policy Copy',
+      'The same source body is copied here.',
+      { type: 'source', contentHash: 'declared-hash-b' },
+    );
+    expect(findCandidate(
+      await generateDuplicateCandidates([sameBodyA, sameBodyB]),
+      sameBodyA.path,
+      sameBodyB.path,
+    )).toBeNull();
+  });
+
+  it('preserves a same-type alias duplicate when provenance overlaps as a source union', async () => {
+    const a = makeMetadataPage(
+      'wiki/concepts/month-to-month-tenancy.md',
+      'Month-to-Month Tenancy',
+      'A tenancy renews monthly under the recurring lease policy.',
+      { type: 'concept', aliases: ['Monthly Tenancy'], sources: ['[[sources/lease-policy]]'], tags: ['lease'] },
+    );
+    const b = makeMetadataPage(
+      'wiki/concepts/monthly-tenancy.md',
+      'Month to Month Tenancy',
+      'The monthly lease arrangement renews without a fixed end date.',
+      { type: 'concept', aliases: ['Monthly Tenancy'], sources: ['[[sources/lease-policy]]', '[[sources/state-guide]]'], tags: ['lease'] },
+    );
+    const candidate = findCandidate(
+      await generateDuplicateCandidates([a, b]),
+      a.path,
+      b.path,
+    );
+    expect(candidate).not.toBeNull();
+    expect(candidate!.signal).toBe('crossLang');
+  });
+
+  it('refuses graph/title matches with disjoint provenance', async () => {
+    const a = makeMetadataPage(
+      'wiki/concepts/rent2wealth.md',
+      'Rent2Wealth',
+      'A property income strategy uses rent, property, and cashflow planning. See [[property-hub]].',
+      { type: 'concept', sources: ['[[sources/investor-brief]]'], tags: ['investment'] },
+    );
+    const b = makeMetadataPage(
+      'wiki/concepts/rental-wealth-strategy.md',
+      'Rental Wealth Strategy',
+      'A property management workflow uses rent, property, and maintenance planning. See [[property-hub]].',
+      { type: 'concept', sources: ['[[sources/operations-guide]]'], tags: ['operations'] },
+    );
+    expect(findCandidate(
+      await generateDuplicateCandidates([a, b]),
+      a.path,
+      b.path,
+    )).toBeNull();
+  });
+
+  it('refuses a statute section/subsection hierarchy match', async () => {
+    const section = makeMetadataPage(
+      'wiki/concepts/deposit-statute-section-1.md',
+      'Deposit Statute § 1',
+      'The statute establishes the deposit return deadline. See [[statute-hub]].',
+      { type: 'concept', sources: ['[[sources/state-statute]]'] },
+    );
+    const subsection = makeMetadataPage(
+      'wiki/concepts/deposit-statute-section-1a.md',
+      'Deposit Statute § 1(a)',
+      'The subsection adds a notice exception to the deposit return deadline. See [[statute-hub]].',
+      { type: 'concept', sources: ['[[sources/state-statute]]'] },
+    );
+    expect(findCandidate(
+      await generateDuplicateCandidates([section, subsection]),
+      section.path,
+      subsection.path,
+    )).toBeNull();
+  });
+
+  it('does not promote transitive incoming evidence without direct page evidence', async () => {
+    const a = makeMetadataPage(
+      'wiki/concepts/evidence-status.md',
+      'Evidence Status',
+      'The status records whether a claim is currently supported.',
+      { type: 'concept', sources: ['[[sources/status-a]]'] },
+    );
+    const b = makeMetadataPage(
+      'wiki/concepts/evidence-state.md',
+      'Evidence State',
+      'The state describes the review lifecycle of an item.',
+      { type: 'concept', sources: ['[[sources/status-b]]'] },
+    );
+    const incoming = new Map<string, string[]>([
+      ['wiki/sources/shared-index.md', [a.path, b.path]],
+    ]);
+    expect(findCandidate(
+      await generateDuplicateCandidates([a, b], {}, {}, incoming),
+      a.path,
+      b.path,
+    )).toBeNull();
+  });
+
+  it('refuses cross-register navigation/workflow pages with shared vocabulary', async () => {
+    const workflow = makeMetadataPage(
+      'wiki/entities/maintenance-workflow.md',
+      'Maintenance Workflow',
+      'The workflow documents approval, maintenance, inspection, and scheduling for property operations. See [[operations-hub]].',
+      { type: 'entity', tags: ['workflow'], sources: ['[[sources/operations-guide]]'] },
+    );
+    const concept = makeMetadataPage(
+      'wiki/concepts/maintenance.md',
+      'Maintenance',
+      'The concept describes approval, maintenance, inspection, and scheduling for property operations. See [[operations-hub]].',
+      { type: 'concept', tags: ['navigation'], sources: ['[[sources/operations-guide]]'] },
+    );
+    expect(findCandidate(
+      await generateDuplicateCandidates([workflow, concept]),
+      workflow.path,
+      concept.path,
+    )).toBeNull();
+  });
+
+  it('refuses disjoint register roles when links and body vocabulary overlap', async () => {
+    const owner = makeMetadataPage(
+      'wiki/entities/owner-silence.md',
+      'Owner Silence',
+      'Silence affects lease communication, notice timing, and follow-up. See [[lease-hub]].',
+      { type: 'entity', tags: ['owner'], sources: ['[[sources/owner-policy]]'] },
+    );
+    const resident = makeMetadataPage(
+      'wiki/entities/resident-silence.md',
+      'Resident Silence',
+      'Silence affects lease communication, notice timing, and escalation. See [[lease-hub]].',
+      { type: 'entity', tags: ['resident'], sources: ['[[sources/resident-policy]]'] },
+    );
+    expect(findCandidate(
+      await generateDuplicateCandidates([owner, resident]),
+      owner.path,
+      resident.path,
+    )).toBeNull();
+  });
 });
 
 // ── partitionPagesMultiBucket (v1.26.0 #382 item 3, Batch 1) ─────────────────
@@ -187,6 +393,9 @@ function makeMeta(overrides: Partial<{
   links: Set<string>;
   bodyWords: Set<string>;
   bodyFingerprint: string;
+  declaredContentHash: string;
+  provenance: Set<string>;
+  registers: Set<string>;
   incomingSources: Set<string>;
 }> = {}) {
   return {
@@ -201,6 +410,9 @@ function makeMeta(overrides: Partial<{
     // care about fingerprint behavior, so the default empty value keeps
     // these tests focused.
     bodyFingerprint: overrides.bodyFingerprint ?? '',
+    declaredContentHash: overrides.declaredContentHash ?? '',
+    provenance: overrides.provenance ?? new Set<string>(),
+    registers: overrides.registers ?? new Set<string>(),
     // v1.26.0 Batch 2: empty incoming sources is the legacy state
     // (Batch 1 callers don't populate it). sharedIncoming signal
     // skips pairs with either side empty.
@@ -463,7 +675,7 @@ describe('partitionPagesMultiBucket — ic: dimension', () => {
 // partition only groups pages by shared incoming source there).
 
 describe('generateDuplicateCandidates — sharedIncoming signal', () => {
-  it('two pages with identical incoming source sets in the same ic: bucket → tier-1 candidate', async () => {
+  it('refuses cross-register entity/concept pairs even with identical incoming source sets', async () => {
     // Both pages are cited by the same 3 sources. Jaccard = 3/3 = 1.0
     // — well above 0.3 threshold. They share a title prefix and a
     // common incoming source, so they land in the same ic: bucket.
@@ -483,10 +695,7 @@ describe('generateDuplicateCandidates — sharedIncoming signal', () => {
       [sourceC, [a.path, b.path]],
     ]);
     const candidates = await generateDuplicateCandidates([a, b], {}, {}, incomingIndex);
-    const cand = findCandidate(candidates, a.path, b.path);
-    expect(cand).not.toBeNull();
-    expect(cand!.signal).toBe('sharedIncoming');
-    expect(cand!.score).toBeGreaterThanOrEqual(0.9);
+    expect(findCandidate(candidates, a.path, b.path)).toBeNull();
   });
 
   it('two pages in same ic: bucket but ZERO incoming overlap → NOT a candidate', async () => {

@@ -170,3 +170,92 @@ describe('AutoMaintainManager.assessWelcomeNeed — sync tier decision (v1.23.0)
     expect(result).not.toHaveProperty('then');
   });
 });
+
+describe('AutoMaintainManager lifecycle ownership', () => {
+  function lifecycleManager(overrides: Partial<LLMWikiSettings> = {}) {
+    const settings = {
+      language: 'en',
+      autoWatchMode: 'notify',
+      autoWatchDebounceMs: 0,
+      watchedFolders: ['inbox'],
+      periodicLint: 'daily',
+      ...overrides,
+    } as unknown as LLMWikiSettings;
+    const events = {
+      on: vi.fn(() => ({})),
+      offref: vi.fn(),
+    };
+    const app = {
+      workspace: { onLayoutReady: (callback: () => void) => callback() },
+      vault: { ...events, getMarkdownFiles: () => [] },
+      metadataCache: events,
+    } as unknown as ConstructorParameters<typeof AutoMaintainManager>[0];
+    const wikiEngine = {
+      isLintRunning: vi.fn(() => false),
+      isIngesting: vi.fn(() => false),
+      getExistingWikiPages: vi.fn(async () => []),
+    } as unknown as WikiEngine;
+    const plugin = {
+      registerEvent: vi.fn(),
+      registerInterval: vi.fn(),
+      llmClient: null,
+    } as unknown as ConstructorParameters<typeof AutoMaintainManager>[3];
+    return { manager: new AutoMaintainManager(app, settings, wikiEngine, plugin), events, plugin };
+  }
+
+  it('detaches watcher listeners when stopped and does not duplicate them after restart', () => {
+    const { manager, events } = lifecycleManager();
+
+    manager.startWatching();
+    expect(events.on).toHaveBeenCalledTimes(4);
+    manager.stopWatching();
+    expect(events.offref).toHaveBeenCalledTimes(4);
+
+    manager.startWatching();
+    expect(events.on).toHaveBeenCalledTimes(8);
+  });
+
+  it('clears the owned periodic interval when settings are reloaded', () => {
+    vi.useFakeTimers();
+    try {
+      const { manager, plugin } = lifecycleManager();
+      manager.schedulePeriodicLint();
+      expect(plugin.registerInterval).toHaveBeenCalledTimes(1);
+      manager.clearPeriodicLint();
+      vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+      expect(plugin.registerInterval).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not re-enter a periodic lint while the prior callback is pending', async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      const callback = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+      const { manager } = lifecycleManager();
+      (manager as unknown as { lintCallback: () => Promise<void> }).lintCallback = callback;
+      (manager as unknown as { runLint: () => Promise<void> }).runLint();
+      (manager as unknown as { runLint: () => Promise<void> }).runLint();
+      expect(callback).toHaveBeenCalledTimes(1);
+      release();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels the tracked startup-settle timer on stop', async () => {
+    vi.useFakeTimers();
+    try {
+      const { manager } = lifecycleManager();
+      const startup = manager.runStartupCheck();
+      manager.stop();
+      await expect(startup).resolves.toBeUndefined();
+      vi.advanceTimersByTime(3001);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -31,6 +31,16 @@ import { TEXTS } from '../../texts';
 import { dedupPages } from './dedup-pages';
 import { buildLogHeader } from '../../core/log-header';
 import { formatBytes } from '../../core/format';
+import {
+  defaultRunId,
+  assertCanonicalContained,
+  canonicalVaultPath,
+  serializeLintReportArtifact,
+  sha256Utf8,
+  utf8ByteLength,
+  type Sha256Text,
+  type SerializedLintReportArtifact,
+} from './report-retention';
 
 /** Metrics suffix for ingest log H2 line. */
 export interface IngestMetrics {
@@ -46,6 +56,28 @@ export interface LogWriterOptions {
   readFile: (path: string) => Promise<string | null>;
   /** Write the full log content to the given path. */
   writeFile: (path: string, content: string) => Promise<void>;
+  /** Optional plugin version included in retained lint report artifacts. */
+  pluginVersion?: string;
+  /** Optional clock and run-id source for deterministic retention tests. */
+  now?: () => Date;
+  runIdFactory?: () => string;
+  sha256?: Sha256Text;
+  /** Separate archive write/read hooks permit immutable collision checks. */
+  readArchiveFile?: (path: string) => Promise<string | null>;
+  /** Create-only raw writer. It must not normalize/rewrite content. */
+  createArchiveFile?: (path: string, content: string) => Promise<void>;
+  ensureArchiveFolder?: (path: string) => Promise<void>;
+  /** Adapter/realpath resolver for reparse-point containment checks. */
+  resolveArchivePath?: (path: string) => Promise<string | null>;
+}
+
+function isCreateCollision(error: unknown): boolean {
+  const code = typeof error === 'object' && error !== null && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  if (code === 'EEXIST') return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /already exists|file exists|EEXIST/i.test(message);
 }
 
 export class LogWriter {
@@ -53,12 +85,30 @@ export class LogWriter {
   private readonly wikiLanguage: string;
   private readonly readFile: LogWriterOptions['readFile'];
   private readonly writeFile: LogWriterOptions['writeFile'];
+  private readonly pluginVersion: string | undefined;
+  private readonly now: () => Date;
+  private readonly runIdFactory: () => string;
+  private readonly sha256: Sha256Text;
+  private readonly readArchiveFile: NonNullable<LogWriterOptions['readArchiveFile']>;
+  private readonly createArchiveFile: NonNullable<LogWriterOptions['createArchiveFile']>;
+  private readonly ensureArchiveFolder: NonNullable<LogWriterOptions['ensureArchiveFolder']>;
+  private readonly resolveArchivePath: LogWriterOptions['resolveArchivePath'];
 
   constructor(opts: LogWriterOptions) {
     this.wikiFolder = opts.wikiFolder;
     this.wikiLanguage = opts.wikiLanguage;
     this.readFile = opts.readFile;
     this.writeFile = opts.writeFile;
+    this.pluginVersion = opts.pluginVersion;
+    this.now = opts.now ?? (() => new Date());
+    this.runIdFactory = opts.runIdFactory ?? defaultRunId;
+    this.sha256 = opts.sha256 ?? sha256Utf8;
+    this.readArchiveFile = opts.readArchiveFile ?? opts.readFile;
+    this.createArchiveFile = opts.createArchiveFile ?? (async () => {
+      throw new Error('Lint report retention requires a raw create-only archive writer');
+    });
+    this.ensureArchiveFolder = opts.ensureArchiveFolder ?? (async () => undefined);
+    this.resolveArchivePath = opts.resolveArchivePath;
   }
 
   /**
@@ -124,24 +174,131 @@ export class LogWriter {
       }
 
       // Cap at 512 KB to avoid Obsidian choking on multi-MB files.
-      const MAX_LOG_BYTES = 512 * 1024;
-      const projectedSize = (existingLog.length + entry.length) * 2; // UTF-16 estimate
-      if (projectedSize > MAX_LOG_BYTES) {
-        const headerEnd = existingLog.indexOf(LogWriter.HEADER_TERMINATOR);
-        const header = headerEnd > 0
-          ? existingLog.substring(0, headerEnd + LogWriter.HEADER_TERMINATOR.length)
-          : LogWriter.HEADER_FALLBACK;
-        const keepBytes = MAX_LOG_BYTES / 2;
-        const trimmed = existingLog.substring(existingLog.length - keepBytes);
-        const h2Idx = trimmed.indexOf('\n## ');
-        existingLog = header + (h2Idx > 0 ? trimmed.substring(h2Idx + 1) : trimmed);
-        console.warn(`[logLintFix] ${logPath} exceeded ${MAX_LOG_BYTES} bytes; trimmed oldest entries`);
-      }
-      await this.writeFile(logPath, existingLog + entry);
+      await this.writeBoundedLog(logPath, existingLog, entry);
     } catch (e) {
       console.error(`[logLintFix] failed to write ${logPath}:`, e);
       throw e; // re-throw so callers (e.g. runLintWiki) can surface the failure
     }
+  }
+
+  /**
+   * Persist a complete lint report before appending its bounded-log index
+   * entry. The archive is written first even when no trim is needed; if it
+   * fails, this method throws and the log is left untouched.
+   */
+  async appendLintReport(operation: string, report: string): Promise<SerializedLintReportArtifact> {
+    const logPath = `${this.wikiFolder}/log.md`;
+    const reportRoot = canonicalVaultPath(`${this.wikiFolder}/lint-reports`);
+    assertCanonicalContained(canonicalVaultPath(this.wikiFolder), reportRoot, 'Report archive root');
+    const now = this.now();
+    const timestamp = now.toISOString();
+    const displayDate = timestamp.slice(0, 10);
+    const displayTime = timestamp.slice(11, 16);
+    const resolveArchivePath = this.resolveArchivePath;
+    if (!resolveArchivePath) {
+      throw new Error('Lint report retention requires a canonical archive path resolver');
+    }
+    // Validate the log path before reading it and again immediately before the
+    // final write. The latter closes the same reparse/junction swap window as
+    // the archive create path.
+    await resolveArchivePath(logPath);
+    const priorLog = await this.readFile(logPath);
+    const existingLog = priorLog || buildLogHeader(this.wikiLanguage);
+    const rootAdapterPath = await resolveArchivePath(reportRoot);
+    if (!rootAdapterPath) throw new Error('Canonical archive path resolver returned no report root');
+
+    let retained: SerializedLintReportArtifact | null = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const runId = this.runIdFactory();
+      const candidate = await serializeLintReportArtifact({
+        timestamp,
+        runId,
+        pluginVersion: this.pluginVersion,
+        previousLog: priorLog ?? '',
+        report,
+        reportRoot,
+        sha256: this.sha256,
+      });
+      assertCanonicalContained(reportRoot, candidate.reportPath, 'Report artifact');
+      await this.ensureArchiveFolder(reportRoot);
+      const rootAfterFolder = await resolveArchivePath(reportRoot);
+      if (!rootAfterFolder) throw new Error('Canonical archive path resolver returned no report root after folder creation');
+      assertCanonicalContained(rootAdapterPath, rootAfterFolder, 'Report archive root');
+      assertCanonicalContained(rootAfterFolder, rootAdapterPath, 'Report archive root');
+      const candidateAdapterPath = await resolveArchivePath(candidate.reportPath);
+      if (!candidateAdapterPath) throw new Error('Canonical archive path resolver returned no report artifact');
+      assertCanonicalContained(rootAfterFolder, candidateAdapterPath, 'Report artifact');
+      if (await this.readArchiveFile(candidate.reportPath) !== null) continue;
+      // The create-only call is the destructive boundary: resolve both paths
+      // again immediately before it so a junction/reparse swap cannot move
+      // the write after the earlier containment check.
+      const rootBeforeCreate = await resolveArchivePath(reportRoot);
+      const candidateBeforeCreate = await resolveArchivePath(candidate.reportPath);
+      if (!rootBeforeCreate || !candidateBeforeCreate) throw new Error('Canonical archive path resolver lost report path before creation');
+      assertCanonicalContained(rootAfterFolder, rootBeforeCreate, 'Report archive root');
+      assertCanonicalContained(rootBeforeCreate, rootAfterFolder, 'Report archive root');
+      assertCanonicalContained(rootBeforeCreate, candidateBeforeCreate, 'Report artifact');
+      try {
+        await this.createArchiveFile(candidate.reportPath, candidate.content);
+      } catch (error) {
+        if (isCreateCollision(error)) continue;
+        throw error;
+      }
+      const rootAfterCreate = await resolveArchivePath(reportRoot);
+      const candidateAfterCreate = await resolveArchivePath(candidate.reportPath);
+      if (!rootAfterCreate || !candidateAfterCreate) throw new Error('Canonical archive path resolver lost report path after creation');
+      assertCanonicalContained(rootAdapterPath, rootAfterCreate, 'Report archive root');
+      assertCanonicalContained(rootAfterCreate, rootAdapterPath, 'Report archive root');
+      assertCanonicalContained(rootAfterCreate, candidateAfterCreate, 'Report artifact');
+      const persisted = await this.readArchiveFile(candidate.reportPath);
+      if (persisted !== candidate.content) {
+        throw new Error(`Lint report archive readback mismatch: ${candidate.reportPath}`);
+      }
+      if (await this.sha256(persisted) !== await this.sha256(candidate.content)) {
+        throw new Error(`Lint report archive hash mismatch: ${candidate.reportPath}`);
+      }
+      retained = candidate;
+      break;
+    }
+    if (!retained) throw new Error('Unable to allocate a collision-free lint report artifact ID');
+
+    // The complete report lives in the immutable artifact. The operation log
+    // is deliberately only a bounded, searchable index entry.
+    const entry = `\n\n## [${displayDate} ${displayTime}] ${operation}\n\n` +
+      `**Report artifact**: ${retained.reportPath}\n` +
+      `**Report SHA256**: ${retained.artifact.reportSha256}\n` +
+      `**Sections**: ${retained.artifact.sections.length}\n`;
+    await resolveArchivePath(logPath);
+    await this.writeBoundedLog(logPath, existingLog, entry);
+    return retained;
+  }
+
+  private async writeBoundedLog(logPath: string, existingLog: string, entry: string): Promise<void> {
+    const MAX_LOG_BYTES = 512 * 1024;
+    const projectedSize = utf8ByteLength(existingLog + entry);
+    if (projectedSize <= MAX_LOG_BYTES) {
+      if (this.resolveArchivePath) await this.resolveArchivePath(logPath);
+      await this.writeFile(logPath, existingLog + entry);
+      return;
+    }
+
+    const headerEnd = existingLog.indexOf(LogWriter.HEADER_TERMINATOR);
+    const header = headerEnd > 0
+      ? existingLog.substring(0, headerEnd + LogWriter.HEADER_TERMINATOR.length)
+      : LogWriter.HEADER_FALLBACK;
+    const headerLength = header.length;
+    const body = existingLog.slice(headerLength);
+    const chunks = body.split(/(?=## )/).filter(chunk => chunk.length > 0);
+    let suffix = '';
+    for (let i = chunks.length - 1; i >= 0; i--) {
+      const candidate = chunks[i] + suffix;
+      if (utf8ByteLength(header + candidate + entry) > MAX_LOG_BYTES) break;
+      suffix = candidate;
+    }
+    const trimmed = header + suffix;
+    console.warn(`[logLintFix] ${logPath} exceeded ${MAX_LOG_BYTES} UTF-8 bytes; trimmed oldest entries`);
+    if (this.resolveArchivePath) await this.resolveArchivePath(logPath);
+    await this.writeFile(logPath, trimmed + entry);
   }
 
   /** Format an ingest metrics suffix: ` · 28s · claude-sonnet-4-5 · 4.2KB`. */

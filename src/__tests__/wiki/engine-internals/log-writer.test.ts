@@ -11,6 +11,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { LogWriter } from '../../../wiki/engine-internals/log-writer';
+import { utf8ByteLength } from '../../../wiki/engine-internals/report-retention';
 import type { SourceAnalysis } from '../../../types';
 
 function makeAnalysis(overrides: Partial<SourceAnalysis> = {}): SourceAnalysis {
@@ -197,5 +198,203 @@ describe('LogWriter', () => {
     });
 
     await expect(writer.appendLintFix('op', 'details')).rejects.toThrow('disk full');
+  });
+
+  it('appendLintReport archives canonical UTF-8 report metadata before indexing the log', async () => {
+    const writes: Array<[string, string]> = [];
+    let archiveContent: string | null = null;
+    const readFile = vi.fn(async (path: string) => path.endsWith('/log.md') ? '# Header\n' : archiveContent);
+    const writer = new LogWriter({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      pluginVersion: '1.26.4',
+      now: () => new Date('2026-08-20T10:03:04.000Z'),
+      runIdFactory: () => 'run-123',
+      sha256: async text => `hash-${text.length}`,
+      readFile,
+      writeFile: async (path, content) => { writes.push([path, content]); },
+      createArchiveFile: async (path, content) => { archiveContent = content; writes.push([path, content]); },
+      ensureArchiveFolder: vi.fn().mockResolvedValue(undefined),
+      resolveArchivePath: async path => path,
+    });
+
+    const report = '# Wiki Lint Report\n\n> 1 finding\n\n## Dead links\n\n- Café → [[target]]\n\n## Quotes\n\n- none\n';
+    const retained = await writer.appendLintReport('Wiki Lint Report', report);
+    expect(retained.reportPath).toBe('wiki/lint-reports/2026-08-20T10-03-04.000Z-run-123.json');
+    expect(writes[0]?.[0]).toBe(retained.reportPath);
+    expect(writes[1]?.[0]).toBe('wiki/log.md');
+    const artifact = JSON.parse(writes[0]?.[1] ?? '') as {
+      timestamp: string;
+      runId: string;
+      pluginVersion: string;
+      previousLogSha256: string;
+      reportSha256: string;
+      sections: Array<{ heading: string; sha256: string; byteLength: number }>;
+      report: string;
+    };
+    expect(artifact).toMatchObject({ timestamp: '2026-08-20T10:03:04.000Z', runId: 'run-123', pluginVersion: '1.26.4' });
+    expect(artifact.report).toBe(report);
+    expect(artifact.sections.map(section => section.heading)).toEqual(['## Dead links', '## Quotes']);
+    expect(artifact.sections[0]?.byteLength).toBe(utf8ByteLength('## Dead links\n\n- Café → [[target]]\n\n'));
+    expect(writes[1]?.[1]).toContain('**Report artifact**: wiki/lint-reports/2026-08-20T10-03-04.000Z-run-123.json');
+  });
+
+  it('fails closed when the immutable archive path already exists', async () => {
+    const writeFile = vi.fn().mockResolvedValue(undefined);
+    const ids = ['run-existing', 'run-unique'];
+    let archiveContent: string | null = null;
+    const writer = new LogWriter({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      now: () => new Date('2026-08-20T10:03:04.000Z'),
+      runIdFactory: () => ids.shift() ?? 'run-fallback',
+      sha256: async () => 'hash',
+      readFile: vi.fn().mockResolvedValue('# Header\n'),
+      readArchiveFile: vi.fn(async path => path.includes('run-existing') ? '{"immutable":true}\n' : archiveContent),
+      writeFile,
+      createArchiveFile: async (_path, content) => { archiveContent = content; },
+      ensureArchiveFolder: vi.fn().mockResolvedValue(undefined),
+      resolveArchivePath: async path => path,
+    });
+
+    await writer.appendLintReport('Wiki Lint Report', '# Report\n\n## Findings\n\n- x\n');
+    expect(archiveContent).toContain('"runId": "run-unique"');
+    expect(writeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a direct EEXIST create race with a fresh immutable artifact ID', async () => {
+    const ids = ['run-create-race', 'run-after-race'];
+    let archiveContent: string | null = null;
+    let archivedPath: string | null = null;
+    let createAttempts = 0;
+    const createArchiveFile = vi.fn(async (path: string, content: string) => {
+      createAttempts++;
+      if (createAttempts === 1) {
+        const error = Object.assign(new Error('archive file already exists'), { code: 'EEXIST' });
+        throw error;
+      }
+      archivedPath = path;
+      archiveContent = content;
+    });
+    const writeFile = vi.fn().mockResolvedValue(undefined);
+    const writer = new LogWriter({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      now: () => new Date('2026-08-20T10:03:04.000Z'),
+      runIdFactory: () => ids.shift() ?? 'run-fallback',
+      sha256: async () => 'hash',
+      readFile: vi.fn().mockResolvedValue('# Header\n'),
+      readArchiveFile: vi.fn(async path => path === archivedPath ? archiveContent : null),
+      writeFile,
+      createArchiveFile,
+      ensureArchiveFolder: vi.fn().mockResolvedValue(undefined),
+      resolveArchivePath: async path => path,
+    });
+
+    await writer.appendLintReport('Wiki Lint Report', '# Report\n\n## Findings\n\n- x\n');
+
+    expect(createArchiveFile).toHaveBeenCalledTimes(2);
+    expect(archiveContent).toContain('"runId": "run-after-race"');
+    expect(writeFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('archives before a trim and leaves the log untouched when archive writing fails', async () => {
+    const fatHeader = '# Wiki Operation Log\n\n';
+    const chunk = '## [2026-01-01 12:00] old entry\n\n' + 'é'.repeat(900) + '\n\n';
+    const fatLog = fatHeader + chunk.repeat(900);
+    const writeLog = vi.fn().mockResolvedValue(undefined);
+    const writeArchive = vi.fn().mockRejectedValue(new Error('archive disk full'));
+    const writer = new LogWriter({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      now: () => new Date('2026-08-20T10:03:04.000Z'),
+      runIdFactory: () => 'run-fails',
+      sha256: async () => 'hash',
+      readFile: vi.fn().mockResolvedValue(fatLog),
+      readArchiveFile: vi.fn().mockResolvedValue(null),
+      writeFile: writeLog,
+      createArchiveFile: writeArchive,
+      ensureArchiveFolder: vi.fn().mockResolvedValue(undefined),
+      resolveArchivePath: async path => path,
+    });
+
+    await expect(writer.appendLintReport('Wiki Lint Report', '# Report\n\n## Findings\n\n- x\n'))
+      .rejects.toThrow('archive disk full');
+    expect(writeArchive).toHaveBeenCalledTimes(1);
+    expect(writeLog).not.toHaveBeenCalled();
+  });
+
+  it('refuses an archive resolver result that escapes the canonical report root', async () => {
+    const createArchive = vi.fn().mockResolvedValue(undefined);
+    const writeLog = vi.fn().mockResolvedValue(undefined);
+    const writer = new LogWriter({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      runIdFactory: () => 'run-escape',
+      sha256: async () => 'hash',
+      readFile: vi.fn().mockResolvedValue('# Header\n'),
+      readArchiveFile: vi.fn().mockResolvedValue(null),
+      createArchiveFile: createArchive,
+      writeFile: writeLog,
+      ensureArchiveFolder: vi.fn().mockResolvedValue(undefined),
+      resolveArchivePath: async path => path.endsWith('/lint-reports')
+        ? 'C:/vault/wiki/lint-reports'
+        : 'C:/vault/escaped/report.json',
+    });
+
+    await expect(writer.appendLintReport('Wiki Lint Report', '# Report\n\n## Findings\n\n- x\n'))
+      .rejects.toThrow('escaped archive root');
+    expect(createArchive).not.toHaveBeenCalled();
+    expect(writeLog).not.toHaveBeenCalled();
+  });
+
+  it('refuses rewritten archive bytes on post-create readback', async () => {
+    let reads = 0;
+    const writeLog = vi.fn().mockResolvedValue(undefined);
+    const writer = new LogWriter({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      runIdFactory: () => 'run-rewritten',
+      sha256: async text => `hash-${text}`,
+      readFile: vi.fn().mockResolvedValue('# Header\n'),
+      readArchiveFile: vi.fn(async () => reads++ === 0 ? null : 'rewritten'),
+      createArchiveFile: vi.fn().mockResolvedValue(undefined),
+      writeFile: writeLog,
+      ensureArchiveFolder: vi.fn().mockResolvedValue(undefined),
+      resolveArchivePath: async path => path,
+    });
+
+    await expect(writer.appendLintReport('Wiki Lint Report', '# Report\n\n## Findings\n\n- x\n'))
+      .rejects.toThrow('readback mismatch');
+    expect(writeLog).not.toHaveBeenCalled();
+  });
+
+  it('revalidates the resolved root after folder creation before creating the artifact', async () => {
+    let rootReads = 0;
+    const createArchive = vi.fn().mockResolvedValue(undefined);
+    const writeLog = vi.fn().mockResolvedValue(undefined);
+    const writer = new LogWriter({
+      wikiFolder: 'wiki',
+      wikiLanguage: 'en',
+      runIdFactory: () => 'run-junction-swap',
+      sha256: async () => 'hash',
+      readFile: vi.fn().mockResolvedValue('# Header\n'),
+      readArchiveFile: vi.fn().mockResolvedValue(null),
+      createArchiveFile: createArchive,
+      writeFile: writeLog,
+      ensureArchiveFolder: vi.fn().mockResolvedValue(undefined),
+      resolveArchivePath: async path => {
+        if (path.endsWith('/lint-reports')) {
+          rootReads++;
+          return rootReads === 1 ? 'C:/vault/wiki/lint-reports' : 'C:/vault/escaped';
+        }
+        return 'C:/vault/escaped/report.json';
+      },
+    });
+
+    await expect(writer.appendLintReport('Wiki Lint Report', '# Report\n\n## Findings\n\n- x\n'))
+      .rejects.toThrow('escaped archive root');
+    expect(createArchive).not.toHaveBeenCalled();
+    expect(writeLog).not.toHaveBeenCalled();
   });
 });

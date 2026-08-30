@@ -15,15 +15,22 @@ are available as pure functions:
   post-processing tail only after a provider response is supplied;
 - frontmatter-only merge planning uses native `mergeFrontmatter` field order,
   passthrough fields, source-link shape, and explicit run dates;
+- body-merge and reviewed-append planning can use a provider response only
+  when it is explicitly bound with the page type, sealed settings, and source
+  revision; the seam then applies the native clean/canonicalize/link/
+  completeness/title/mentions tail and preserves native `NO_NEW_CONTENT`
+  no-write behavior;
 - index planning mirrors `IndexGenerator`'s three sections, summaries,
   aliases, localized labels, and empty-state output;
 - ingest and lint log planning mirrors `LogWriter`, including page
   de-duplication, metrics formatting, header creation, and the 512 KiB trim.
 
 The seam fails closed for the parts that cannot be proven from deterministic
-inputs.  Native body merge, reviewed append, and complementary append remain
-LLM-owned; their plans are returned with `canApply: false` and a
-`native-llm-seam-required` reason.  Index source entries require the raw source
+inputs. Native body merge and reviewed append require an explicitly bound
+provider response; missing or ambiguous source-scoped responses remain
+`canApply: false` with a `native-llm-seam-required` reason. Complementary
+append remains LLM-owned because its per-section triage/anchor sequence is not
+represented by the headless IR. Index source entries require the raw source
 path and reject a basename that does not equal the native fingerprinted slug.
 The planners return bytes and paths only; callers still need the existing
 lease, transaction, independent readback, lint, provenance, and receipt gates.

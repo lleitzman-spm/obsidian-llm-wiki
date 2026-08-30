@@ -240,6 +240,98 @@ describe('native reducer', () => {
     expect(result.reasons).toContain('native-merge-required:wiki/entities/body-target.md');
   });
 
+  it('applies an explicitly bound native existing-page body merge', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/body-target.md',
+      pageType: 'entity',
+      label: 'Body Target',
+      content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Body Target\n\n## Description\nCurated body.\n',
+    };
+    const sourceRecord = source('body-bound', [{
+      proposalId: 'body-bound-proposal',
+      sourceId: 'body-bound',
+      pageType: 'entity',
+      label: 'Body Target',
+      summary: 'New summary',
+      mentions: [{ evidenceId: 'bound-quote', quote: 'Bound quote', sourcePath: 'notes/body-bound.md', sourceSlug: nativeSourceSlug('notes/body-bound.md'), extractedAt: '2026-08-20T00:00:00.000Z' }],
+    }]);
+    const result = reduceNativeSourceIR([sourceRecord], options({
+      existingPages: [existing],
+      existingPageContents: new Map([
+        ['body-bound\u001fentity\u001fbody target', '# Other title\n\n## Description\nProvider merge.\n'],
+      ]),
+    }));
+    expect(result.canApply).toBe(true);
+    expect(result.reasons).toEqual([]);
+    expect(result.pages[0]?.content).toContain('# Body Target');
+    expect(result.pages[0]?.content).toContain('Provider merge.');
+    expect(result.pages[0]?.content).toContain('Bound quote');
+  });
+
+  it('requires existing-page output bindings instead of borrowing new-page output', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/boundary.md',
+      pageType: 'entity',
+      label: 'Boundary',
+      content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Boundary\n',
+    };
+    const result = reduceNativeSourceIR([source('boundary', [{
+      proposalId: 'boundary-proposal', sourceId: 'boundary', pageType: 'entity', label: 'Boundary', summary: 'New body required',
+    }])], options({
+      existingPages: [existing],
+      generatedPageContents: new Map([['boundary\u001fentity\u001fboundary', '# New-page output\n']]),
+      existingPageContents: undefined,
+    }));
+    expect(result.canApply).toBe(false);
+    expect(result.pages[0]?.content).toBe(existing.content);
+    expect(result.reasons.some(reason => reason.includes('native-merge:sequence-refused:boundary'))).toBe(true);
+  });
+
+  it('clears reviewed comparison refusal after a bound NO_NEW_CONTENT no-op', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/reviewed-boundary.md',
+      pageType: 'entity',
+      label: 'Reviewed Boundary',
+      content: '---\ntype: entity\ncreated: 2024-01-01\nreviewed: true\n---\n\n# Reviewed Boundary\nLocked.\n',
+    };
+    const result = reduceNativeSourceIR([source('reviewed-boundary', [{
+      proposalId: 'reviewed-boundary-proposal', sourceId: 'reviewed-boundary', pageType: 'entity', label: 'Reviewed Boundary', summary: 'Possible new information', reviewed: true,
+    }])], options({
+      existingPages: [existing],
+      existingPageContents: new Map([
+        ['reviewed-boundary\u001fentity\u001freviewed boundary', 'NO_NEW_CONTENT'],
+      ]),
+    }));
+    expect(result.canApply).toBe(true);
+    expect(result.reasons).toEqual([]);
+    expect(result.pages[0]?.content).toBe(existing.content);
+    expect(result.reasons.some(reason => reason.includes('reviewed-append-requires-native-comparison'))).toBe(false);
+  });
+
+  it('rolls a bound existing-page sequence back when a later source lacks its native output', () => {
+    const existing: NativeExistingPage = {
+      path: 'wiki/entities/sequence-target.md',
+      pageType: 'entity',
+      label: 'Sequence Target',
+      content: '---\ntype: entity\ncreated: 2024-01-01\n---\n\n# Sequence Target\n\n## Description\nOriginal.\n',
+    };
+    const first = source('sequence-a', [{
+      proposalId: 'sequence-a-proposal', sourceId: 'sequence-a', pageType: 'entity', label: 'Sequence Target', summary: 'First',
+    }]);
+    const second = source('sequence-b', [{
+      proposalId: 'sequence-b-proposal', sourceId: 'sequence-b', pageType: 'entity', label: 'Sequence Target', summary: 'Second',
+    }]);
+    const result = reduceNativeSourceIR([second, first], options({
+      existingPages: [existing],
+      existingPageContents: new Map([
+        ['sequence-a\u001fentity\u001fsequence target', '# Sequence Target\n\n## Description\nFirst merge.\n'],
+      ]),
+    }));
+    expect(result.canApply).toBe(false);
+    expect(result.pages[0]?.content).toBe(existing.content);
+    expect(result.reasons.some(reason => reason.includes('native-merge:sequence-refused:sequence-b'))).toBe(true);
+  });
+
   it('folds native frontmatter-only merges across sources in canonical order', () => {
     const existing: NativeExistingPage = {
       path: 'wiki/entities/shared-existing.md',

@@ -1,5 +1,6 @@
 // Duplicate page detection — programmatic candidate generation via shared links,
-// bigram title similarity, and cross-language alias matching.
+// title/alias similarity, source fingerprints, and incoming-link buckets, with
+// provenance/register guards applied before candidates reach LLM verification.
 // Extracted from lint-fixes.ts to keep the module focused.
 
 import { parseFrontmatter } from '../../core/frontmatter';
@@ -44,33 +45,28 @@ export function pageTypeOf(path: string): WikiPageType {
 }
 
 /**
- * Allowed dedup pair combinations per user direction (2026-08-12):
- *   entity ↔ entity, concept ↔ concept,
- *   entity ↔ concept (cross-type is OK here),
- *   source ↔ source.
- * Forbidden: entity ↔ source, concept ↔ source.
+ * Allowed dedup pair combinations per user direction (2026-08-20):
+ *   entity ↔ entity, concept ↔ concept, source ↔ source, and entity ↔
+ *   concept only when direct duplicate evidence exists. Cross-register
+ *   entity ↔ concept pages that merely share hubs or incoming sources are
+ *   refused. Forbidden: entity ↔ source and concept ↔ source.
  *
  * Pages tagged `'other'` (e.g. log.md, schema/) are NEVER in the
  * dedup-eligible set — they bail at the file-level filter upstream,
  * so this guard only needs to handle the four canonical wiki types.
- * If `'other'` slips through, the guard rejects the pair rather than
- * emit a candidate of unknown shape.
+ * If `'other'` slips through, the guard rejects the pair rather than emit a
+ * candidate of unknown shape.
  *
  * Implementation note: stored as a Set of canonicalized "smaller|larger"
  * keys (lexicographically sorted by the type tag) so lookup is O(1)
  * regardless of which side is target vs source. Because the key is
- * canonical, ('entity', 'concept') and ('concept', 'entity') BOTH map to
- * 'concept|entity' — the Set MUST contain that row for the cross-type
- * combination to be allowed. The original bug (caught by the
- * sharedIncoming signal test) was a Set missing 'concept|entity' (only
- * symmetric rows were present), so every entity↔concept pair was silently
- * rejected — the fix was ADDING the row, not changing the `a < b`
- * comparison (which produces an identical key either way). Do not
- * 'simplify' the comparison or trust that Set row order matters.
+ * canonical, ('entity', 'concept') and ('concept', 'entity') both map to
+ * 'concept|entity'. The final direct-evidence gate below decides whether
+ * that cross-register pair is meaningful.
  */
 const ALLOWED_PAIR_KEYS: ReadonlySet<string> = new Set([
   'concept|concept',
-  'concept|entity', // canonical form of ('entity', 'concept')
+  'concept|entity',
   'entity|entity',
   'source|source',
 ]);
@@ -128,6 +124,137 @@ export function computeJaccard<T>(setA: Set<T>, setB: Set<T>): number {
   return union > 0 ? intersection / union : 0;
 }
 
+/**
+ * Return true when title length and token overlap indicate different scope,
+ * rather than a spelling variant of the same title. Character bigrams are
+ * intentionally tolerant of typos and inflections, but they can also make a
+ * long, specific title look similar to a short, broad title. Such a pair may
+ * still be a duplicate when the page bodies corroborate it; the caller uses
+ * this predicate to require that additional evidence for the bigram signal.
+ */
+function titleTokenSet(title: string): Set<string> {
+  return new Set(
+    title.toLowerCase()
+      .replace(/[^\w\s一-鿿]/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean),
+  );
+}
+
+function hasTitleScopeMismatch(tokensA: Set<string>, tokensB: Set<string>): boolean {
+  if (tokensA.size === 0 || tokensB.size === 0) return false;
+
+  const larger = Math.max(tokensA.size, tokensB.size);
+  const smaller = Math.min(tokensA.size, tokensB.size);
+  if (larger / smaller < 2) return false;
+
+  // A broad title and a narrow title can share one central noun while having
+  // little lexical identity. Requiring body evidence for this shape avoids
+  // promoting the shared noun's character bigrams as a duplicate proof.
+  return computeJaccard(tokensA, tokensB) < 0.5;
+}
+
+function normalizeReference(value: string): string {
+  const unwrapped = value.trim().replace(/^\[\[|\]\]$/g, '');
+  return unwrapped.split(/[|#]/, 1)[0].trim().toLowerCase().replace(/\\/g, '/');
+}
+
+function stringValues(value: unknown): string[] {
+  if (typeof value === 'string') return value.trim() ? [value] : [];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+function frontmatterReferences(fm: ReturnType<typeof parseFrontmatter>): Set<string> {
+  if (!fm) return new Set<string>();
+  const values = [
+    ...stringValues(fm.sources),
+    ...stringValues(fm.source_file),
+  ];
+  return new Set(values.map(normalizeReference).filter(Boolean));
+}
+
+function frontmatterRegisters(fm: ReturnType<typeof parseFrontmatter>): Set<string> {
+  if (!fm) return new Set<string>();
+  const values = [
+    ...stringValues(fm.tags),
+    ...stringValues(fm.register),
+    ...stringValues(fm.page_register),
+    ...stringValues(fm.entity_type),
+    ...stringValues(fm.concept_type),
+  ];
+  return new Set(values.map(normalizeForMatch).filter(Boolean));
+}
+
+function normalizedNames(meta: LintPageMeta): Set<string> {
+  return new Set([meta.title, ...meta.aliases].map(normalizeForMatch).filter(Boolean));
+}
+
+function hasDirectNameOverlap(a: LintPageMeta, b: LintPageMeta): boolean {
+  const namesA = normalizedNames(a);
+  const namesB = normalizedNames(b);
+  for (const name of namesA) {
+    if (namesB.has(name)) return true;
+  }
+  return false;
+}
+
+function hasDisjointProvenance(a: LintPageMeta, b: LintPageMeta): boolean {
+  if (a.provenance.size === 0 || b.provenance.size === 0) return false;
+  return computeJaccard(a.provenance, b.provenance) === 0;
+}
+
+function hasRegisterConflict(a: LintPageMeta, b: LintPageMeta): boolean {
+  if (a.registers.size === 0 || b.registers.size === 0) return false;
+  return computeJaccard(a.registers, b.registers) === 0;
+}
+
+function hasTitleHierarchy(a: LintPageMeta, b: LintPageMeta): boolean {
+  const combinedTitles = `${a.title} ${b.title}`;
+  if (!/(?:§|\bsection\b|\bsubsection\b|\barticle\b|\bchapter\b|\bpart\b)/i.test(combinedTitles)) {
+    return false;
+  }
+  const titleA = normalizeForMatch(a.title);
+  const titleB = normalizeForMatch(b.title);
+  if (!titleA || !titleB || titleA === titleB) return false;
+  const longer = titleA.length > titleB.length ? titleA : titleB;
+  const shorter = titleA.length > titleB.length ? titleB : titleA;
+  if (!longer.startsWith(shorter)) return false;
+  // Restrict the hierarchy guard to explicit section/ordinal suffixes. A
+  // generic prefix test would reject legitimate near-title pairs such as
+  // "Article Alpha" and "Article AlphaTwin".
+  return /(?:§\s*\d+[a-z]?(?:\s*\([a-z0-9]+\))?|\b(?:section|subsection|article|chapter|part)\s+\d+[a-z]?(?:\s*\([a-z0-9]+\))?)/i.test(combinedTitles);
+}
+
+function hasDirectDuplicateEvidence(a: LintPageMeta, b: LintPageMeta): boolean {
+  if (a.bodyFingerprint && a.bodyFingerprint === b.bodyFingerprint) return true;
+  if (computeJaccard(a.bodyWords, b.bodyWords) >= 0.5) return true;
+  if (hasDirectNameOverlap(a, b) && !hasDisjointProvenance(a, b)) return true;
+  return false;
+}
+
+function hasCrossRegisterDuplicateEvidence(a: LintPageMeta, b: LintPageMeta): boolean {
+  // Cross-register pages need stronger proof than shared vocabulary: an
+  // entity workflow and a concept navigation page can describe the same
+  // operations while remaining distinct records. Exact body identity or an
+  // exact name/alias backed by non-disjoint provenance is sufficient.
+  return Boolean(
+    (a.bodyFingerprint && a.bodyFingerprint === b.bodyFingerprint) ||
+    (hasDirectNameOverlap(a, b) && !hasDisjointProvenance(a, b)),
+  );
+}
+
+function sourceVersionsCompatible(a: LintPageMeta, b: LintPageMeta): boolean {
+  if (a.declaredContentHash || b.declaredContentHash) {
+    // The writer's contentHash binds the original source note, not the
+    // generated summary body. If either page carries that binding, require
+    // both pages to carry the same source hash; missing metadata is fail-closed.
+    return Boolean(a.declaredContentHash && b.declaredContentHash &&
+      a.declaredContentHash === b.declaredContentHash);
+  }
+  return Boolean(a.bodyFingerprint && b.bodyFingerprint && a.bodyFingerprint === b.bodyFingerprint);
+}
+
 // Generate duplicate-page candidates using programmatic signals.
 // Returns candidates for LLM verification, capped by the O(n²) algorithm.
 // Three signals, ordered by reliability:
@@ -183,14 +310,33 @@ export interface LintPageMeta {
   /**
    * v1.26.0 (#382 item 1, Batch 2): body hash for the sourceFingerprint
    * signal. Filled in by `generateDuplicateCandidates` from the
-   * frontmatter-stripped body; null for tests that construct LintPageMeta
+   * frontmatter-stripped body; empty for tests that construct LintPageMeta
    * directly without going through the pipeline (e.g.
-   * partitionPagesMultiBucket unit tests). The fingerprint is identical
-   * to `hashBody(extractBody(content))` from source-requirements.ts and
-   * is what makes source↔source "content identical" detection
-   * deterministic without depending on title/alias/bigram heuristics.
+   * partitionPagesMultiBucket unit tests). The fingerprint is equivalent
+   * to `hashBody(extractBody(content))` from source-requirements.ts, except
+   * that generated source-summary H1s are omitted because they are
+   * presentation titles rather than source evidence. This makes
+   * source↔source "content identical" detection deterministic without
+   * depending on title/alias/bigram heuristics.
    */
   bodyFingerprint: string;
+  /**
+   * Optional contentHash stamped by the ingest writer. Source↔source
+   * candidates fail closed when this declared hash conflicts with the other
+   * page's declaration; pages without declarations use body fingerprints.
+   */
+  declaredContentHash?: string;
+  /**
+   * Canonical source references from `sources:` / `source_file:`. A pair
+   * whose non-empty provenance sets are disjoint is not a duplicate unless
+   * the bodies are byte-identical.
+   */
+  provenance: Set<string>;
+  /**
+   * Frontmatter register/type tags (for example an entity role or concept
+   * family). Disjoint non-empty registers require direct duplicate evidence.
+   */
+  registers: Set<string>;
   /**
    * v1.26.0 (#382 item 1, Batch 2): set of wiki paths that cite THIS
    * page (i.e. for which THIS page appears in their outgoing `[[links]]`).
@@ -424,6 +570,8 @@ export async function generateDuplicateCandidates(
 
     const fm = parseFrontmatter(page.content);
     const aliases = Array.isArray(fm?.aliases) ? fm.aliases : [];
+    const provenance = frontmatterReferences(fm);
+    const registers = frontmatterRegisters(fm);
 
     const links = new Set<string>();
     const body = page.content.replace(/---[\s\S]*?---/, '');
@@ -442,7 +590,14 @@ export async function generateDuplicateCandidates(
     // already-extracted body. Source↔source pairs whose bodies hash
     // to the same value are the only ones the sourceFingerprint
     // signal promotes to tier-1.
-    const bodyFingerprint = hashBody(body);
+    // Source-page H1s are generated summaries' presentation titles, not
+    // source evidence. Exclude that first heading from the fallback body
+    // fingerprint so two summaries of the same un-stamped source remain
+    // comparable; stamped pages use the authoritative contentHash above.
+    const fingerprintBody = pageTypeOf(page.path) === 'source'
+      ? body.replace(/^\s*#\s+[^\r\n]*(?:\r?\n|$)/, '')
+      : body;
+    const bodyFingerprint = hashBody(fingerprintBody);
 
     metas.push({
       path: page.path,
@@ -451,6 +606,9 @@ export async function generateDuplicateCandidates(
       links,
       bodyWords,
       bodyFingerprint,
+      declaredContentHash: typeof fm?.contentHash === 'string' ? fm.contentHash.trim() : undefined,
+      provenance,
+      registers,
       // v1.26.0 (#382 item 1, Batch 2): filled in below from
       // `incomingIndex` after the setup loop. Default empty here;
       // the populate step overwrites for pages that appear as targets
@@ -475,6 +633,7 @@ export async function generateDuplicateCandidates(
   }
 
   const candidates = new Map<string, DuplicateCandidate>();
+  const pathToMeta = new Map(metas.map(meta => [meta.path, meta]));
   // B3 (v1.26.3 PATCH, DocT CR): count rejected cross-type pairs so the
   // filter's effect is measurable (emitted via hooks.onCrossTypeRejected).
   let crossTypeRejected = 0;
@@ -496,6 +655,64 @@ export async function generateDuplicateCandidates(
     const typeB = pageTypeOf(pathB);
     if (!isCrossTypePairAllowed(typeA, typeB)) {
       crossTypeRejected++;
+      return;
+    }
+    const metaA = pathToMeta.get(pathA);
+    const metaB = pathToMeta.get(pathB);
+    if (!metaA || !metaB) return;
+
+    // Entity↔concept pairs are different semantic registers. Keep the
+    // explicit cross-type allowance only for exact body identity or an exact
+    // name/alias with compatible provenance, never for shared vocabulary,
+    // hubs, or incoming citations alone.
+    if (typeA !== typeB && !hasCrossRegisterDuplicateEvidence(metaA, metaB)) {
+      crossTypeRejected++;
+      return;
+    }
+
+    // Source pages are versioned evidence, not semantic pages. A title,
+    // alias, shared hub, or incoming citation cannot make two different
+    // source bodies duplicates. When ingest supplies a contentHash, both
+    // pages must carry the same declaration; otherwise normalized body
+    // fingerprints must agree before admitting a source pair.
+    if (typeA === 'source' && typeB === 'source' && !sourceVersionsCompatible(metaA, metaB)) {
+      return;
+    }
+
+    // Explicit section/subsection titles are distinct scopes even when they
+    // share a statute or navigation hub. Only a byte-identical body can
+    // override that conservative hierarchy guard.
+    if (hasTitleHierarchy(metaA, metaB) && metaA.bodyFingerprint !== metaB.bodyFingerprint) {
+      return;
+    }
+
+    // Independent provenance is a hard boundary for weak lexical/graph
+    // signals. This preserves same-type source-union duplicates (which share
+    // at least one source or an identical body) while refusing transitive
+    // evidence/status collisions from unrelated source records.
+    if (hasDisjointProvenance(metaA, metaB) && metaA.bodyFingerprint !== metaB.bodyFingerprint) {
+      return;
+    }
+
+    // Distinct non-empty registers (for example two entity roles) need
+    // direct evidence before a graph or title signal can promote the pair.
+    if (hasRegisterConflict(metaA, metaB) && !hasDirectDuplicateEvidence(metaA, metaB)) {
+      return;
+    }
+
+    // Shared incoming sources are transitive evidence: both pages were cited
+    // by a referrer, not that the pages represent the same thing. Keep the
+    // signal useful only when a direct title/body/provenance cue agrees.
+    if (signal === 'sharedIncoming' && !hasDirectDuplicateEvidence(metaA, metaB)) {
+      return;
+    }
+
+    // A broad/narrow title pair must clear stronger body evidence for every
+    // signal, not just the bigram path. Shared links alone are navigation,
+    // and do not establish duplicate scope.
+    if (hasTitleScopeMismatch(titleTokenSet(metaA.title), titleTokenSet(metaB.title)) &&
+      computeJaccard(metaA.bodyWords, metaB.bodyWords) < 0.5 &&
+      metaA.bodyFingerprint !== metaB.bodyFingerprint) {
       return;
     }
     const key = [pathA, pathB].sort().join('|||');
@@ -733,6 +950,8 @@ async function runBigramCrossLangSignal(
   ) => void,
   comparisonCountRef: { n: number },
 ): Promise<void> {
+  const titleTokens = bucketPages.map(page => titleTokenSet(page.title));
+
   for (let i = 0; i < bucketPages.length; i++) {
     for (let j = i + 1; j < bucketPages.length; j++) {
       await yieldForComparison(comparisonCountRef);
@@ -749,7 +968,11 @@ async function runBigramCrossLangSignal(
           if (sim > maxSim) maxSim = sim;
         }
       }
-      if (maxSim >= thresholds.bigramThreshold) {
+      const titleScopeMismatch = hasTitleScopeMismatch(titleTokens[i], titleTokens[j]);
+      if (
+        maxSim >= thresholds.bigramThreshold &&
+        (!titleScopeMismatch || computeJaccard(a.bodyWords, b.bodyWords) >= Math.max(thresholds.jaccardBodyGate, 0.5))
+      ) {
         addCandidate(a.path, b.path, `Title/alias similarity (${Math.round(maxSim * 100)}% match)`, 'bigram', maxSim);
       }
 

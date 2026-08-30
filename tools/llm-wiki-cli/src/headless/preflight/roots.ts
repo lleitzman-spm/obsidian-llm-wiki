@@ -1,5 +1,6 @@
 import { lstat as fsLstat, realpath as fsRealpath } from 'node:fs/promises';
 import * as nodePath from 'node:path';
+import { assertRootPathBinding } from './path-safety';
 
 export interface RootStat {
   isDirectory?: () => boolean;
@@ -146,6 +147,9 @@ export async function assertSafeCopyRoots(options: SafeCopyRootOptions): Promise
   const liveRoot = await resolveSafeRoot(options.liveRoot, probe);
   const copyRoots = await Promise.all(options.copyRoots.map(path => resolveSafeRoot(path, probe)));
   const syncRoots = await Promise.all((options.syncRoots ?? []).map(path => resolveSafeRoot(path, probe)));
+  await assertRootPathBinding(liveRoot, probe, 'Live root');
+  await Promise.all(copyRoots.map(root => assertRootPathBinding(root, probe, 'Copied-vault root')));
+  await Promise.all(syncRoots.map(root => assertRootPathBinding(root, probe, 'Sync root')));
   for (const copyRoot of copyRoots) {
     if (
       isSameOrWithin(copyRoot.resolved, liveRoot.resolved)

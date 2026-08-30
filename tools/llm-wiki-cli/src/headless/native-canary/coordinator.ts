@@ -6,10 +6,8 @@ import {
   ReplayLedger,
   digestHex,
   hashCanonical,
-  independentlyVerifyRun,
   verifyContractSignature,
   type JsonValue,
-  type IndependentRunVerificationResult,
 } from '../crypto';
 import { buildTagVocabulary, verifySignedSettingsProjection } from '../policy-pack';
 import { captureSettingsHashes } from '../preflight/settings';
@@ -70,7 +68,12 @@ import {
   type FinalizationResult,
   type ReplayAppender,
 } from '../finalization';
+import {
+  independentlyVerifyNativeCanaryArtifacts,
+  type VerifiedNativeCanaryArtifacts,
+} from '../verification';
 import { parseFrontmatter } from '../../../../../src/core/frontmatter';
+import type { LLMWikiSettings } from '../../../../../src/types';
 import type { ContractSemanticProjection } from '../provenance/types';
 import type {
   LiveIdleObservation,
@@ -78,6 +81,7 @@ import type {
   NativeCanaryInput,
   NativeCanaryRefusalCode,
   NativeCanaryResult,
+  NativeCanaryWriterBinding,
   NativeReferenceRunner,
 } from './types';
 import {
@@ -255,6 +259,33 @@ function validateInputShape(input: NativeCanaryInput): void {
   validateSourceInventory(input);
 }
 
+function candidateRootSha256(root: string): string {
+  return sha256Hex(nodePath.resolve(root));
+}
+
+function validateWriterBinding(input: NativeCanaryInput): NativeCanaryWriterBinding | undefined {
+  const binding = input.writerBinding;
+  if (binding === undefined) return undefined;
+  if (typeof binding.ownerId !== 'string' || !binding.ownerId.trim()
+    || binding.runId !== input.runId
+    || !Number.isSafeInteger(binding.fence) || binding.fence < 1
+    || !HEX64.test(binding.candidateRootSha256)
+    || binding.candidateRootSha256 !== candidateRootSha256(input.candidateRoot)) {
+    fail('invalid-input', 'Writer owner/run/fence/candidate-root binding is invalid for this canary');
+  }
+  return binding;
+}
+
+async function assertWriterCurrent(input: NativeCanaryInput): Promise<void> {
+  validateWriterBinding(input);
+  if (!input.assertWriterCurrent) return;
+  try {
+    await input.assertWriterCurrent();
+  } catch (error) {
+    wrap('transaction-refused', 'Writer authority was lost before candidate mutation', error);
+  }
+}
+
 async function validatePolicy(input: NativeCanaryInput): Promise<{ readonly hashes: ReturnType<typeof captureSettingsHashes>; readonly mapPolicy: NativeMapPolicy }> {
   const policy = input.policy;
   let hashes: ReturnType<typeof captureSettingsHashes>;
@@ -309,6 +340,10 @@ async function copyVaults(input: NativeCanaryInput, roots: SafeCopyRoots, observ
   try {
     const exclusions = ['run', 'lease'] as const;
     first = await copySnapshot({ root: roots.liveRoot.resolved, destinationRoot: roots.copyRoots[0].resolved, exclusions, syncRoots: input.syncRoots });
+    // The two disposable copies are independent writer operations.  Re-check
+    // the host lease between them so a revoked writer cannot start the second
+    // copy after the authority boundary has already changed.
+    await assertWriterCurrent(input);
     second = await copySnapshot({ root: roots.liveRoot.resolved, destinationRoot: roots.copyRoots[1].resolved, exclusions, syncRoots: input.syncRoots });
   } catch (error) {
     wrap('unsafe-root', 'Independent native/candidate snapshot copies could not be made safely', error);
@@ -578,10 +613,20 @@ async function performCandidateTransaction(
   const journalPath = nodePath.join(artifactRoot, 'journals', `${input.runId}.transaction-journal.jsonl`);
   let lease: LeaseHandle;
   try {
+    // Re-check the host launch authority before even creating candidate-side
+    // lease metadata.  The isolated native worker cannot grant this authority.
+    await assertWriterCurrent(input);
     lease = await new FilesystemLease(safeCandidateRoot, {
       now: input.now,
       metadataRoot: nodePath.join(artifactRoot, 'leases'),
-    }).acquire({ ownerId: `native-canary:${input.signer.keyId}`, runId: input.runId });
+    }).acquire({ ownerId: input.writerBinding?.ownerId ?? `native-canary:${input.signer.keyId}`, runId: input.runId });
+    if (input.writerBinding
+      && (lease.record.ownerId !== input.writerBinding.ownerId
+        || lease.record.runId !== input.writerBinding.runId
+        || candidateRootSha256(safeCandidateRoot) !== input.writerBinding.candidateRootSha256)) {
+      await lease.release().catch(() => undefined);
+      fail('transaction-refused', 'Candidate lease is not bound to the host writer owner/run/candidate root');
+    }
   } catch (error) {
     wrap('transaction-refused', 'Candidate writer lease acquisition failed closed', error);
   }
@@ -592,6 +637,7 @@ async function performCandidateTransaction(
     } catch (error) {
       wrap('live-observation-invalid', 'Fresh live idle observation failed closed before candidate mutation', error);
     }
+    await assertWriterCurrent(input);
     await assertLiveUnchanged(input, copies.live);
     if (fresh.statusDigest !== observation.statusDigest && fresh.observedAt === observation.observedAt) {
       fail('live-observation-invalid', 'Fresh live observation changed status without changing its observation timestamp');
@@ -614,15 +660,32 @@ async function performCandidateTransaction(
       current,
       desired,
     });
+    // The transaction engine is the first candidate-vault writer.  Keep the
+    // host authority check adjacent to the mutation, after all read/planning
+    // work but before the journal or candidate files can be touched.
+    await assertWriterCurrent(input);
     const fileSystem = new NodeTransactionFileSystem(safeCandidateRoot);
     const receipt = await new TransactionEngine({
       rootDir: safeCandidateRoot,
       fileSystem,
       journalPath,
       lease: {
-        assertFence: lease.assertFence,
-        withWriteFence: lease.withWriteFence,
-        withFinalCommit: lease.withFinalCommit,
+        // Keep the coordinator's owner/run/fence authority check in the
+        // transaction engine's lease callbacks.  The engine calls these
+        // callbacks for every journal/file mutation and final CAS boundary;
+        // checking only once before apply would leave a revocation window.
+        assertFence: async (fence) => {
+          await lease.assertFence(fence);
+          await assertWriterCurrent(input);
+        },
+        withWriteFence: async <T>(operation: () => Promise<T>): Promise<T> => lease.withWriteFence(async () => {
+          await assertWriterCurrent(input);
+          return operation();
+        }),
+        withFinalCommit: async <T>(operation: () => Promise<T>): Promise<T> => lease.withFinalCommit(async () => {
+          await assertWriterCurrent(input);
+          return operation();
+        }),
         onRollbackStart: async () => undefined,
         onRollbackComplete: async () => undefined,
         freeze: async (fence, reason) => { await lease.freeze(fence, reason); },
@@ -648,12 +711,13 @@ async function finalizeAndVerify(
   reduction: NativeReductionPlan,
   transactionPlan: TransactionPlan,
   transaction: TransactionReceipt,
+  writerBinding: NativeCanaryWriterBinding,
   comparison: ReturnType<typeof compareNativeCandidate>,
   candidateProjection: ContractSemanticProjection,
   candidateSnapshot: CopySnapshotManifest,
   observation: LiveIdleObservation,
   terminalObservation: LiveIdleObservation,
-): Promise<{ readonly finalization: FinalizationResult; readonly independentVerification: IndependentRunVerificationResult; readonly artifactDirectory: string }> {
+): Promise<{ readonly finalization: FinalizationResult; readonly independentVerification: VerifiedNativeCanaryArtifacts; readonly artifactDirectory: string }> {
   const artifactBase = nodePath.join(roots.copyRoots[2].resolved, 'canary-runs');
   const artifactDirectory = nodePath.join(artifactBase, input.runId);
   const stateRoot = nodePath.join(roots.copyRoots[2].resolved, 'canary-state', input.runId);
@@ -664,6 +728,25 @@ async function finalizeAndVerify(
     { path: 'live-idle-observation.json', bytes: jsonText(observation) },
     { path: 'live-terminal-observation.json', bytes: jsonText(terminalObservation) },
     { path: 'copy-manifests.json', bytes: jsonText(copies) },
+    { path: 'canary-binding.json', bytes: jsonText({
+      version: 'native-canary-binding/v1',
+      runId: input.runId,
+      windowId: input.windowId,
+      authority: input.authority,
+      sourceInventorySha256: input.sourceInventory.inventorySha256,
+      liveRoot: roots.liveRoot.resolved,
+      nativeRoot: roots.copyRoots[0].resolved,
+      candidateRoot: roots.copyRoots[1].resolved,
+      artifactRoot: nodePath.join(roots.copyRoots[2].resolved, 'native-reference'),
+      writer: writerBinding,
+      ...(input.writerBinding ? { hostWriter: input.writerBinding } : {}),
+      policySha256: mapPolicy.policySha256,
+      provider: {
+        provider: input.provider.provider,
+        model: input.provider.model,
+        authorizationRefSha256: sha256Hex(input.provider.authorizationRef),
+      },
+    }) },
     { path: 'native-receipt.json', bytes: jsonText(native.receipt) },
     { path: 'native-binding.json', bytes: jsonText(native.binding) },
     { path: 'native-projection.json', bytes: jsonText(native.projection) },
@@ -677,6 +760,10 @@ async function finalizeAndVerify(
     { path: 'transaction-receipt.json', bytes: jsonText(transaction) },
     { path: 'transaction-journal.jsonl', bytes: journalBytes },
   ];
+  // Finalization creates the durable artifact set and replay entry.  The
+  // candidate lease remains the writer authority for this run, so check it
+  // again immediately before preparing those writes.
+  await assertWriterCurrent(input);
   let pending: ReturnType<typeof prepareFinalization>;
   try {
     pending = prepareFinalization({
@@ -710,19 +797,31 @@ async function finalizeAndVerify(
         lockPath,
       });
       const existing = ledger.entries().find(entry => entry.runId === input.runId && entry.nonce === intent.nonce && entry.fence === transactionPlan.fence);
-      const entry = existing ?? ledger.append({
-        runId: input.runId,
-        nonce: intent.nonce,
-        fence: transactionPlan.fence,
-        timestamp: new Date(input.now?.() ?? Date.now()).toISOString(),
-        payload: intent.payload,
-      }, input.signer);
+      let entry = existing;
+      if (entry === undefined) {
+        // Replay append is a durable write in its own right.  The check is
+        // intentionally immediately adjacent to the synchronous append.
+        await assertWriterCurrent(input);
+        entry = ledger.append({
+          runId: input.runId,
+          nonce: intent.nonce,
+          fence: transactionPlan.fence,
+          timestamp: new Date(input.now?.() ?? Date.now()).toISOString(),
+          payload: intent.payload,
+        }, input.signer);
+        await assertWriterCurrent(input);
+      }
       const bytes = new Uint8Array(await readFile(ledgerPath));
       return { entryHash: entry.hash, ledgerRootHash: ledger.rootHash(), artifactPath: intent.artifactPath, artifactSha256: sha256Hex(bytes) };
     },
   };
   let finalization: FinalizationResult;
   try {
+    // prepareFinalization materializes the signed pending envelope and the
+    // finalizer then performs the durable artifact/terminal writes. Re-check
+    // the launch authority at the handoff so a revocation cannot be hidden by
+    // the earlier preparation check.
+    await assertWriterCurrent(input);
     finalization = await finalizeRun({
       ...pending,
       files,
@@ -731,22 +830,36 @@ async function finalizeAndVerify(
       signer: input.signer,
       now: input.now,
     });
+    await assertWriterCurrent(input);
   } catch (error) {
     wrap('finalization-refused', 'Durable canary finalization failed closed', error);
   }
   if (finalization.state !== 'terminal') fail('finalization-refused', `Canary finalization ended in ${finalization.state}`, [finalization.reason ?? 'no reason']);
-  let independentVerification: IndependentRunVerificationResult;
+  let independentVerification: VerifiedNativeCanaryArtifacts;
   try {
-    independentVerification = independentlyVerifyRun({
+    independentVerification = await independentlyVerifyNativeCanaryArtifacts({
       directory: artifactDirectory,
       registry: input.trustedRegistry,
       expectedRunId: input.runId,
-      replayLedgerPath: 'replay-ledger.jsonl',
-      replayScope: 'spm-brain-replay-append',
+      expectedWindowId: input.windowId,
+      expectedLiveRoot: roots.liveRoot.resolved,
+      expectedNativeRoot: roots.copyRoots[0].resolved,
+      expectedCandidateRoot: roots.copyRoots[1].resolved,
+      expectedArtifactRoot: nodePath.join(roots.copyRoots[2].resolved, 'native-reference'),
+      expectedAuthority: input.authority,
+      sourceInventory: input.sourceInventory,
+      expectedProvider: {
+        provider: input.provider.provider,
+        model: input.provider.model,
+        authorizationRefSha256: sha256Hex(input.provider.authorizationRef),
+      },
+      verifyLiveRoot: true,
+      liveRoot: roots.liveRoot.resolved,
       terminalScope: 'spm-brain-run-terminalize',
+      replayScope: 'spm-brain-replay-append',
     });
   } catch (error) {
-    wrap('verification-refused', 'Independent terminal tree and replay-ledger verification failed', error);
+    wrap('verification-refused', 'Independent native/map/reduction/projection/transaction/live verification failed', error);
   }
   return { finalization, independentVerification, artifactDirectory };
 }
@@ -760,6 +873,8 @@ async function finalizeAndVerify(
  */
 export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeCanaryResult> {
   validateInputShape(input);
+  validateWriterBinding(input);
+  await assertWriterCurrent(input);
   let initialObservation: LiveIdleObservation;
   try {
     initialObservation = validateObservation(input, await input.observeLive(), nodePath.resolve(input.liveRoot));
@@ -778,8 +893,12 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
   }
   if (!samePath(initialObservation.liveRoot, roots.liveRoot.resolved)) fail('live-observation-invalid', 'Initial observation root differs from the resolved live root');
   const { hashes, mapPolicy } = await validatePolicy(input);
+  // Both disposable copy roots are created by the next operation.  Do not
+  // begin that mutation on a stale launch authority.
+  await assertWriterCurrent(input);
   const copies = await copyVaults(input, roots, initialObservation);
   await assertLiveUnchanged(input, copies.live);
+  await assertWriterCurrent(input);
   const native = await runNative(input, roots, copies, hashes);
   await assertLiveUnchanged(input, copies.live);
   let candidateBefore: CopySnapshotManifest;
@@ -831,6 +950,11 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
       },
       slugCase: input.global.slugCase,
       date: input.global.date,
+      // Bind page post-processing to the exact settings captured by the
+      // native reference run, never to an unverified caller projection.
+      nativeSettings: native.preflight.effectiveSettings as unknown as LLMWikiSettings,
+      existingPageContents: input.existingPageContents,
+      generatedPageContents: input.generatedPageContents,
       existingPages: existingPages(input.global.wikiFolder, candidateFiles),
       existingFiles: candidateFiles,
     });
@@ -841,6 +965,17 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
     fail('candidate-reduction-refused', 'Candidate reduction requires native comparison or contains unsupported structure', [...reduction.reasons, ...reduction.unsupported]);
   }
   const transactionResult = await performCandidateTransaction(input, roots, copies, reduction, initialObservation);
+  const transactionFence = Number(transactionResult.plan.fence);
+  if (!Number.isSafeInteger(transactionFence) || transactionFence < 1) {
+    await transactionResult.lease.release().catch(() => undefined);
+    fail('transaction-refused', 'Candidate transaction returned an invalid writer fence');
+  }
+  const transactionWriterBinding: NativeCanaryWriterBinding = {
+    ownerId: transactionResult.lease.record.ownerId,
+    runId: transactionResult.lease.record.runId,
+    fence: transactionFence,
+    candidateRootSha256: candidateRootSha256(roots.copyRoots[1].resolved),
+  };
   let preFinalizationTerminalObservation: LiveIdleObservation;
   try {
     preFinalizationTerminalObservation = await validateTerminalLiveObservation(input, roots, copies, initialObservation);
@@ -872,7 +1007,7 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
   }
   let finalized: Awaited<ReturnType<typeof finalizeAndVerify>>;
   try {
-    finalized = await finalizeAndVerify(input, roots, native, copies, mapPolicy, mapIR, reduction, transactionResult.plan, transactionResult.receipt, comparison, candidateProjection, transactionResult.candidate, transactionResult.observation, preFinalizationTerminalObservation);
+    finalized = await finalizeAndVerify(input, roots, native, copies, mapPolicy, mapIR, reduction, transactionResult.plan, transactionResult.receipt, transactionWriterBinding, comparison, candidateProjection, transactionResult.candidate, transactionResult.observation, preFinalizationTerminalObservation);
   } catch (error) {
     await transactionResult.lease.release().catch(() => undefined);
     throw error;
@@ -897,6 +1032,8 @@ export async function runNativeCanary(input: NativeCanaryInput): Promise<NativeC
     reduction,
     transactionPlan: transactionResult.plan,
     transaction: transactionResult.receipt,
+    writerBinding: transactionWriterBinding,
+    ...(input.writerBinding ? { hostWriterBinding: input.writerBinding } : {}),
     comparison,
     finalization: finalized.finalization,
     independentVerification: finalized.independentVerification,

@@ -4,6 +4,7 @@ import { computeSlug } from '../../../../../src/core/slug';
 import { canonicalPartitionKey, partitionKeyString } from '../engine/partition';
 import {
   NativeCompatibilityError,
+  normalizeNativeVaultPath,
   nativeSourceSlug,
   planNativeGeneratedPage,
   planNativeMerge,
@@ -841,15 +842,38 @@ function candidateForGroup(
     if (incomingAliases.length > 0) localReasons.push(`native-merge:aliases-not-proven:${path}`);
     if (incomingTags.length > 0) localReasons.push(`native-merge:tags-not-proven:${path}`);
     if (existingFile !== undefined && existingFile !== existing.content) localReasons.push(`native-merge:existing-content-mismatch:${path}`);
-    if (mergeEligible) {
-      const mergeSources = sourceIds.map(sourceId => {
-        const source = group.sources.find(item => item.sourceId === sourceId);
-        if (!source) throw new NativeReductionError(`missing source ${sourceId} for native merge sequence ${group.key.keyString}`);
-        return source;
+    const bodyMergeRequired = !reviewed && (
+      bodyParts.length > 0
+      || summaries.length > 0
+      || statements.length > 0
+      || qualifications.length > 0
+      || evidence.length > 0
+      || related.length > 0
+    );
+    const mergeMode = reviewed ? 'reviewed-append' as const : bodyMergeRequired ? 'llm-merge' as const : 'frontmatter-only' as const;
+    const mergeSources = sourceIds.map(sourceId => {
+      const source = group.sources.find(item => item.sourceId === sourceId);
+      if (!source) throw new NativeReductionError(`missing source ${sourceId} for native merge sequence ${group.key.keyString}`);
+      return source;
+    });
+    if (mergeEligible || bodyMergeRequired || reviewed) {
+      const sequence = planNativeMergeSequence(path, existing.content, mergeSources, options, {
+        mode: mergeMode,
+        pageType,
+        keyString: group.key.keyString,
+        proposals,
       });
-      const sequence = planNativeMergeSequence(path, existing.content, mergeSources, options);
+      if (sequence.reasons.length === 0) {
+        const bodyComparisonReason = `native-merge:body-comparison-required:${path}`;
+        const reviewedReason = `native-merge:reviewed-page:${path}`;
+        const reviewedComparisonReason = `reviewed-append-requires-native-comparison:${path}`;
+        for (const removable of [bodyComparisonReason, reviewedReason, reviewedComparisonReason]) {
+          const index = localReasons.indexOf(removable);
+          if (index >= 0) localReasons.splice(index, 1);
+        }
+      }
       localReasons.push(...sequence.reasons);
-      if (mergeSources.length > 1) nativeMergeTrace = sequence.trace;
+      if (mergeSources.length > 1 && sequence.reasons.length === 0) nativeMergeTrace = sequence.trace;
       content = sequence.reasons.length === 0 ? sequence.content : existing.content;
     } else {
       content = existing.content;
@@ -938,6 +962,39 @@ interface NativeMergeSequenceResult {
   readonly trace?: NativeMergeSequenceTrace;
 }
 
+interface NativeMergeSequenceContext {
+  readonly mode: 'frontmatter-only' | 'llm-merge' | 'reviewed-append';
+  readonly pageType: 'entity' | 'concept';
+  readonly keyString: string;
+  readonly proposals: readonly NativePageProposal[];
+}
+
+function boundExistingPageContent(
+  options: NativeReducerOptions,
+  source: NativeSourceScopedIR,
+  context: NativeMergeSequenceContext,
+  path: string,
+  sourceCount: number,
+): string | undefined {
+  // Existing-page body bytes are a separate provider seam from new-page
+  // generation. Never fall back to generated-page output here: doing so could
+  // silently treat a create response as an existing-page merge response.
+  const maps = [options.existingPageContents];
+  const scopedKeys = [
+    `${source.sourceId}${KEY_SEPARATOR}${context.keyString}`,
+    `${source.sourceId}${KEY_SEPARATOR}${path}`,
+  ];
+  if (sourceCount === 1) scopedKeys.push(context.keyString, path);
+  for (const map of maps) {
+    if (!map) continue;
+    for (const key of scopedKeys) {
+      const value = map.get(key);
+      if (value !== undefined) return value;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Fold the native frontmatter-only merge once per source.  The prior planner
  * output is the next planner's sealed existingContent; any failed binding or
@@ -948,6 +1005,12 @@ function planNativeMergeSequence(
   originalContent: string,
   sources: readonly NativeSourceScopedIR[],
   options: NativeReducerOptions,
+  context: NativeMergeSequenceContext = {
+    mode: 'frontmatter-only',
+    pageType: 'entity',
+    keyString: '',
+    proposals: [],
+  },
 ): NativeMergeSequenceResult {
   if (sources.length === 0) return { content: originalContent, reasons: [`native-merge:sequence-empty:${path}`] };
   let priorContent = originalContent;
@@ -956,15 +1019,44 @@ function planNativeMergeSequence(
     const stepReasons: string[] = [];
     let plan: ReturnType<typeof planNativeMerge>;
     try {
+      const proposal = context.proposals.find(item => item.sourceId === source.sourceId);
+      const normalizedSourcePath = normalizeNativeVaultPath(source.sourcePath, 'sourcePath');
+      const generatedContent = context.mode === 'frontmatter-only'
+        ? undefined
+        : boundExistingPageContent(options, source, context, path, sources.length);
       plan = planNativeMerge({
         pagePath: path,
-        sourcePath: source.sourcePath,
+        sourcePath: normalizedSourcePath,
         existingContent: priorContent,
         wikiFolder: options.wikiFolder,
         date: options.date,
-        mode: 'frontmatter-only',
+        mode: context.mode,
         sourceSlug: source.sourceSlug,
         slug: { preserveCase: options.slugCase === 'preserve' },
+        ...(generatedContent !== undefined ? { generatedContent } : {}),
+        ...(context.mode !== 'frontmatter-only' ? {
+          pageType: context.pageType,
+          settings: options.nativeSettings,
+          sourceFileBasename: normalizedSourcePath.split('/').pop(),
+          relatedEntities: proposal?.relatedEntities,
+          relatedConcepts: proposal?.relatedConcepts,
+          mentions: [...(proposal?.mentions ?? []), ...(proposal?.evidence ?? [])]
+            .filter(item => item.quote !== undefined)
+            .map(item => ({
+              quote: item.quote ?? '',
+              source_path: normalizeNativeVaultPath(item.sourcePath ?? normalizedSourcePath, 'sourcePath'),
+              source_slug: item.sourceSlug ?? source.sourceSlug,
+              extracted_at: item.extractedAt ?? '',
+            })),
+          existingPages: options.existingPages?.map(item => {
+            const meta = parseFrontmatter(item.content);
+            return {
+              title: item.label ?? item.path.split('/').pop()?.replace(/\.md$/iu, '') ?? item.path,
+              path: item.path,
+              aliases: meta.aliases ?? [],
+            };
+          }),
+        } : {}),
       });
     } catch (error) {
       return {
@@ -988,7 +1080,7 @@ function planNativeMergeSequence(
     if (nextContent === undefined) return { content: originalContent, reasons: [`native-merge:sequence-content-missing:${source.sourceId}`] };
     steps.push(Object.freeze({
       sourceId: source.sourceId,
-      sourcePath: source.sourcePath,
+      sourcePath: normalizeNativeVaultPath(source.sourcePath, 'sourcePath'),
       sourceSlug: source.sourceSlug,
       path: plan.path,
       plannerAction: plan.action as NativeMergePlannerAction,
@@ -1006,6 +1098,7 @@ function planNativeMergeSequence(
     trace: Object.freeze({
       originalContent,
       finalContent: priorContent,
+      mode: context.mode,
       steps: Object.freeze(steps),
     }),
   };
@@ -1149,11 +1242,15 @@ function validateSharedPageTrace(
       }],
     };
   }
-  if (!page || page.bodyPolicy !== 'preserve-existing' || page.reviewed) {
+  const routeMatchesPolicy = page && (
+    ((!page.reviewed && page.bodyPolicy === 'preserve-existing') && (trace.mode === 'frontmatter-only' || trace.mode === 'llm-merge'))
+    || (page.reviewed && page.bodyPolicy === 'append-reviewed' && trace.mode === 'reviewed-append')
+  );
+  if (!page || !routeMatchesPolicy) {
     return {
       reasons: [refuse(
         'shared-page-trace-eligibility-mismatch',
-        `Canonical page ${file.path} has a merge trace outside the unreviewed existing frontmatter-only path`,
+        `Canonical page ${file.path} has a merge trace outside its native existing-page route`,
       )],
     };
   }

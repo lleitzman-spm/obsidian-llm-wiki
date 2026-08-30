@@ -287,6 +287,35 @@ describe('scanDeadLinks', () => {
     expect(result).toHaveLength(1);
     expect(result[0].target).toBe('Shared');
   });
+
+  it('accepts literal-leading and mid-slug # characters in known page paths', () => {
+    const pm = new Map<string, ScannerPage>([
+      ...makePageMap('wiki/entities/Source.md', [
+        '[[entities/#1-#2-lease-extension-reminder|Lease extension]]',
+        '[[entities/1430-schley-#4|Schley #4]]',
+      ].join('\n')),
+      ...makePageMap('wiki/entities/#1-#2-lease-extension-reminder.md', 'Lease extension reminder'),
+      ...makePageMap('wiki/entities/1430-schley-#4.md', 'Schley #4'),
+    ]);
+    const { known, knownLower } = buildKnownTargets([...pm.values()]);
+
+    expect(scanDeadLinks(pm, known, knownLower, 'wiki')).toEqual([]);
+  });
+
+  it('keeps genuine heading fragments and display aliases pointed at the page', () => {
+    const pm = new Map<string, ScannerPage>([
+      ...makePageMap('wiki/entities/Source.md', [
+        '[[entities/Page#Heading]]',
+        '[[entities/Page#Another heading|Page alias]]',
+        '[[entities/Page Alias#Heading|Page alias target]]',
+        '[[entities/Page|Page alias]]',
+      ].join('\n')),
+      ...makePageMap('wiki/entities/Page.md', '---\ntype: entity\naliases: [Page Alias]\n---\n# Heading\n\n## Another heading'),
+    ]);
+    const { known, knownLower } = buildKnownTargets([...pm.values()]);
+
+    expect(scanDeadLinks(pm, known, knownLower, 'wiki')).toEqual([]);
+  });
 });
 
 // ── scanOrphans ────────────────────────────────────────────────
@@ -327,6 +356,16 @@ describe('scanOrphans', () => {
 
     const result = scanOrphans(pm, 'wiki');
     expect(result).not.toContain('wiki/entities/ML.md');
+  });
+
+  it('matches incoming links to known paths containing literal # characters', () => {
+    const pm = new Map<string, ScannerPage>();
+    const target = makePageMap('wiki/entities/#1-#2-lease-extension-reminder.md', 'Lease extension reminder.');
+    const source = makePageMap('wiki/entities/Source.md', 'See [[entities/#1-#2-lease-extension-reminder|Lease extension]].');
+    for (const [k, v] of target) pm.set(k, v);
+    for (const [k, v] of source) pm.set(k, v);
+
+    expect(scanOrphans(pm, 'wiki')).not.toContain('wiki/entities/#1-#2-lease-extension-reminder.md');
   });
 });
 

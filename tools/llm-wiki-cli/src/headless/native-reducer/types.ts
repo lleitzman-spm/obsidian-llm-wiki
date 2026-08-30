@@ -138,6 +138,13 @@ export interface NativeReducerOptions {
   readonly nativeSettings?: import('../../../../../src/types').LLMWikiSettings;
   /** Provider-generated page bodies keyed by canonical key (`type\u001flabel`) or target path. */
   readonly generatedPageContents?: ReadonlyMap<string, string>;
+  /**
+   * Provider responses for native existing-page routes. Keys should bind the
+   * source (`sourceId`) to the page (`sourceId\u001fcanonicalKey` or
+   * `sourceId\u001fpath`); an unscoped canonical/path key is accepted only for
+   * a single-source page. Missing bindings remain fail-closed.
+   */
+  readonly existingPageContents?: ReadonlyMap<string, string>;
   readonly existingPages?: readonly NativeExistingPage[];
   readonly existingFiles?: ReadonlyMap<string, string>;
 }
@@ -189,6 +196,8 @@ export interface NativeMergeStepTrace {
 export interface NativeMergeSequenceTrace {
   readonly originalContent: string;
   readonly finalContent: string;
+  /** Existing-page native route that produced every step in this trace. */
+  readonly mode: 'frontmatter-only' | 'llm-merge' | 'reviewed-append';
   readonly steps: readonly NativeMergeStepTrace[];
 }
 
